@@ -438,6 +438,11 @@ pub struct PlayerRecord {
     pub tid_cape: i64,
     pub last_modified: String,
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum UserSignOutcome {
+    Signed(i64),
+    NotEligible,
+}
 #[derive(Debug, FromRow)]
 pub struct PasswordCredential {
     pub uid: i64,
@@ -3659,6 +3664,120 @@ impl DatabasePool {
             .await?),
         }
     }
+    pub async fn user_usage(&self, prefix: &str, uid: i64) -> Result<(i64, i64), sqlx::Error> {
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let sql = format!(
+            "SELECT CAST((SELECT COUNT(*) FROM {prefix}players WHERE uid = {{uid}}) AS {integer_cast}) AS player_count, \
+             CAST((SELECT COALESCE(SUM(size), 0) FROM {prefix}textures WHERE uploader = {{uid}}) AS {integer_cast}) AS storage_size"
+        );
+        let sql = if matches!(self, Self::Postgres(_)) {
+            sql.replace("{uid}", "$1")
+        } else {
+            sql.replace("{uid}", "?")
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(uid)
+                .fetch_one(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(uid)
+                .fetch_one(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_one(pool)
+                .await?),
+        }
+    }
+
+    pub async fn sign_user(
+        &self,
+        prefix: &str,
+        uid: i64,
+        score_reward: i64,
+        now: &str,
+        eligible_before: &str,
+    ) -> Result<UserSignOutcome, sqlx::Error> {
+        let update_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}users SET score = score + $1, last_sign_at = CAST($2 AS TIMESTAMP) \
+                 WHERE uid = $3 AND last_sign_at <= CAST($4 AS TIMESTAMP)"
+            ),
+            _ => format!(
+                "UPDATE {prefix}users SET score = score + ?, last_sign_at = ? \
+                 WHERE uid = ? AND last_sign_at <= ?"
+            ),
+        };
+        let affected = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(score_reward)
+                .bind(now)
+                .bind(uid)
+                .bind(eligible_before)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(score_reward)
+                .bind(now)
+                .bind(uid)
+                .bind(eligible_before)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(score_reward)
+                .bind(now)
+                .bind(uid)
+                .bind(eligible_before)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        if affected == 0 {
+            return Ok(UserSignOutcome::NotEligible);
+        }
+        let score_sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ?")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?")
+            }
+        };
+        let score = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(UserSignOutcome::Signed(score))
+    }
+
     pub async fn players_for_user(
         &self,
         prefix: &str,

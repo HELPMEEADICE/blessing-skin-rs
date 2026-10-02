@@ -25,6 +25,7 @@ use image::{ImageFormat, ImageReader};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
 use pulldown_cmark::{Options, Parser, html as markdown_html};
+use rand::Rng;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -63,6 +64,8 @@ pub fn router(state: AppState) -> Router {
         .route("/user/profile", post(user_profile_update))
         .route("/user/profile/avatar", post(user_set_avatar))
         .route("/user/dark-mode", put(toggle_user_dark_mode))
+        .route("/user/score-info", get(user_score_info))
+        .route("/user/sign", post(user_sign))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -659,6 +662,148 @@ async fn site_name(state: &AppState) -> String {
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
     }
+}
+
+async fn user_score_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let (players, storage) = match database.user_usage(prefix, user.uid).await {
+        Ok(usage) => usage,
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to read user score usage");
+            return unavailable();
+        }
+    };
+    let option_number = |value: Option<String>, default: i64| {
+        value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default)
+    };
+    let storage_rate = match database.option(prefix, "score_per_storage").await {
+        Ok(value) => option_number(value, 1),
+        Err(error) => {
+            tracing::error!(%error, "failed to read storage score rate");
+            return unavailable();
+        }
+    };
+    let player_rate = match database.option(prefix, "score_per_player").await {
+        Ok(value) => option_number(value, 100),
+        Err(error) => {
+            tracing::error!(%error, "failed to read player score rate");
+            return unavailable();
+        }
+    };
+    let sign_after_zero = match database.option(prefix, "sign_after_zero").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sign reset option");
+            return unavailable();
+        }
+    };
+    let sign_gap_time = match database.option(prefix, "sign_gap_time").await {
+        Ok(value) => option_number(value, 24),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sign gap option");
+            return unavailable();
+        }
+    };
+    Json(serde_json::json!({
+        "user": { "score": user.score, "lastSignAt": user.last_sign_at },
+        "rate": { "storage": storage_rate, "players": player_rate },
+        "usage": { "players": players, "storage": storage },
+        "signAfterZero": sign_after_zero,
+        "signGapTime": sign_gap_time
+    }))
+    .into_response()
+}
+
+async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let sign_after_zero = match database.option(prefix, "sign_after_zero").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sign reset option");
+            return unavailable();
+        }
+    };
+    let sign_gap_time = match database.option(prefix, "sign_gap_time").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(24)
+            .max(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sign gap option");
+            return unavailable();
+        }
+    };
+    let (minimum, maximum) = match database.option(prefix, "sign_score").await {
+        Ok(value) => value
+            .as_deref()
+            .and_then(|value| value.split_once(','))
+            .and_then(|(minimum, maximum)| {
+                Some((
+                    minimum.trim().parse::<i64>().ok()?,
+                    maximum.trim().parse::<i64>().ok()?,
+                ))
+            })
+            .unwrap_or((10, 100)),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sign score range");
+            return unavailable();
+        }
+    };
+    let (minimum, maximum) = (minimum.min(maximum), minimum.max(maximum));
+    let reward = rand::thread_rng().gen_range(minimum..=maximum);
+    let now = shanghai_now();
+    let eligible_before = if sign_after_zero {
+        now.date().and_hms_opt(0, 0, 0).unwrap_or(now)
+    } else {
+        now - chrono::Duration::hours(sign_gap_time)
+    };
+    let now = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let eligible_before = eligible_before.format("%Y-%m-%d %H:%M:%S").to_string();
+    match database
+        .sign_user(prefix, user.uid, reward, &now, &eligible_before)
+        .await
+    {
+        Ok(crate::database::UserSignOutcome::Signed(score)) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("签到成功，获得了 {reward} 积分")
+            } else {
+                format!("Signed successfully. You got {reward} scores.")
+            };
+            login_result(0, &message, Some(serde_json::json!({ "score": score })))
+        }
+        Ok(crate::database::UserSignOutcome::NotEligible) => login_result(1, "", None),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to apply sign reward");
+            unavailable()
+        }
+    }
+}
+
+fn shanghai_now() -> NaiveDateTime {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, elapsed.subsec_nanos())
+        .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap());
+    utc.with_timezone(&FixedOffset::east_opt(8 * 60 * 60).unwrap())
+        .naive_local()
 }
 
 async fn user_profile_update(
@@ -6588,6 +6733,134 @@ mod tests {
         let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
         assert!(dashboard_html.contains("alex@example.test"));
         assert!(dashboard_html.contains("Alex"));
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('score_per_storage','2'), ('score_per_player','100'), ('sign_after_zero','false'), ('sign_gap_time','24'), ('sign_score','10,10')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let score_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user/score-info")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(score_info.status(), StatusCode::OK);
+        let score_info: serde_json::Value =
+            serde_json::from_slice(&to_bytes(score_info.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(score_info["user"]["score"], 5);
+        assert_eq!(score_info["user"]["lastSignAt"], "");
+        assert_eq!(score_info["rate"]["storage"], 2);
+        assert_eq!(score_info["rate"]["players"], 100);
+        assert_eq!(score_info["usage"]["players"], 1);
+        assert_eq!(score_info["usage"]["storage"], 8);
+        let sign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/sign")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sign: serde_json::Value =
+            serde_json::from_slice(&to_bytes(sign.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(sign["code"], 0);
+        assert_eq!(sign["data"]["score"], 15);
+        let duplicate_sign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/sign")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let duplicate_sign: serde_json::Value = serde_json::from_slice(
+            &to_bytes(duplicate_sign.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(duplicate_sign["code"], 1);
+        let yesterday = super::shanghai_now()
+            .date()
+            .pred_opt()
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query("UPDATE users SET last_sign_at = ? WHERE uid = 7")
+            .bind(yesterday)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE options SET option_value = 'true' WHERE option_name = 'sign_after_zero'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let daily_sign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/sign")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let daily_sign: serde_json::Value =
+            serde_json::from_slice(&to_bytes(daily_sign.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(daily_sign["code"], 0);
+        let duplicate_daily_sign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/sign")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let duplicate_daily_sign: serde_json::Value = serde_json::from_slice(
+            &to_bytes(duplicate_daily_sign.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(duplicate_daily_sign["code"], 1);
+        sqlx::query("UPDATE users SET score = 5, last_sign_at = '' WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE options SET option_value = 'false' WHERE option_name = 'sign_after_zero'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE options SET option_value = '0' WHERE option_name IN ('score_per_storage', 'score_per_player')")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         for nickname in ["Changed nickname", "Alex User"] {
             let response = app
