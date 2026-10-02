@@ -56,9 +56,9 @@ describe('info box', () => {
       const { getByText, container } = render(<Dashboard />)
       await waitFor(() => expect(fetch.get).toBeCalledTimes(1))
       expect(getByText('4')).toBeInTheDocument()
-      expect(container.querySelector('.info-box-number')).toHaveTextContent(
-        '4 / 7 MB',
-      )
+      expect(
+        container.querySelector('.info-box.bg-maroon .info-box-number'),
+      ).toHaveTextContent('4 / 7 MB')
       expect(getByText(/MB/)).toBeInTheDocument()
     })
   })
