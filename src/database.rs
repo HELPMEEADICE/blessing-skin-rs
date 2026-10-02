@@ -65,6 +65,13 @@ pub struct PasswordCredential {
     pub password: String,
     pub permission: i32,
 }
+#[derive(Debug)]
+pub enum NotificationAudience {
+    All,
+    Normal,
+    User(i64),
+    Email(String),
+}
 #[derive(Debug, FromRow)]
 pub struct NotificationRecord {
     pub id: String,
@@ -1677,6 +1684,160 @@ impl DatabasePool {
         Ok(())
     }
 
+    pub async fn notification_recipients(
+        &self,
+        prefix: &str,
+        audience: &NotificationAudience,
+    ) -> Result<Option<Vec<i64>>, sqlx::Error> {
+        let (sql, targeted) = match (self, audience) {
+            (Self::Postgres(_), NotificationAudience::All) => (
+                format!("SELECT CAST(uid AS BIGINT) FROM {prefix}users ORDER BY uid"),
+                false,
+            ),
+            (Self::Postgres(_), NotificationAudience::Normal) => (
+                format!(
+                    "SELECT CAST(uid AS BIGINT) FROM {prefix}users WHERE permission = 0 ORDER BY uid"
+                ),
+                false,
+            ),
+            (Self::Postgres(_), NotificationAudience::User(_)) => (
+                format!("SELECT CAST(uid AS BIGINT) FROM {prefix}users WHERE uid = $1"),
+                true,
+            ),
+            (Self::Postgres(_), NotificationAudience::Email(_)) => (
+                format!("SELECT CAST(uid AS BIGINT) FROM {prefix}users WHERE email = $1"),
+                true,
+            ),
+            (_, NotificationAudience::All) => (
+                format!("SELECT CAST(uid AS SIGNED) FROM {prefix}users ORDER BY uid"),
+                false,
+            ),
+            (_, NotificationAudience::Normal) => (
+                format!(
+                    "SELECT CAST(uid AS SIGNED) FROM {prefix}users WHERE permission = 0 ORDER BY uid"
+                ),
+                false,
+            ),
+            (_, NotificationAudience::User(_)) => (
+                format!("SELECT CAST(uid AS SIGNED) FROM {prefix}users WHERE uid = ?"),
+                true,
+            ),
+            (_, NotificationAudience::Email(_)) => (
+                format!("SELECT CAST(uid AS SIGNED) FROM {prefix}users WHERE email = ?"),
+                true,
+            ),
+        };
+        let recipients = match (self, audience) {
+            (Self::Sqlite(pool), NotificationAudience::User(user_id)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::MySql(pool), NotificationAudience::User(user_id)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::Postgres(pool), NotificationAudience::User(user_id)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::Sqlite(pool), NotificationAudience::Email(email)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::MySql(pool), NotificationAudience::Email(email)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::Postgres(pool), NotificationAudience::Email(email)) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::Sqlite(pool), _) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::MySql(pool), _) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await?
+            }
+            (Self::Postgres(pool), _) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        if targeted && recipients.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(recipients))
+        }
+    }
+
+    pub async fn create_site_notification(
+        &self,
+        prefix: &str,
+        id: &str,
+        user_id: i64,
+        data: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(id)
+                    .bind("App\\Notifications\\SiteMessage")
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .bind(data)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(id)
+                    .bind("App\\Notifications\\SiteMessage")
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .bind(data)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(id)
+                    .bind("App\\Notifications\\SiteMessage")
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .bind(data)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn unread_notifications(
         &self,
         prefix: &str,
@@ -1994,6 +2155,69 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            database
+                .notification_recipients("bs_", &super::NotificationAudience::All)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            database
+                .notification_recipients("bs_", &super::NotificationAudience::Normal)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            database
+                .notification_recipients("bs_", &super::NotificationAudience::User(7))
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            database
+                .notification_recipients(
+                    "bs_",
+                    &super::NotificationAudience::Email("alex@example.test".to_owned())
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7]
+        );
+        assert!(
+            database
+                .notification_recipients(
+                    "bs_",
+                    &super::NotificationAudience::Email("missing@example.test".to_owned())
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database
+            .create_site_notification(
+                "bs_",
+                "00000000-0000-4000-8000-000000000001",
+                7,
+                r#"{"title":"New notice","content":"Updated **skin**"}"#,
+            )
+            .await
+            .unwrap();
+        let sent_notification = database
+            .read_notification("bs_", 7, "00000000-0000-4000-8000-000000000001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sent_notification.data).unwrap()["title"],
+            "New notice"
         );
         let email_credential = database
             .credentials_by_email("bs_", "alex@example.test")

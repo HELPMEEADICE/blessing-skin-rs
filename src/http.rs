@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant, SystemTime},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use askama::Template;
@@ -12,7 +13,7 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
             CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_MODIFIED_SINCE,
-            IF_NONE_MATCH, LAST_MODIFIED, SET_COOKIE,
+            IF_NONE_MATCH, LAST_MODIFIED, LOCATION, SET_COOKIE,
         },
     },
     response::{Html, IntoResponse, Redirect, Response},
@@ -51,6 +52,7 @@ pub fn router(state: AppState) -> Router {
             put(api_rename_closet_item).delete(api_remove_closet_item),
         )
         .route("/api/user/notifications", get(api_user_notifications))
+        .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players).post(api_add_player))
         .route("/api/players/{pid}", delete(api_delete_player))
@@ -517,6 +519,189 @@ async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response
     }
 }
 
+static NOTIFICATION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+async fn api_send_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let user = match database.user_profile(prefix, identity.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load notification sender");
+            return unavailable();
+        }
+    };
+    if user.permission < 1 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "message": "This action is unauthorized." })),
+        )
+            .into_response();
+    }
+    if !identity.has_scope("Notification.ReadWrite") {
+        return missing_scope();
+    }
+
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return notification_validation_error("receiver", &state.config.locale),
+    };
+    let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("receiver", &state.config.locale);
+    };
+    let receiver = receiver.trim();
+    let audience = match receiver {
+        "all" => crate::database::NotificationAudience::All,
+        "normal" => crate::database::NotificationAudience::Normal,
+        "uid" => {
+            let Some(uid) = request_i64(request.get("uid")) else {
+                return notification_validation_error("uid", &state.config.locale);
+            };
+            crate::database::NotificationAudience::User(uid)
+        }
+        "email" => {
+            let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
+                return notification_validation_error("email", &state.config.locale);
+            };
+            let email = email.trim();
+            if !valid_email_address(email) {
+                return notification_validation_error("email", &state.config.locale);
+            }
+            crate::database::NotificationAudience::Email(email.to_owned())
+        }
+        _ => return notification_validation_error("receiver", &state.config.locale),
+    };
+    let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("title", &state.config.locale);
+    };
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 20 {
+        return notification_validation_error("title", &state.config.locale);
+    }
+    let content = match request.get("content") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(content)) => Some(content.trim()),
+        _ => return notification_validation_error("content", &state.config.locale),
+    };
+
+    let recipients = match database.notification_recipients(prefix, &audience).await {
+        Ok(Some(recipients)) => recipients,
+        Ok(None) => {
+            return notification_validation_error(
+                match audience {
+                    crate::database::NotificationAudience::User(_) => "uid",
+                    crate::database::NotificationAudience::Email(_) => "email",
+                    _ => "receiver",
+                },
+                &state.config.locale,
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to select notification recipients");
+            return unavailable();
+        }
+    };
+    let data = serde_json::json!({ "title": title, "content": content }).to_string();
+    for recipient in recipients {
+        if let Err(error) = database
+            .create_site_notification(prefix, &new_notification_id(), recipient, &data)
+            .await
+        {
+            tracing::error!(%error, recipient, "failed to store notification");
+            return unavailable();
+        }
+    }
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(LOCATION, HeaderValue::from_static("/admin"));
+    response
+}
+
+fn request_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
+    value.as_i64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|number| number.trim().parse::<i64>().ok())
+    })
+}
+fn notification_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("receiver", true) => "接收对象必须是 all、normal、uid 或 email。",
+        ("receiver", false) => "The receiver must be all, normal, uid, or email.",
+        ("uid", true) => "用户编号为必填整数且必须存在。",
+        ("uid", false) => "The uid must be an integer identifying an existing user.",
+        ("email", true) => "邮箱地址无效或不存在。",
+        ("email", false) => "The email must be valid and belong to an existing user.",
+        ("title", true) => "标题为必填项且不能超过 20 个字符。",
+        ("title", false) => "The title is required and may not exceed 20 characters.",
+        ("content", true) => "内容必须是字符串。",
+        ("content", false) => "The content must be a string.",
+        _ => "The given field is invalid.",
+    };
+    let mut errors = serde_json::Map::new();
+    errors.insert(field.to_owned(), serde_json::json!([field_error]));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
+}
+
+fn valid_email_address(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn new_notification_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NOTIFICATION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let source = format!("{timestamp}:{}:{sequence}", std::process::id());
+    let digest = Md5::digest(source.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
 async fn api_user_notifications(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let identity = match authenticate(&state, &headers).await {
         Ok(identity) => identity,
@@ -1902,6 +2087,15 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(value["errors"]["tid"][0].as_str().is_some());
         assert!(value["errors"]["field"].is_null());
+    }
+    #[test]
+    fn creates_unique_legacy_notification_ids() {
+        let first = super::new_notification_id();
+        let second = super::new_notification_id();
+        assert_eq!(first.len(), 36);
+        assert_eq!(second.len(), 36);
+        assert_eq!(first.as_bytes()[14], b'4');
+        assert_ne!(first, second);
     }
     #[test]
     fn parses_legacy_boolean_options() {
