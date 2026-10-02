@@ -23,6 +23,7 @@ pub struct AppState {
     pub passport_key: Option<DecodingKey>,
     pub session_key: Option<EncodingKey>,
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
+    pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
 }
 
 #[tokio::main]
@@ -63,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         passport_key,
         session_key,
         login_failures: Arc::new(Mutex::new(HashMap::new())),
+        captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
     });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");

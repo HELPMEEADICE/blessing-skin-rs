@@ -21,11 +21,14 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
-use image::{ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader, Rgb, RgbImage};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
 use pulldown_cmark::{Options, Parser, html as markdown_html};
-use rand::Rng;
+use rand::{
+    Rng,
+    distributions::{Alphanumeric, DistString},
+};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -51,6 +54,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/", any(api_root))
         .route("/", get(home))
         .route("/auth/login", get(login_page).post(handle_login))
+        .route("/auth/register", get(register_page).post(handle_register))
+        .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
         .route(
             "/oauth/clients",
@@ -179,6 +184,7 @@ struct LoginPage {
     password_label: String,
     remember_label: String,
     submit_label: String,
+    registration_link: String,
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
@@ -216,6 +222,12 @@ async fn login_page(State(state): State<AppState>) -> Response {
         }
         .to_owned(),
         submit_label: if chinese { "登录" } else { "Log In" }.to_owned(),
+        registration_link: if chinese {
+            "注册新账号"
+        } else {
+            "Register a new account"
+        }
+        .to_owned(),
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -224,6 +236,604 @@ async fn login_page(State(state): State<AppState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+#[derive(Template)]
+#[template(path = "register.html")]
+struct RegisterPage {
+    site_name: String,
+    locale: String,
+    title: String,
+    prompt: String,
+    email_label: String,
+    account_label: String,
+    password_label: String,
+    captcha_label: String,
+    submit_label: String,
+    player_name_registration: bool,
+    use_recaptcha: bool,
+    recaptcha_sitekey: String,
+}
+
+async fn register_page(State(state): State<AppState>) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let site_name = match database.option(prefix, "site_name").await {
+        Ok(value) => value.unwrap_or_else(|| "Blessing Skin".to_owned()),
+        Err(error) => {
+            tracing::error!(%error, "failed to read site name for registration");
+            return unavailable();
+        }
+    };
+    let player_name_registration = match database.option(prefix, "register_with_player_name").await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read registration mode");
+            return unavailable();
+        }
+    };
+    let recaptcha_secret = match database.option(prefix, "recaptcha_secretkey").await {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read registration CAPTCHA configuration");
+            return unavailable();
+        }
+    };
+    let recaptcha_sitekey = if recaptcha_secret.is_empty() {
+        String::new()
+    } else {
+        match database.option(prefix, "recaptcha_sitekey").await {
+            Ok(value) => value.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to read reCAPTCHA site key");
+                return unavailable();
+            }
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let page = RegisterPage {
+        site_name,
+        locale: state.config.locale.clone(),
+        title: if chinese { "注册" } else { "Register" }.to_owned(),
+        prompt: if chinese {
+            "创建一个账号来管理你的皮肤与角色。"
+        } else {
+            "Create an account to manage your skins and players."
+        }
+        .to_owned(),
+        email_label: if chinese { "邮箱" } else { "Email" }.to_owned(),
+        account_label: (if chinese {
+            if player_name_registration {
+                "角色名"
+            } else {
+                "昵称"
+            }
+        } else if player_name_registration {
+            "Player name"
+        } else {
+            "Nickname"
+        })
+        .to_owned(),
+        password_label: if chinese { "密码" } else { "Password" }.to_owned(),
+        captcha_label: if chinese { "验证码" } else { "CAPTCHA" }.to_owned(),
+        submit_label: if chinese { "注册" } else { "Register" }.to_owned(),
+        player_name_registration,
+        use_recaptcha: !recaptcha_secret.is_empty(),
+        recaptcha_sitekey,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render registration page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn captcha_image(State(state): State<AppState>) -> Response {
+    let session_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+    let choices = b"23456789";
+    let phrase = (0..6)
+        .map(|_| choices[rand::thread_rng().gen_range(0..choices.len())] as char)
+        .collect::<String>();
+    {
+        let mut challenges = state
+            .captcha_challenges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        challenges.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(300));
+        challenges.insert(session_id.clone(), (phrase.clone(), Instant::now()));
+    }
+    let bytes = match captcha_jpeg(&phrase) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(%error, "failed to render CAPTCHA image");
+            return unavailable();
+        }
+    };
+    let secure = if state.config.app_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "blessing_skin_captcha={session_id}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=300{secure}"
+    );
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+}
+
+fn captcha_jpeg(phrase: &str) -> Result<Vec<u8>, image::ImageError> {
+    let mut rng = rand::thread_rng();
+    let mut image = RgbImage::from_pixel(180, 60, Rgb([248, 250, 252]));
+    for _ in 0..180 {
+        let x = rng.gen_range(0..180);
+        let y = rng.gen_range(0..60);
+        let shade = rng.gen_range(170..225);
+        image.put_pixel(x, y, Rgb([shade, shade, shade]));
+    }
+    for _ in 0..4 {
+        let color = Rgb([
+            rng.gen_range(140..190),
+            rng.gen_range(140..190),
+            rng.gen_range(140..190),
+        ]);
+        draw_captcha_line(
+            &mut image,
+            rng.gen_range(0..180),
+            rng.gen_range(0..60),
+            rng.gen_range(0..180),
+            rng.gen_range(0..60),
+            color,
+        );
+    }
+    for (index, digit) in phrase.chars().enumerate() {
+        let rows = captcha_digit_rows(digit);
+        let origin_x = 10 + index as u32 * 27;
+        let origin_y = 12;
+        for (row, bits) in rows.iter().enumerate() {
+            for column in 0..3 {
+                if bits & (1 << (2 - column)) == 0 {
+                    continue;
+                }
+                for dy in 0..7 {
+                    for dx in 0..7 {
+                        image.put_pixel(
+                            origin_x + column * 7 + dx,
+                            origin_y + row as u32 * 7 + dy,
+                            Rgb([35, 45, 60]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let mut output = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image).write_to(&mut output, ImageFormat::Jpeg)?;
+    Ok(output.into_inner())
+}
+
+fn captcha_digit_rows(digit: char) -> [u8; 5] {
+    match digit {
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        _ => [0b111, 0b101, 0b101, 0b101, 0b111],
+    }
+}
+
+fn draw_captcha_line(
+    image: &mut RgbImage,
+    mut x0: u32,
+    mut y0: u32,
+    x1: u32,
+    y1: u32,
+    color: Rgb<u8>,
+) {
+    let dx = x0.abs_diff(x1) as i32;
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y0.abs_diff(y1) as i32);
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        image.put_pixel(x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let twice = 2 * error;
+        if twice >= dy {
+            error += dy;
+            x0 = (i64::from(x0) + i64::from(sx)).clamp(0, i64::from(image.width() - 1)) as u32;
+        }
+        if twice <= dx {
+            error += dx;
+            y0 = (i64::from(y0) + i64::from(sy)).clamp(0, i64::from(image.height() - 1)) as u32;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RecaptchaVerification {
+    success: bool,
+}
+
+async fn verify_registration_captcha(
+    state: &AppState,
+    headers: &HeaderMap,
+    value: &str,
+) -> Result<bool, Response> {
+    let Some(database) = &state.database else {
+        return Err(unavailable());
+    };
+    let secret = match database
+        .option(&state.config.database.table_prefix, "recaptcha_secretkey")
+        .await
+    {
+        Ok(secret) => secret.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read reCAPTCHA secret");
+            return Err(unavailable());
+        }
+    };
+    if !secret.is_empty() {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "failed to construct reCAPTCHA client");
+                return Err(unavailable());
+            }
+        };
+        let verification = match client
+            .post("https://www.recaptcha.net/recaptcha/api/siteverify")
+            .form(&[("secret", secret.as_str()), ("response", value)])
+            .send()
+            .await
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<RecaptchaVerification>().await {
+                    Ok(verification) => verification,
+                    Err(error) => {
+                        tracing::warn!(%error, "reCAPTCHA returned invalid JSON");
+                        return Ok(false);
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "reCAPTCHA returned an HTTP error");
+                    return Ok(false);
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "reCAPTCHA verification request failed");
+                return Err(unavailable());
+            }
+        };
+        return Ok(verification.success);
+    }
+
+    let Some(session_id) = cookie_value(headers, "blessing_skin_captcha") else {
+        return Ok(false);
+    };
+    let challenge = state
+        .captcha_challenges
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id);
+    Ok(challenge.is_some_and(|(answer, created)| {
+        created.elapsed() <= Duration::from_secs(300) && answer.eq_ignore_ascii_case(value.trim())
+    }))
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|cookie| {
+            let (cookie_name, value) = cookie.trim().split_once('=')?;
+            (cookie_name == name && !value.is_empty()).then_some(value)
+        })
+}
+
+fn registration_client_ip(headers: &HeaderMap) -> String {
+    for name in ["x-real-ip", "x-forwarded-for"] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let candidate = value.split(',').next().unwrap_or_default().trim();
+        if candidate.parse::<std::net::IpAddr>().is_ok() {
+            return candidate.to_owned();
+        }
+    }
+    "unknown".to_owned()
+}
+
+async fn handle_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if state.session_key.is_none() {
+        tracing::error!("APP_KEY is required to create a web login session");
+        return unavailable();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return registration_validation_error("email", "required", &state.config.locale),
+    };
+    let Some(email) = request
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .filter(|email| valid_email_address(email) && email.len() <= 100)
+    else {
+        return registration_validation_error("email", "email", &state.config.locale);
+    };
+    let Some(password) = request
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .filter(|password| (8..=32).contains(&password.chars().count()))
+    else {
+        return registration_validation_error("password", "length", &state.config.locale);
+    };
+    let Some(captcha) = request
+        .get("captcha")
+        .or_else(|| request.get("g-recaptcha-response"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|captcha| !captcha.trim().is_empty())
+    else {
+        return registration_validation_error("captcha", "required", &state.config.locale);
+    };
+    match verify_registration_captcha(&state, &headers, captcha).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return registration_validation_error("captcha", "invalid", &state.config.locale);
+        }
+        Err(response) => return response,
+    }
+
+    let prefix = &state.config.database.table_prefix;
+    let player_name_registration = match database.option(prefix, "register_with_player_name").await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read registration mode");
+            return unavailable();
+        }
+    };
+    let mut player_name = None;
+    let nickname = if player_name_registration {
+        let Some(name) = request
+            .get("player_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return registration_validation_error("player_name", "required", &state.config.locale);
+        };
+        let rule = match database.option(prefix, "player_name_rule").await {
+            Ok(value) => value.unwrap_or_else(|| "official".to_owned()),
+            Err(error) => {
+                tracing::error!(%error, "failed to read player-name rule");
+                return unavailable();
+            }
+        };
+        let custom_rule = match database.option(prefix, "custom_player_name_regexp").await {
+            Ok(value) => value.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to read custom player-name rule");
+                return unavailable();
+            }
+        };
+        let min_length = match database.option(prefix, "player_name_length_min").await {
+            Ok(value) => value
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(3),
+            Err(error) => {
+                tracing::error!(%error, "failed to read minimum player-name length");
+                return unavailable();
+            }
+        };
+        let max_length = match database.option(prefix, "player_name_length_max").await {
+            Ok(value) => value
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16),
+            Err(error) => {
+                tracing::error!(%error, "failed to read maximum player-name length");
+                return unavailable();
+            }
+        };
+        if !valid_player_name(name, &rule, &custom_rule, min_length, max_length) {
+            return registration_validation_error("player_name", "format", &state.config.locale);
+        }
+        player_name = Some(name);
+        name
+    } else {
+        let Some(nickname) = request
+            .get("nickname")
+            .and_then(serde_json::Value::as_str)
+            .filter(|nickname| !nickname.is_empty() && nickname.chars().count() <= 255)
+        else {
+            return registration_validation_error("nickname", "required", &state.config.locale);
+        };
+        nickname
+    };
+
+    let client_ip = registration_client_ip(&headers);
+    let max_registrations_per_ip = match database.option(prefix, "regs_per_ip").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(3),
+        Err(error) => {
+            tracing::error!(%error, "failed to read registration IP limit");
+            return unavailable();
+        }
+    };
+    let initial_score = match database.option(prefix, "user_initial_score").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1000),
+        Err(error) => {
+            tracing::error!(%error, "failed to read initial user score");
+            return unavailable();
+        }
+    };
+    let Some(password_hash) = hash_legacy_password(
+        password,
+        &state.config.password_method,
+        &state.config.password_salt,
+    ) else {
+        tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
+        return unavailable();
+    };
+    let now = shanghai_now();
+    let last_sign_at = now - chrono::Duration::days(1);
+    let now = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let last_sign_at = last_sign_at.format("%Y-%m-%d %H:%M:%S").to_string();
+    match database
+        .register_user(
+            prefix,
+            email,
+            nickname,
+            initial_score,
+            &password_hash,
+            &client_ip,
+            &now,
+            &last_sign_at,
+            max_registrations_per_ip,
+            player_name,
+        )
+        .await
+    {
+        Ok(crate::database::UserRegistrationOutcome::EmailExists) => {
+            registration_validation_error("email", "unique", &state.config.locale)
+        }
+        Ok(crate::database::UserRegistrationOutcome::PlayerNameExists) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "该角色名已被占用"
+            } else {
+                "The player name is already registered."
+            },
+            None,
+        ),
+        Ok(crate::database::UserRegistrationOutcome::IpLimit) => login_result(
+            1,
+            &if state.config.locale.starts_with("zh") {
+                format!("你在本站注册的账号已达到上限 {max_registrations_per_ip} 个，无法继续注册")
+            } else {
+                format!("You can't register more than {max_registrations_per_ip} accounts.")
+            },
+            None,
+        ),
+        Ok(crate::database::UserRegistrationOutcome::Registered(uid)) => {
+            let now_epoch = jsonwebtoken::get_current_timestamp();
+            let claims = crate::auth::WebSessionClaims {
+                sub: uid.to_string(),
+                iat: now_epoch,
+                exp: now_epoch + 60 * 60 * 12,
+            };
+            let Some(key) = &state.session_key else {
+                return unavailable();
+            };
+            let session = match encode(&Header::new(Algorithm::HS256), &claims, key) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::error!(%error, user_id = uid, "failed to issue post-registration session");
+                    return unavailable();
+                }
+            };
+            let message = if state.config.locale.starts_with("zh") {
+                "注册成功，正在跳转..."
+            } else {
+                "Your account was registered. Redirecting..."
+            };
+            let mut response = login_result(0, message, None);
+            let secure = if state.config.app_url.starts_with("https://") {
+                "; Secure"
+            } else {
+                ""
+            };
+            let cookie = format!(
+                "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200{secure}"
+            );
+            if let Ok(value) = HeaderValue::from_str(&cookie) {
+                response.headers_mut().insert(SET_COOKIE, value);
+            }
+            response
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to create new user registration");
+            unavailable()
+        }
+    }
+}
+
+fn registration_validation_error(field: &str, rule: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let error = match (field, rule, chinese) {
+        ("email", "unique", true) => "该邮箱已被使用。",
+        ("email", "unique", false) => "The email has already been taken.",
+        ("email", "email", true) => "邮箱格式无效。",
+        ("email", "email", false) => "The email must be a valid email address.",
+        ("email", _, true) => "邮箱为必填项。",
+        ("email", _, false) => "The email field is required.",
+        ("password", _, true) => "密码为必填项且长度必须为 8 至 32 个字符。",
+        ("password", _, false) => {
+            "The password field is required and must be between 8 and 32 characters."
+        }
+        ("captcha", "invalid", true) => "验证码无效。",
+        ("captcha", "invalid", false) => "The CAPTCHA is invalid.",
+        ("captcha", _, true) => "验证码为必填项。",
+        ("captcha", _, false) => "The CAPTCHA field is required.",
+        ("player_name", "format", true) => "角色名格式或长度无效。",
+        ("player_name", "format", false) => "The player name format or length is invalid.",
+        ("player_name", _, true) => "角色名为必填项。",
+        ("player_name", _, false) => "The player_name field is required.",
+        ("nickname", _, true) => "昵称为必填项且不能超过 255 个字符。",
+        ("nickname", _, false) => {
+            "The nickname field is required and may not exceed 255 characters."
+        }
+        _ => "The given field is invalid.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": { field: [error] } })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -6133,6 +6743,78 @@ const COPYRIGHTS: [&str; 7] = [
 mod tests {
     use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
 
+    async fn submit_test_registration(
+        app: &axum::Router,
+        cookie: &str,
+        captcha: &str,
+        email: &str,
+        player_name: &str,
+        ip: &str,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/auth/register")
+                    .header("cookie", cookie)
+                    .header("x-real-ip", ip)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": email,
+                            "password": "secure pass 123",
+                            "player_name": player_name,
+                            "captcha": captcha
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn issue_test_captcha(
+        app: &axum::Router,
+        challenges: &std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+        >,
+    ) -> (String, String) {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, header::SET_COOKIE},
+        };
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/captcha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        let set_cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let jpeg = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+        let id = cookie.split_once('=').unwrap().1.to_owned();
+        let answer = challenges.lock().unwrap().get(&id).unwrap().0.clone();
+        (cookie, answer)
+    }
+
     #[tokio::test]
     async fn closet_validation_errors_use_the_requested_field_name() {
         use axum::body::to_bytes;
@@ -6492,6 +7174,7 @@ mod tests {
             passport_key: None,
             session_key: None,
             login_failures: Default::default(),
+            captcha_challenges: Default::default(),
         });
         let response = app
             .clone()
@@ -6640,12 +7323,14 @@ mod tests {
             password_salt: String::new(),
             app_key: Some(secret.clone()),
         };
+        let captcha_challenges = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let app = router(crate::AppState {
             config: Arc::new(config),
             database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
             passport_key: None,
             session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
             login_failures: Default::default(),
+            captcha_challenges: captcha_challenges.clone(),
         });
         let homepage = app
             .clone()
@@ -6676,6 +7361,145 @@ mod tests {
             String::from_utf8(login_html.to_vec())
                 .unwrap()
                 .contains("Email or player name")
+        );
+
+        let register_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_page.status(), StatusCode::OK);
+        let register_html = to_bytes(register_page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let register_html = String::from_utf8(register_html.to_vec()).unwrap();
+        assert!(register_html.contains("Player name"));
+        assert!(register_html.contains("/auth/captcha"));
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('register_with_player_name','true'), ('user_initial_score','73'), ('regs_per_ip','2')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (captcha_cookie, captcha_answer) = issue_test_captcha(&app, &captcha_challenges).await;
+        let registration = submit_test_registration(
+            &app,
+            &captcha_cookie,
+            &captcha_answer,
+            "first@example.test",
+            "NewGuy",
+            "203.0.113.40",
+        )
+        .await;
+        assert_eq!(registration.status(), StatusCode::OK);
+        let registered_cookie = registration
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let registration_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(registration.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registration_body["code"], 0);
+        let registered_user: (i64, String, i64, String, i32, bool, i64, String, String) =
+            sqlx::query_as("SELECT uid,nickname,score,ip,permission,verified,avatar,last_sign_at,register_at FROM users WHERE email = 'first@example.test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(registered_user.1, "NewGuy");
+        assert_eq!(registered_user.2, 73);
+        assert_eq!(registered_user.3, "203.0.113.40");
+        assert_eq!(registered_user.4, 0);
+        assert!(!registered_user.5);
+        assert_eq!(registered_user.6, 0);
+        assert!(registered_user.7 < registered_user.8);
+        let registered_player: (i64, String, i64, i64) =
+            sqlx::query_as("SELECT uid,name,tid_skin,tid_cape FROM players WHERE name = 'NewGuy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            registered_player,
+            (registered_user.0, "NewGuy".to_owned(), 0, 0)
+        );
+        let registered_password: String =
+            sqlx::query_scalar("SELECT password FROM users WHERE uid = ?")
+                .bind(registered_user.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(crate::auth::verify_legacy_password(
+            "secure pass 123",
+            &registered_password,
+            "BCRYPT",
+            ""
+        ));
+        let registered_dashboard = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user")
+                    .header("cookie", registered_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered_dashboard.status(), StatusCode::OK);
+
+        let (second_captcha_cookie, second_captcha_answer) =
+            issue_test_captcha(&app, &captcha_challenges).await;
+        let second_registration = submit_test_registration(
+            &app,
+            &second_captcha_cookie,
+            &second_captcha_answer,
+            "second@example.test",
+            "NewGuy2",
+            "203.0.113.40",
+        )
+        .await;
+        let second_registration: serde_json::Value = serde_json::from_slice(
+            &to_bytes(second_registration.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second_registration["code"], 0);
+        let (third_captcha_cookie, third_captcha_answer) =
+            issue_test_captcha(&app, &captcha_challenges).await;
+        let limited_registration = submit_test_registration(
+            &app,
+            &third_captcha_cookie,
+            &third_captcha_answer,
+            "third@example.test",
+            "NewGuy3",
+            "203.0.113.40",
+        )
+        .await;
+        let limited_registration: serde_json::Value = serde_json::from_slice(
+            &to_bytes(limited_registration.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(limited_registration["code"], 1);
+        assert!(
+            limited_registration["message"]
+                .as_str()
+                .unwrap()
+                .contains("2 accounts")
         );
 
         let login = app

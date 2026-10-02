@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} - {{ site_name }}</title>
+  {% if use_recaptcha %}<script src="https://www.recaptcha.net/recaptcha/api.js" async defer></script>{% endif %}
+  <style>
+    body { background: #f4f6f9; color: #343a40; font: 16px system-ui, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { background: white; border-radius: 8px; box-shadow: 0 8px 28px #0002; box-sizing: border-box; max-width: 440px; padding: 2rem; width: calc(100% - 2rem); }
+    h1 { font-size: 1.6rem; margin: 0 0 .4rem; } p { color: #667085; margin: 0 0 1.5rem; }
+    label { display: block; font-weight: 600; margin: 1rem 0 .4rem; }
+    input[type=text], input[type=email], input[type=password] { border: 1px solid #c9ced6; border-radius: 4px; box-sizing: border-box; font: inherit; padding: .7rem; width: 100%; }
+    button { background: #007bff; border: 0; border-radius: 4px; color: white; cursor: pointer; font: inherit; margin-top: 1.3rem; padding: .75rem; width: 100%; }
+    #error { color: #b42318; min-height: 1.4rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{ site_name }}</h1>
+    <p>{{ prompt }}</p>
+    <form id="register-form">
+      <label for="email">{{ email_label }}</label>
+      <input id="email" name="email" type="email" autocomplete="email" maxlength="100" required>
+      {% if player_name_registration %}
+      <label for="player_name">{{ account_label }}</label>
+      <input id="player_name" name="player_name" type="text" autocomplete="username" required>
+      {% else %}
+      <label for="nickname">{{ account_label }}</label>
+      <input id="nickname" name="nickname" type="text" autocomplete="nickname" maxlength="255" required>
+      {% endif %}
+      <label for="password">{{ password_label }}</label>
+      <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="32" required>
+      <label>{{ captcha_label }}</label>
+      {% if use_recaptcha %}
+      <div class="g-recaptcha" data-sitekey="{{ recaptcha_sitekey }}"></div>
+      {% else %}
+      <img id="captcha-image" src="/auth/captcha" alt="CAPTCHA image" width="180" height="60">
+      <button id="refresh-captcha" type="button">↻</button>
+      <input id="captcha" name="captcha" type="text" autocomplete="off" required>
+      {% endif %}
+      <div id="error" role="alert"></div>
+      <button type="submit">{{ submit_label }}</button>
+    </form>
+    <p><a href="/auth/login">Log in</a></p>
+  </main>
+  <script>
+    const form = document.getElementById('register-form');
+    const error = document.getElementById('error');
+    {% if use_recaptcha %}{% else %}
+    document.getElementById('refresh-captcha').addEventListener('click', () => {
+      document.getElementById('captcha-image').src = '/auth/captcha?' + Date.now();
+    });
+    {% endif %}
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button[type=submit]');
+      button.disabled = true;
+      error.textContent = '';
+      const data = {
+        email: document.getElementById('email').value,
+        password: document.getElementById('password').value,
+        captcha: {% if use_recaptcha %}document.querySelector('[name="g-recaptcha-response"]').value{% else %}document.getElementById('captcha').value{% endif %}
+      };
+      {% if player_name_registration %}
+      data.player_name = document.getElementById('player_name').value;
+      {% else %}
+      data.nickname = document.getElementById('nickname').value;
+      {% endif %}
+      try {
+        const response = await fetch('/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify(data)
+        });
+        const result = await response.json();
+        if (response.ok && result.code === 0) {
+          window.location.href = '/user';
+          return;
+        }
+        error.textContent = result.message || 'Registration failed.';
+      } catch (_) {
+        error.textContent = 'Unable to connect to the server.';
+      }
+      button.disabled = false;
+    });
+  </script>
+</body>
+</html>
