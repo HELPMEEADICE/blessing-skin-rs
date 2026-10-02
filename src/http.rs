@@ -132,6 +132,22 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
+        .route(
+            "/admin/options",
+            get(crate::admin_settings::options_page).post(crate::admin_settings::save_options),
+        )
+        .route(
+            "/admin/score",
+            get(crate::admin_settings::score_page).post(crate::admin_settings::save_score),
+        )
+        .route(
+            "/admin/customize",
+            get(crate::admin_settings::customize_page).post(crate::admin_settings::save_customize),
+        )
+        .route(
+            "/admin/resource",
+            get(crate::admin_settings::resource_page).post(crate::admin_settings::save_resource),
+        )
         .route("/skinlib", get(skinlib_page))
         .route("/skinlib/upload", get(texture_upload_page))
         .route("/skinlib/show/{tid}", get(skinlib_show_page))
@@ -270,12 +286,17 @@ struct EmailVerificationPage {
 
 async fn login_page(State(state): State<AppState>) -> Response {
     let site_name = match &state.database {
-        Some(database) => database
-            .option(&state.config.database.table_prefix, "site_name")
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "Blessing Skin".to_owned()),
+        Some(database) => {
+            let prefix = &state.config.database.table_prefix;
+            let localized = format!("site_name_{}", state.config.locale);
+            database
+                .option(prefix, &localized)
+                .await
+                .ok()
+                .flatten()
+                .or(database.option(prefix, "site_name").await.ok().flatten())
+                .unwrap_or_else(|| "Blessing Skin".to_owned())
+        }
         None => "Blessing Skin".to_owned(),
     };
     let chinese = state.config.locale.starts_with("zh");
@@ -2223,7 +2244,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     }
 }
 
-async fn site_name(state: &AppState) -> String {
+pub(crate) async fn site_name(state: &AppState) -> String {
     match &state.database {
         Some(database) => database
             .option(&state.config.database.table_prefix, "site_name")
@@ -5011,7 +5032,7 @@ fn texture_info_json(texture: TextureInfoRecord) -> serde_json::Value {
     })
 }
 
-async fn authenticated_web_user(
+pub(crate) async fn authenticated_web_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<UserProfile, Response> {
@@ -10312,6 +10333,77 @@ mod tests {
             .await
             .unwrap();
         assert!(verified_state);
+
+        let non_admin_settings =
+            session_request(&app, &registered_cookie, "GET", "/admin/options", None).await;
+        assert_eq!(non_admin_settings.status(), StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE users SET permission = 2 WHERE uid = ?")
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let settings_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/options", None).await;
+        assert_eq!(settings_page.status(), StatusCode::OK);
+        let settings_html = String::from_utf8(
+            to_bytes(settings_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(settings_html.contains("data-section=\"general\""));
+        for settings_path in ["/admin/score", "/admin/customize", "/admin/resource"] {
+            let section_page =
+                session_request(&app, &registered_cookie, "GET", settings_path, None).await;
+            assert_eq!(section_page.status(), StatusCode::OK, "{settings_path}");
+        }
+        let saved_settings = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/admin/options",
+            Some(r#"{"values":{"site_name":"Settings Integration","require_verification":true}}"#),
+        )
+        .await;
+        assert_eq!(saved_settings.status(), StatusCode::OK);
+        let saved_settings: serde_json::Value = serde_json::from_slice(
+            &to_bytes(saved_settings.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved_settings["code"], 0);
+        let localized_site_name: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'site_name_en'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(localized_site_name, "Settings Integration");
+        let localized_home = session_request(&app, &registered_cookie, "GET", "/", None).await;
+        let localized_home = String::from_utf8(
+            to_bytes(localized_home.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(localized_home.contains("Settings Integration"));
+        let invalid_setting = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/admin/options",
+            Some(r#"{"values":{"arbitrary_database_key":"unsafe"}}"#),
+        )
+        .await;
+        assert_eq!(invalid_setting.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        sqlx::query("UPDATE users SET permission = 0 WHERE uid = ?")
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let reset_path = format!("/auth/reset/{}", registered_user.0);
         let reset_expiry = super::unix_timestamp() + 3600;

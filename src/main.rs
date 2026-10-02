@@ -1,3 +1,4 @@
+mod admin_settings;
 mod auth;
 mod config;
 mod database;

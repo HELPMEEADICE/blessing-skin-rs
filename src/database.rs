@@ -733,6 +733,104 @@ impl DatabasePool {
         }
     }
 
+    pub async fn all_options(&self, prefix: &str) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let sql = format!("SELECT option_name, option_value FROM {prefix}options");
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
+    pub async fn set_option(
+        &self,
+        prefix: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        let (update_sql, exists_sql, insert_sql) = match self {
+            Self::Postgres(_) => (
+                format!("UPDATE {prefix}options SET option_value = $1 WHERE option_name = $2"),
+                format!("SELECT COUNT(*) FROM {prefix}options WHERE option_name = $1"),
+                format!("INSERT INTO {prefix}options (option_name, option_value) VALUES ($1, $2)"),
+            ),
+            Self::Sqlite(_) | Self::MySql(_) => (
+                format!("UPDATE {prefix}options SET option_value = ? WHERE option_name = ?"),
+                format!("SELECT COUNT(*) FROM {prefix}options WHERE option_name = ?"),
+                format!("INSERT INTO {prefix}options (option_name, option_value) VALUES (?, ?)"),
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(value)
+                    .bind(key)
+                    .execute(pool)
+                    .await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(key)
+                    .fetch_one(pool)
+                    .await?;
+                if exists == 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                        .bind(key)
+                        .bind(value)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(value)
+                    .bind(key)
+                    .execute(pool)
+                    .await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(key)
+                    .fetch_one(pool)
+                    .await?;
+                if exists == 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                        .bind(key)
+                        .bind(value)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(value)
+                    .bind(key)
+                    .execute(pool)
+                    .await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(key)
+                    .fetch_one(pool)
+                    .await?;
+                if exists == 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                        .bind(key)
+                        .bind(value)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn submit_report(
         &self,
         prefix: &str,
@@ -6136,6 +6234,32 @@ mod tests {
                 .unwrap();
         }
         let database = DatabasePool::Sqlite(pool.clone());
+        assert_eq!(database.all_options("bs_").await.unwrap().len(), 1);
+        database
+            .set_option("bs_", "site_name", "Updated legacy site")
+            .await
+            .unwrap();
+        database
+            .set_option("bs_", "require_verification", "true")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .option("bs_", "site_name")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Updated legacy site")
+        );
+        assert_eq!(
+            database
+                .option("bs_", "require_verification")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(database.all_options("bs_").await.unwrap().len(), 2);
         let (pending_reports, report_count) = database
             .report_management_items(
                 "bs_",
@@ -6662,7 +6786,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("Legacy Instance")
+            Some("Updated legacy site")
         );
         assert_eq!(
             database.texture_hash("bs_", 12).await.unwrap().as_deref(),
