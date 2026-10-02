@@ -3035,29 +3035,30 @@ async fn review_report_action(
         .as_ref()
         .and_then(|request| request.get("action"))
         .and_then(serde_json::Value::as_str)
-        .filter(|action| matches!(*action, "reject" | "ban"))
+        .filter(|action| matches!(*action, "reject" | "ban" | "delete"))
     else {
         return report_review_validation_error(&state.config.locale);
     };
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let reporter_score_modification = match database
-        .option(
-            &state.config.database.table_prefix,
-            "reporter_score_modification",
-        )
-        .await
+    let reporter_score_modification = match read_score_option(
+        database,
+        &state.config.database.table_prefix,
+        "reporter_score_modification",
+        0,
+    )
+    .await
     {
-        Ok(value) => value
-            .as_deref()
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => value,
         Err(error) => {
             tracing::error!(%error, "failed to read report score modifier");
             return unavailable();
         }
     };
+    if action == "delete" {
+        return delete_reported_texture(state, id, reporter_score_modification).await;
+    }
     let outcome = if action == "reject" {
         database
             .reject_report(
@@ -3146,6 +3147,215 @@ fn report_review_validation_error(locale: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn delete_reported_texture(
+    state: &AppState,
+    report_id: i64,
+    reporter_score_modification: i64,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let filters = ReportSearchFilters {
+        id: Some(report_id),
+        ..Default::default()
+    };
+    let mut reports = match database
+        .report_management_items(
+            &state.config.database.table_prefix,
+            &filters,
+            "report_at",
+            true,
+            1,
+            1,
+        )
+        .await
+    {
+        Ok((reports, _)) => reports,
+        Err(error) => {
+            tracing::error!(%error, report_id, "failed to load report for texture deletion");
+            return unavailable();
+        }
+    };
+    let Some(report) = reports.pop() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let texture = if let Some(tid) = report.texture_tid {
+        match database
+            .texture_info(&state.config.database.table_prefix, tid)
+            .await
+        {
+            Ok(texture) => texture,
+            Err(error) => {
+                tracing::error!(%error, tid, "failed to load texture reported for deletion");
+                return unavailable();
+            }
+        }
+    } else {
+        None
+    };
+    let Some(texture) = texture else {
+        return match database
+            .resolve_report_without_texture(
+                &state.config.database.table_prefix,
+                report_id,
+                reporter_score_modification,
+            )
+            .await
+        {
+            Ok(crate::database::ReportReviewOutcome::Resolved) => login_result(
+                0,
+                if state.config.locale.starts_with("zh") {
+                    "请求的材质已被删除"
+                } else {
+                    "The requested texture has been deleted."
+                },
+                Some(serde_json::json!({ "status": 1 })),
+            ),
+            Ok(crate::database::ReportReviewOutcome::NotFound) => {
+                StatusCode::NOT_FOUND.into_response()
+            }
+            Ok(_) => unreachable!("missing texture resolution has no other outcome"),
+            Err(error) => {
+                tracing::error!(%error, report_id, "failed to resolve report with deleted texture");
+                unavailable()
+            }
+        };
+    };
+    let prefix = &state.config.database.table_prefix;
+    let return_score = match read_bool_option(database, prefix, "return_score", true).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score return option");
+            return unavailable();
+        }
+    };
+    let public_cost = match read_score_option(database, prefix, "score_per_storage", 0).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read public texture storage score");
+            return unavailable();
+        }
+    };
+    let private_cost =
+        match read_score_option(database, prefix, "private_score_per_storage", 10).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "failed to read private texture storage score");
+                return unavailable();
+            }
+        };
+    let public_award = match read_score_option(database, prefix, "score_award_per_texture", 0).await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score award");
+            return unavailable();
+        }
+    };
+    let take_back_award =
+        match read_bool_option(database, prefix, "take_back_scores_after_deletion", true).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "failed to read texture award return option");
+                return unavailable();
+            }
+        };
+    let closet_refund = if return_score {
+        match read_score_option(database, prefix, "score_per_closet_item", 0).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "failed to read closet item score");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    let reporter_reward = if report.status == 0 {
+        match read_score_option(database, prefix, "reporter_reward_score", 0).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "failed to read reporter reward score");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    let reporter_adjustment = if report.status == 0 {
+        reporter_score_modification
+            .min(0)
+            .saturating_neg()
+            .saturating_add(reporter_reward)
+    } else {
+        0
+    };
+    let uploader_refund = texture_delete_score_refund(
+        &texture,
+        return_score,
+        public_cost,
+        private_cost,
+        public_award,
+        take_back_award,
+    );
+    let remove_texture_file = match database
+        .delete_reported_texture(
+            prefix,
+            &texture,
+            report_id,
+            reporter_adjustment,
+            uploader_refund,
+            closet_refund,
+        )
+        .await
+    {
+        Ok(crate::database::TextureDeleteOutcome::Deleted(remove_file)) => remove_file,
+        Ok(crate::database::TextureDeleteOutcome::ReportNotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, tid = texture.tid, report_id, "failed to delete reported texture");
+            return unavailable();
+        }
+    };
+    if remove_texture_file && valid_texture_hash(&texture.hash) {
+        let file_path = state.config.textures_dir.join(&texture.hash);
+        if let Err(error) = tokio::fs::remove_file(file_path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, hash = texture.hash, "failed to remove reported texture file");
+            }
+        }
+    }
+    report_review_success(state, 1)
+}
+
+async fn read_score_option(
+    database: &DatabasePool,
+    prefix: &str,
+    name: &str,
+    default: i64,
+) -> Result<i64, sqlx::Error> {
+    Ok(database
+        .option(prefix, name)
+        .await?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default))
+}
+
+async fn read_bool_option(
+    database: &DatabasePool,
+    prefix: &str,
+    name: &str,
+    default: bool,
+) -> Result<bool, sqlx::Error> {
+    Ok(database
+        .option(prefix, name)
+        .await?
+        .as_deref()
+        .map(|value| parse_legacy_form_bool(value).unwrap_or(false))
+        .unwrap_or(default))
 }
 
 async fn admin_reports_response(state: &AppState, query: AdminReportListQuery) -> Response {
@@ -4152,6 +4362,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE user_closet (user_uid INTEGER NOT NULL, texture_tid INTEGER NOT NULL, item_name TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE options (id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -4174,7 +4388,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO reports (id,tid,uploader,reporter,reason,status,report_at) VALUES (1,2,7,7,'stolen skin',0,'2026-10-02 14:00:00'), (2,2,8,7,'second report',0,'2026-10-02 15:00:00')")
+        sqlx::query("INSERT INTO reports (id,tid,uploader,reporter,reason,status,report_at) VALUES (1,2,7,7,'stolen skin',0,'2026-10-02 14:00:00'), (2,2,8,7,'second report',0,'2026-10-02 15:00:00'), (3,2,7,7,'third report',0,'2026-10-02 13:00:00'), (4,99,8,7,'texture already deleted',0,'2026-10-02 12:00:00')")
             .execute(&pool)
             .await
             .unwrap();
@@ -4312,7 +4526,7 @@ mod tests {
         let report_page: serde_json::Value = serde_json::from_slice(&report_page).unwrap();
         assert_eq!(report_page["current_page"], 1);
         assert_eq!(report_page["last_page"], 1);
-        assert_eq!(report_page["total"], 2);
+        assert_eq!(report_page["total"], 4);
         assert_eq!(report_page["data"][0]["tid"], 2);
         assert_eq!(report_page["data"][0]["texture"]["hash"], "reported-hash");
         assert_eq!(report_page["data"][0]["informer"]["ip"], "");
@@ -4375,6 +4589,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rewarded_score, 6);
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/reports/3")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"delete"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted_body = to_bytes(deleted.into_body(), usize::MAX).await.unwrap();
+        let deleted_body: serde_json::Value = serde_json::from_slice(&deleted_body).unwrap();
+        assert_eq!(deleted_body["code"], 0);
+        assert_eq!(deleted_body["data"]["status"], 1);
+        let texture_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM textures WHERE tid = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(texture_count, 0);
+        let deletion_report_status: i64 =
+            sqlx::query_scalar("SELECT status FROM reports WHERE id = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deletion_report_status, 1);
+        let final_reporter_score: i64 = sqlx::query_scalar("SELECT score FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_reporter_score, 9);
+
+        let missing_texture_report = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/reports/4")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"delete"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_texture_report.status(), StatusCode::OK);
+        let missing_body = to_bytes(missing_texture_report.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_body: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(missing_body["code"], 0);
+        assert_eq!(
+            missing_body["message"],
+            "The requested texture has been deleted."
+        );
+        assert_eq!(missing_body["data"]["status"], 1);
+        let final_reporter_score: i64 = sqlx::query_scalar("SELECT score FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_reporter_score, 9);
 
         let logout = app
             .oneshot(

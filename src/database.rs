@@ -193,6 +193,11 @@ pub enum TextureUploadOutcome {
     InsufficientScore,
     Uploaded(i64),
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum TextureDeleteOutcome {
+    Deleted(bool),
+    ReportNotFound,
+}
 #[derive(Debug)]
 pub enum PlayerRenameOutcome {
     NotFound,
@@ -1361,9 +1366,102 @@ impl DatabasePool {
         uploader_score_refund: i64,
         closet_score_refund: i64,
     ) -> Result<bool, sqlx::Error> {
+        match self
+            .delete_texture_inner(
+                prefix,
+                texture,
+                uploader_score_refund,
+                closet_score_refund,
+                None,
+            )
+            .await?
+        {
+            TextureDeleteOutcome::Deleted(remove_shared_file) => Ok(remove_shared_file),
+            TextureDeleteOutcome::ReportNotFound => unreachable!("no report was supplied"),
+        }
+    }
+
+    pub async fn delete_reported_texture(
+        &self,
+        prefix: &str,
+        texture: &TextureInfoRecord,
+        report_id: i64,
+        reporter_score_adjustment: i64,
+        uploader_score_refund: i64,
+        closet_score_refund: i64,
+    ) -> Result<TextureDeleteOutcome, sqlx::Error> {
+        self.delete_texture_inner(
+            prefix,
+            texture,
+            uploader_score_refund,
+            closet_score_refund,
+            Some((report_id, reporter_score_adjustment)),
+        )
+        .await
+    }
+
+    async fn delete_texture_inner(
+        &self,
+        prefix: &str,
+        texture: &TextureInfoRecord,
+        uploader_score_refund: i64,
+        closet_score_refund: i64,
+        report_review: Option<(i64, i64)>,
+    ) -> Result<TextureDeleteOutcome, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let report_lock = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let status_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "INTEGER"
+        };
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let report_sql = format!(
+            "SELECT CAST(status AS {status_cast}), CAST(reporter AS {integer_cast}) \
+             FROM {prefix}reports WHERE id = {} LIMIT 1{report_lock}",
+            marker(1)
+        );
+        let report_score_sql = format!(
+            "UPDATE {prefix}users SET score = score + {} WHERE uid = {}",
+            marker(1),
+            marker(2)
+        );
+        let report_status_sql = format!(
+            "UPDATE {prefix}reports SET status = 1 WHERE id = {}",
+            marker(1)
+        );
         let delete_shared_file = match self {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
+                let report_review_state = if let Some((report_id, score_adjustment)) = report_review
+                {
+                    let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                        .bind(report_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                    let Some((status, reporter_id)) = report else {
+                        transaction.rollback().await?;
+                        return Ok(TextureDeleteOutcome::ReportNotFound);
+                    };
+                    Some((report_id, status, reporter_id, score_adjustment))
+                } else {
+                    None
+                };
                 let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = ?");
                 let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
                     .bind(&texture.hash)
@@ -1423,11 +1521,40 @@ impl DatabasePool {
                     .bind(texture.tid)
                     .execute(&mut *transaction)
                     .await?;
+                if let Some((report_id, status, reporter_id, score_adjustment)) =
+                    report_review_state
+                {
+                    if status == 0 && score_adjustment != 0 {
+                        sqlx::query(sqlx::AssertSqlSafe(report_score_sql))
+                            .bind(score_adjustment)
+                            .bind(reporter_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    sqlx::query(sqlx::AssertSqlSafe(report_status_sql))
+                        .bind(report_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
                 transaction.commit().await?;
-                reference_count == 1
+                TextureDeleteOutcome::Deleted(reference_count == 1)
             }
             Self::MySql(pool) => {
                 let mut transaction = pool.begin().await?;
+                let report_review_state = if let Some((report_id, score_adjustment)) = report_review
+                {
+                    let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                        .bind(report_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                    let Some((status, reporter_id)) = report else {
+                        transaction.rollback().await?;
+                        return Ok(TextureDeleteOutcome::ReportNotFound);
+                    };
+                    Some((report_id, status, reporter_id, score_adjustment))
+                } else {
+                    None
+                };
                 let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = ?");
                 let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
                     .bind(&texture.hash)
@@ -1487,11 +1614,40 @@ impl DatabasePool {
                     .bind(texture.tid)
                     .execute(&mut *transaction)
                     .await?;
+                if let Some((report_id, status, reporter_id, score_adjustment)) =
+                    report_review_state
+                {
+                    if status == 0 && score_adjustment != 0 {
+                        sqlx::query(sqlx::AssertSqlSafe(report_score_sql))
+                            .bind(score_adjustment)
+                            .bind(reporter_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    sqlx::query(sqlx::AssertSqlSafe(report_status_sql))
+                        .bind(report_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
                 transaction.commit().await?;
-                reference_count == 1
+                TextureDeleteOutcome::Deleted(reference_count == 1)
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
+                let report_review_state = if let Some((report_id, score_adjustment)) = report_review
+                {
+                    let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                        .bind(report_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                    let Some((status, reporter_id)) = report else {
+                        transaction.rollback().await?;
+                        return Ok(TextureDeleteOutcome::ReportNotFound);
+                    };
+                    Some((report_id, status, reporter_id, score_adjustment))
+                } else {
+                    None
+                };
                 let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = $1");
                 let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
                     .bind(&texture.hash)
@@ -1551,12 +1707,145 @@ impl DatabasePool {
                     .bind(texture.tid)
                     .execute(&mut *transaction)
                     .await?;
+                if let Some((report_id, status, reporter_id, score_adjustment)) =
+                    report_review_state
+                {
+                    if status == 0 && score_adjustment != 0 {
+                        sqlx::query(sqlx::AssertSqlSafe(report_score_sql))
+                            .bind(score_adjustment)
+                            .bind(reporter_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    sqlx::query(sqlx::AssertSqlSafe(report_status_sql))
+                        .bind(report_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
                 transaction.commit().await?;
-                reference_count == 1
+                TextureDeleteOutcome::Deleted(reference_count == 1)
             }
         };
         Ok(delete_shared_file)
     }
+    pub async fn resolve_report_without_texture(
+        &self,
+        prefix: &str,
+        report_id: i64,
+        reporter_score_modification: i64,
+    ) -> Result<ReportReviewOutcome, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let lock_clause = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let status_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "INTEGER"
+        };
+        let report_sql = format!(
+            "SELECT CAST(status AS {status_cast}), CAST(reporter AS {integer_cast}) \
+             FROM {prefix}reports WHERE id = {} LIMIT 1{lock_clause}",
+            marker(1)
+        );
+        let refund = reporter_score_modification.min(0).saturating_neg();
+        let score_sql = format!(
+            "UPDATE {prefix}users SET score = score + {} WHERE uid = {}",
+            marker(1),
+            marker(2)
+        );
+        let status_sql = format!(
+            "UPDATE {prefix}reports SET status = 1 WHERE id = {}",
+            marker(1)
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && refund > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(refund)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(status_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && refund > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(refund)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(status_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && refund > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(refund)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(status_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(ReportReviewOutcome::Resolved)
+    }
+
     pub async fn player_profile(
         &self,
         prefix: &str,
