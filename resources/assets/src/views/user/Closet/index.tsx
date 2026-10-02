@@ -22,9 +22,9 @@ import removeClosetItem from './removeClosetItem'
 type Category = 'skin' | 'cape'
 
 const updater = debounce(
-  <T extends unknown>(
-    value: React.SetStateAction<T>,
-    setter: React.Dispatch<React.SetStateAction<T>>,
+  (
+    value: React.SetStateAction<string>,
+    setter: React.Dispatch<React.SetStateAction<string>>,
   ) => setter(value),
   350,
 )

@@ -1,6 +1,14 @@
 import React from 'react'
 
-export default [
+type Route = {
+  path: string
+  module?: Array<() => Promise<unknown>>
+  react?: () => Promise<{ default: React.ComponentType }>
+  el?: string | Element | null
+  frame?: () => React.ReactNode
+}
+
+const routes: Route[] = [
   {
     path: 'user',
     react: () => import('../views/user/Dashboard'),
@@ -116,3 +124,5 @@ export default [
     el: '#file-input',
   },
 ]
+
+export default routes

@@ -31,7 +31,9 @@ if (route) {
       </React.StrictMode>
     )
     const c =
-      typeof route.el === 'string' ? document.querySelector(route.el) : route.el
+      typeof route.el === 'string'
+        ? document.querySelector(route.el)
+        : route.el ?? null
     ReactDOM.render(<Root />, c)
   }
 }
