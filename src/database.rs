@@ -97,6 +97,24 @@ pub enum PlayerRenameOutcome {
     },
 }
 #[derive(Debug)]
+pub enum ClosetAddOutcome {
+    Added,
+    NameExists,
+    InsufficientScore,
+    TextureNotFound,
+    PrivateTexture,
+}
+#[derive(Debug)]
+pub enum ClosetRenameOutcome {
+    Renamed,
+    NotInCloset,
+}
+#[derive(Debug)]
+pub enum ClosetRemoveOutcome {
+    Removed,
+    NotInCloset,
+}
+#[derive(Debug)]
 pub enum PlayerAddOutcome {
     NameExists,
     InsufficientScore,
@@ -501,6 +519,565 @@ impl DatabasePool {
         })
     }
 
+    pub async fn add_closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+        name: &str,
+        score_cost: i64,
+        is_admin: bool,
+        score_award_per_like: i64,
+    ) -> Result<ClosetAddOutcome, sqlx::Error> {
+        let score_sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ?")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?")
+            }
+        };
+        let score = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        if score.is_none_or(|score| score < score_cost) {
+            return Ok(ClosetAddOutcome::InsufficientScore);
+        }
+
+        let texture_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT public, CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = $1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT public, CAST(uploader AS SIGNED) FROM {prefix}textures WHERE tid = ?"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT public, CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = ?"
+            ),
+        };
+        let texture = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (bool, i64)>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (bool, i64)>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (bool, i64)>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some((is_public, uploader_id)) = texture else {
+            return Ok(ClosetAddOutcome::TextureNotFound);
+        };
+        if !is_public && uploader_id != user_id && !is_admin {
+            return Ok(ClosetAddOutcome::PrivateTexture);
+        }
+
+        let duplicate_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        let duplicate_count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if duplicate_count > 0 {
+            return Ok(ClosetAddOutcome::NameExists);
+        }
+
+        let insert_sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES ($1, $2, $3)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (?, ?, ?)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+
+        if score_cost != 0 {
+            let update_sql = match self {
+                Self::Postgres(_) => format!(
+                    "UPDATE {prefix}users SET score = score - $1 WHERE uid = $2 AND score >= $3"
+                ),
+                _ => format!(
+                    "UPDATE {prefix}users SET score = score - ? WHERE uid = ? AND score >= ?"
+                ),
+            };
+            let updated = match self {
+                Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+                Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+                Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+            };
+            if updated == 0 {
+                let delete_sql = match self {
+                    Self::Postgres(_) => format!(
+                        "DELETE FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+                    ),
+                    _ => format!(
+                        "DELETE FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+                    ),
+                };
+                match self {
+                    Self::Sqlite(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(user_id)
+                            .bind(tid)
+                            .execute(pool)
+                            .await?;
+                    }
+                    Self::MySql(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(user_id)
+                            .bind(tid)
+                            .execute(pool)
+                            .await?;
+                    }
+                    Self::Postgres(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(user_id)
+                            .bind(tid)
+                            .execute(pool)
+                            .await?;
+                    }
+                }
+                return Ok(ClosetAddOutcome::InsufficientScore);
+            }
+        }
+
+        let likes_sql = format!(
+            "UPDATE {prefix}textures SET likes = likes + 1 WHERE tid = {}",
+            if matches!(self, Self::Postgres(_)) {
+                "$1"
+            } else {
+                "?"
+            }
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        if uploader_id != user_id && score_award_per_like != 0 {
+            let award_sql = match self {
+                Self::Postgres(_) => {
+                    format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2")
+                }
+                _ => format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?"),
+            };
+            match self {
+                Self::Sqlite(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(award_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::MySql(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(award_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::Postgres(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(award_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        Ok(ClosetAddOutcome::Added)
+    }
+
+    pub async fn rename_closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+        name: &str,
+    ) -> Result<ClosetRenameOutcome, sqlx::Error> {
+        let exists_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        let exists = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if exists == 0 {
+            return Ok(ClosetRenameOutcome::NotInCloset);
+        }
+        let update_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}user_closet SET item_name = $1 WHERE user_uid = $2 AND texture_tid = $3"
+            ),
+            _ => format!(
+                "UPDATE {prefix}user_closet SET item_name = ? WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(name)
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(name)
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(name)
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(ClosetRenameOutcome::Renamed)
+    }
+
+    pub async fn remove_closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+        return_score: bool,
+        score_refund: i64,
+        score_award_per_like: i64,
+    ) -> Result<ClosetRemoveOutcome, sqlx::Error> {
+        let exists_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        let exists = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if exists == 0 {
+            return Ok(ClosetRemoveOutcome::NotInCloset);
+        }
+        let texture_sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = $1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(uploader AS SIGNED) FROM {prefix}textures WHERE tid = ?")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = ?")
+            }
+        };
+        let uploader_id = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                    .bind(tid)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some(uploader_id) = uploader_id else {
+            return Ok(ClosetRemoveOutcome::NotInCloset);
+        };
+        let delete_sql = match self {
+            Self::Postgres(_) => {
+                format!("DELETE FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2")
+            }
+            _ => format!("DELETE FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        if return_score && score_refund != 0 {
+            let refund_sql = match self {
+                Self::Postgres(_) => {
+                    format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2")
+                }
+                _ => format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?"),
+            };
+            match self {
+                Self::Sqlite(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                        .bind(score_refund)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::MySql(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                        .bind(score_refund)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::Postgres(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                        .bind(score_refund)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        let likes_sql = format!(
+            "UPDATE {prefix}textures SET likes = likes - 1 WHERE tid = {}",
+            if matches!(self, Self::Postgres(_)) {
+                "$1"
+            } else {
+                "?"
+            }
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(likes_sql))
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        if score_award_per_like != 0 {
+            let retract_sql = match self {
+                Self::Postgres(_) => {
+                    format!("UPDATE {prefix}users SET score = score - $1 WHERE uid = $2")
+                }
+                _ => format!("UPDATE {prefix}users SET score = score - ? WHERE uid = ?"),
+            };
+            match self {
+                Self::Sqlite(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::MySql(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::Postgres(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_sql))
+                        .bind(score_award_per_like)
+                        .bind(uploader_id)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        Ok(ClosetRemoveOutcome::Removed)
+    }
     pub async fn closet_items(
         &self,
         prefix: &str,
@@ -1346,7 +1923,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Skin', 'alex', 'skin-hash', 8, 7, 1, '2026-10-01 10:00:00', 1), (12, 'Cape', 'cape', 'cape-hash', 9, 7, 1, '2026-10-01 10:01:00', 1), (13, 'Other skin', 'alex', 'not-in-closet', 10, 8, 1, '2026-10-01 10:02:00', 0)")
+        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Skin', 'alex', 'skin-hash', 8, 7, 1, '2026-10-01 10:00:00', 1), (12, 'Cape', 'cape', 'cape-hash', 9, 7, 1, '2026-10-01 10:01:00', 1), (13, 'Other skin', 'alex', 'not-in-closet', 10, 8, 1, '2026-10-01 10:02:00', 0), (14, 'Private skin', 'steve', 'private-hash', 11, 8, 0, '2026-10-01 10:03:00', 4)")
             .execute(&pool)
             .await
             .unwrap();
@@ -1563,10 +2140,62 @@ mod tests {
                 .unwrap(),
             super::PlayerDeleteOutcome::NotFound
         ));
-        sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 13, 'Second skin')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 99, "Missing", 0, false, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::TextureNotFound
+        ));
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 13, "Too costly", 100, false, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::InsufficientScore
+        ));
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 11, "Already saved", 0, false, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::NameExists
+        ));
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 14, "Private", 0, false, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::PrivateTexture
+        ));
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 14, "Admin saved", 0, true, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::Added
+        ));
+        assert!(matches!(
+            database
+                .remove_closet_item("bs_", 7, 14, false, 0, 0)
+                .await
+                .unwrap(),
+            super::ClosetRemoveOutcome::Removed
+        ));
+        assert!(matches!(
+            database
+                .add_closet_item("bs_", 7, 13, "Second skin", 2, false, 0)
+                .await
+                .unwrap(),
+            super::ClosetAddOutcome::Added
+        ));
+        assert!(matches!(
+            database
+                .rename_closet_item("bs_", 7, 13, "Second skin renamed")
+                .await
+                .unwrap(),
+            super::ClosetRenameOutcome::Renamed
+        ));
         let (skin_page, skin_total) = database
             .closet_items("bs_", 7, "skin", None, 1, 1)
             .await
@@ -1576,7 +2205,10 @@ mod tests {
         assert_eq!(skin_page[0].tid, 13);
         assert_eq!(skin_page[0].user_uid, 7);
         assert_eq!(skin_page[0].texture_tid, 13);
-        assert_eq!(skin_page[0].item_name.as_deref(), Some("Second skin"));
+        assert_eq!(
+            skin_page[0].item_name.as_deref(),
+            Some("Second skin renamed")
+        );
         assert!(skin_page[0].is_public);
         let (next_skin_page, next_skin_total) = database
             .closet_items("bs_", 7, "skin", None, 2, 1)
@@ -1590,6 +2222,36 @@ mod tests {
             .unwrap();
         assert_eq!(searched_total, 1);
         assert_eq!(searched_items[0].tid, 13);
+        assert_eq!(
+            searched_items[0].item_name.as_deref(),
+            Some("Second skin renamed")
+        );
+        assert!(matches!(
+            database
+                .remove_closet_item("bs_", 7, 13, true, 2, 0)
+                .await
+                .unwrap(),
+            super::ClosetRemoveOutcome::Removed
+        ));
+        assert!(matches!(
+            database
+                .remove_closet_item("bs_", 7, 99, false, 0, 0)
+                .await
+                .unwrap(),
+            super::ClosetRemoveOutcome::NotInCloset
+        ));
+        assert!(matches!(
+            database
+                .rename_closet_item("bs_", 7, 99, "Missing")
+                .await
+                .unwrap(),
+            super::ClosetRenameOutcome::NotInCloset
+        ));
+        let skin_likes: i64 = sqlx::query_scalar("SELECT likes FROM bs_textures WHERE tid = 13")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(skin_likes, 0);
         let (cape_items, cape_total) = database
             .closet_items("bs_", 7, "cape", None, 1, 6)
             .await

@@ -45,7 +45,11 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/api/user", get(api_user))
-        .route("/api/closet", get(api_closet))
+        .route("/api/closet", get(api_closet).post(api_add_closet_item))
+        .route(
+            "/api/closet/{tid}",
+            put(api_rename_closet_item).delete(api_remove_closet_item),
+        )
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players).post(api_add_player))
@@ -1097,6 +1101,300 @@ fn legacy_option_bool(value: Option<&str>) -> bool {
         Some(_) => true,
     }
 }
+fn closet_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("tid", true) => "材质编号必须是整数。",
+        ("tid", false) => "The tid field must be an integer.",
+        ("name", true) => "名称为必填项。",
+        ("name", false) => "The name field is required.",
+        _ => "The given field is invalid.",
+    };
+    let mut errors = serde_json::Map::new();
+    errors.insert(field.to_owned(), serde_json::json!([field_error]));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
+}
+
+fn texture_id_from_request(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Number(value) => value.as_i64(),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+async fn api_add_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Closet.ReadWrite") {
+        return missing_scope();
+    }
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return closet_validation_error("tid", &state.config.locale),
+    };
+    let Some(tid) = texture_id_from_request(request.get("tid")) else {
+        return closet_validation_error("tid", &state.config.locale);
+    };
+    let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
+        return closet_validation_error("name", &state.config.locale);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return closet_validation_error("name", &state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let user = match database.user_profile(prefix, identity.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet owner");
+            return unavailable();
+        }
+    };
+    let score_cost = match database.option(prefix, "score_per_closet_item").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet score cost");
+            return unavailable();
+        }
+    };
+    let like_award = match database.option(prefix, "score_award_per_like").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load texture like award");
+            return unavailable();
+        }
+    };
+    match database
+        .add_closet_item(
+            prefix,
+            identity.user_id,
+            tid,
+            name,
+            score_cost,
+            user.permission >= 1,
+            like_award,
+        )
+        .await
+    {
+        Ok(crate::database::ClosetAddOutcome::Added) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("材质 {name} 收藏成功")
+            } else {
+                format!("Added {name} to closet successfully.")
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "你已经收藏过这个材质啦"
+            } else {
+                "You have already added this texture."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::InsufficientScore) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "收藏失败，积分不足"
+            } else {
+                "You don't have enough score to add it to closet."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::TextureNotFound) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "该材质不存在"
+            } else {
+                "We cannot find this texture."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::PrivateTexture) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "请求的材质已经设为私密，仅上传者和管理员可查看"
+            } else {
+                "The requested texture is private and only visible to the uploader and admins."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to add a texture to the closet");
+            unavailable()
+        }
+    }
+}
+
+async fn api_rename_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_tid): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Closet.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(tid) = raw_tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return closet_validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
+        return closet_validation_error("name", &state.config.locale);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return closet_validation_error("name", &state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .rename_closet_item(
+            &state.config.database.table_prefix,
+            identity.user_id,
+            tid,
+            name,
+        )
+        .await
+    {
+        Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("衣柜物品成功重命名至 {name}")
+            } else {
+                format!("The item is successfully renamed to {name}")
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetRenameOutcome::NotInCloset) => closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, "failed to rename a closet item");
+            unavailable()
+        }
+    }
+}
+
+async fn api_remove_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_tid): RoutePath<String>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Closet.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(tid) = raw_tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let return_score = match database.option(prefix, "return_score").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet score refund option");
+            return unavailable();
+        }
+    };
+    let score_refund = if return_score {
+        match database.option(prefix, "score_per_closet_item").await {
+            Ok(value) => value
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to load closet score refund");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    let like_award = match database.option(prefix, "score_award_per_like").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load texture like award");
+            return unavailable();
+        }
+    };
+    match database
+        .remove_closet_item(
+            prefix,
+            identity.user_id,
+            tid,
+            return_score,
+            score_refund,
+            like_award,
+        )
+        .await
+    {
+        Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
+            0,
+            if state.config.locale.starts_with("zh") {
+                "材质已从衣柜中移除"
+            } else {
+                "The texture was removed from closet successfully."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetRemoveOutcome::NotInCloset) => closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, "failed to remove a texture from the closet");
+            unavailable()
+        }
+    }
+}
+
+fn closet_item_missing(state: &AppState) -> Response {
+    login_result(
+        1,
+        if state.config.locale.starts_with("zh") {
+            "衣柜中不存在此材质"
+        } else {
+            "The texture does not exist in your closet."
+        },
+        None,
+    )
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClosetListQuery {
@@ -1591,6 +1889,20 @@ const COPYRIGHTS: [&str; 7] = [
 mod tests {
     use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
 
+    #[tokio::test]
+    async fn closet_validation_errors_use_the_requested_field_name() {
+        use axum::body::to_bytes;
+
+        let response = super::closet_validation_error("tid", "en");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["errors"]["tid"][0].as_str().is_some());
+        assert!(value["errors"]["field"].is_null());
+    }
     #[test]
     fn parses_legacy_boolean_options() {
         assert!(super::legacy_option_bool(Some("true")));
