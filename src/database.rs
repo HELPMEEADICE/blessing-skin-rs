@@ -50,6 +50,15 @@ pub struct UserProfile {
     pub verified: bool,
     pub is_dark_mode: bool,
 }
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PlayerRecord {
+    pub pid: i64,
+    pub uid: i64,
+    pub name: String,
+    pub tid_skin: i64,
+    pub tid_cape: i64,
+    pub last_modified: String,
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -270,6 +279,46 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn players_for_user(
+        &self,
+        prefix: &str,
+        uid: i64,
+    ) -> Result<Vec<PlayerRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, \
+                 CAST(tid_skin AS BIGINT) AS tid_skin, CAST(tid_cape AS BIGINT) AS tid_cape, \
+                 to_char(last_modified, 'YYYY-MM-DD HH24:MI:SS') AS last_modified \
+                 FROM {prefix}players WHERE CAST(uid AS BIGINT) = $1 ORDER BY pid"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(pid AS SIGNED) AS pid, CAST(uid AS SIGNED) AS uid, name, \
+                 CAST(tid_skin AS SIGNED) AS tid_skin, CAST(tid_cape AS SIGNED) AS tid_cape, \
+                 DATE_FORMAT(last_modified, '%Y-%m-%d %H:%i:%s') AS last_modified \
+                 FROM {prefix}players WHERE uid = ? ORDER BY pid"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, \
+                 CAST(tid_skin AS BIGINT) AS tid_skin, CAST(tid_cape AS BIGINT) AS tid_cape, \
+                 CAST(last_modified AS TEXT) AS last_modified \
+                 FROM {prefix}players WHERE uid = ? ORDER BY pid"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_all(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_all(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_all(pool)
+                .await?),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -311,7 +360,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_players (pid, uid, name, tid_skin, tid_cape, last_modified) VALUES (3, 7, 'Alex', 11, 12, '2026-10-02 12:00:00')")
+        sqlx::query("INSERT INTO bs_players (pid, uid, name, tid_skin, tid_cape, last_modified) VALUES (3, 7, 'Alex', 11, 12, '2026-10-02 12:00:00'), (4, 8, 'Other', 0, 0, '2026-10-02 13:00:00')")
             .execute(&pool)
             .await
             .unwrap();
@@ -331,6 +380,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(profile.name, "Alex");
+        let players = database.players_for_user("bs_", 7).await.unwrap();
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].pid, 3);
+        assert_eq!(players[0].uid, 7);
+        assert_eq!(players[0].name, "Alex");
+        assert_eq!(players[0].tid_skin, 11);
+        assert_eq!(players[0].tid_cape, 12);
+        assert_eq!(players[0].last_modified, "2026-10-02 12:00:00");
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");

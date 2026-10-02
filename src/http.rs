@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::{
     AppState,
-    auth::{audience_matches, bearer_token, decode_access_token, has_scope},
+    auth::{audience_matches, bearer_token, decode_access_token},
     database::{DatabasePool, PlayerProfile},
 };
 
@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api", any(api_root))
         .route("/api/", any(api_root))
         .route("/api/user", get(api_user))
+        .route("/api/players", get(api_players))
         .route("/{profile}", get(player_json))
         .route("/csl/{profile}", get(player_json))
         .route("/textures/{hash}", get(texture))
@@ -75,55 +76,19 @@ struct ApiRoot {
 }
 
 async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(key) = &state.passport_key else {
-        return unauthenticated();
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
     };
-    let Some(token) = bearer_token(&headers) else {
-        return unauthenticated();
-    };
+    if !identity.has_scope("User.Read") {
+        return missing_scope();
+    }
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let Some(claims) = decode_access_token(token, key) else {
-        return unauthenticated();
-    };
-    if claims.exp <= jsonwebtoken::get_current_timestamp() {
-        return unauthenticated();
-    }
-    let token_record = match database
-        .access_token(&state.config.database.table_prefix, &claims.jti)
-        .await
-    {
-        Ok(Some(record)) => record,
-        Ok(None) => return unauthenticated(),
-        Err(error) => {
-            tracing::error!(%error, "failed to load Passport access token");
-            return unavailable();
-        }
-    };
-    let subject_id = match claims.sub.parse::<i64>() {
-        Ok(subject_id) => subject_id,
-        Err(_) => return unauthenticated(),
-    };
-    if token_record.revoked
-        || token_record.user_id != Some(subject_id)
-        || !audience_matches(claims.aud.as_ref(), token_record.client_id)
-    {
-        return unauthenticated();
-    }
-    if !has_scope(&claims, "User.Read") {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "code": 403,
-                "message": "The access token is missing the required scope."
-            })),
-        )
-            .into_response();
-    }
 
     match database
-        .user_profile(&state.config.database.table_prefix, subject_id)
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
         .await
     {
         Ok(Some(user)) => Json(user).into_response(),
@@ -135,6 +100,102 @@ async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response
     }
 }
 
+async fn api_players(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["Player.Read", "Player.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+
+    match database
+        .players_for_user(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(players) => Json(players).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load authenticated player's list");
+            unavailable()
+        }
+    }
+}
+
+struct AuthenticatedToken {
+    user_id: i64,
+    scopes: Vec<String>,
+}
+
+impl AuthenticatedToken {
+    fn has_scope(&self, required: &str) -> bool {
+        self.scopes.iter().any(|scope| scope == required)
+    }
+
+    fn has_any_scope(&self, required: &[&str]) -> bool {
+        required.iter().any(|scope| self.has_scope(scope))
+    }
+}
+
+async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedToken, Response> {
+    let Some(key) = &state.passport_key else {
+        return Err(unauthenticated());
+    };
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthenticated());
+    };
+    let Some(database) = &state.database else {
+        return Err(unavailable());
+    };
+    let Some(claims) = decode_access_token(token, key) else {
+        return Err(unauthenticated());
+    };
+    if claims.exp <= jsonwebtoken::get_current_timestamp() {
+        return Err(unauthenticated());
+    }
+    let token_record = match database
+        .access_token(&state.config.database.table_prefix, &claims.jti)
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(unauthenticated()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load Passport access token");
+            return Err(unavailable());
+        }
+    };
+    let user_id = match claims.sub.parse::<i64>() {
+        Ok(user_id) => user_id,
+        Err(_) => return Err(unauthenticated()),
+    };
+    if token_record.revoked
+        || token_record.user_id != Some(user_id)
+        || !audience_matches(claims.aud.as_ref(), token_record.client_id)
+    {
+        return Err(unauthenticated());
+    }
+
+    Ok(AuthenticatedToken {
+        user_id,
+        scopes: claims.scopes,
+    })
+}
+
+fn missing_scope() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": 403,
+            "message": "Invalid scope(s) provided."
+        })),
+    )
+        .into_response()
+}
 fn unauthenticated() -> Response {
     (
         StatusCode::UNAUTHORIZED,
