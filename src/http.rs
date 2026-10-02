@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::Cursor,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
-use image::{ImageFormat, ImageReader, Rgb, RgbImage};
+use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage, Rgba, RgbaImage};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
 use pulldown_cmark::{Options, Parser, html as markdown_html};
@@ -192,6 +192,10 @@ pub fn router(state: AppState) -> Router {
         .route("/textures/{hash}", get(texture))
         .route("/csl/textures/{hash}", get(texture))
         .route("/raw/{tid}", get(raw_texture))
+        .route("/avatar/player/{name}", get(avatar_by_player))
+        .route("/avatar/user/{uid}", get(avatar_by_user))
+        .route("/avatar/hash/{hash}", get(avatar_by_hash))
+        .route("/avatar/{tid}", get(avatar_by_texture))
         .with_state(state)
 }
 
@@ -7637,6 +7641,360 @@ async fn raw_texture(
     serve_texture(&state, &hash, &request_headers).await
 }
 
+#[derive(Debug)]
+struct AvatarSource {
+    hash: String,
+    texture_type: String,
+}
+
+async fn avatar_by_player(
+    State(state): State<AppState>,
+    RoutePath(name): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let profile = match database
+        .player_profile(&state.config.database.table_prefix, &name)
+        .await
+    {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, player = %name, "failed to load player avatar");
+            return unavailable();
+        }
+    };
+    if profile.permission == -1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let source = profile
+        .skin_hash
+        .zip(profile.skin_type)
+        .map(|(hash, texture_type)| AvatarSource { hash, texture_type });
+    render_avatar_response(&state, source, &query, &request_headers).await
+}
+
+async fn avatar_by_user(
+    State(state): State<AppState>,
+    RoutePath(uid): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let Some(uid) = uid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load user avatar");
+            return unavailable();
+        }
+    };
+    let texture_id = user.map(|user| user.avatar).filter(|tid| *tid > 0);
+    let source = match texture_id {
+        Some(tid) => match database
+            .texture_info(&state.config.database.table_prefix, tid)
+            .await
+        {
+            Ok(Some(texture)) => Some(AvatarSource {
+                hash: texture.hash,
+                texture_type: texture.texture_type,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::error!(%error, tid, "failed to load user avatar texture");
+                return unavailable();
+            }
+        },
+        None => None,
+    };
+    render_avatar_response(&state, source, &query, &request_headers).await
+}
+
+async fn avatar_by_hash(
+    State(state): State<AppState>,
+    RoutePath(hash): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let source = if valid_texture_hash(&hash) {
+        match database
+            .texture_id_by_hash(&state.config.database.table_prefix, &hash)
+            .await
+        {
+            Ok(Some(tid)) => match database
+                .texture_info(&state.config.database.table_prefix, tid)
+                .await
+            {
+                Ok(Some(texture)) => Some(AvatarSource {
+                    hash: texture.hash,
+                    texture_type: texture.texture_type,
+                }),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::error!(%error, tid, "failed to load avatar texture");
+                    return unavailable();
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                tracing::error!(%error, hash, "failed to find avatar texture");
+                return unavailable();
+            }
+        }
+    } else {
+        None
+    };
+    render_avatar_response(&state, source, &query, &request_headers).await
+}
+
+async fn avatar_by_texture(
+    State(state): State<AppState>,
+    RoutePath(tid): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let Some(tid) = tid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let source = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => Some(AvatarSource {
+            hash: texture.hash,
+            texture_type: texture.texture_type,
+        }),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load avatar texture");
+            return unavailable();
+        }
+    };
+    render_avatar_response(&state, source, &query, &request_headers).await
+}
+
+async fn render_avatar_response(
+    state: &AppState,
+    source: Option<AvatarSource>,
+    query: &HashMap<String, String>,
+    request_headers: &HeaderMap,
+) -> Response {
+    let three_d = query.contains_key("3d");
+    let size = query
+        .get("size")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|size| (1..=1024).contains(size))
+        .unwrap_or(100);
+    let use_png = query.contains_key("png");
+    let format = if use_png {
+        ImageFormat::Png
+    } else {
+        ImageFormat::WebP
+    };
+    let mut modified = None;
+    let mut source_skin = None;
+    if let Some(source) = source {
+        if source.texture_type != "steve" && source.texture_type != "alex" {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        if valid_texture_hash(&source.hash) {
+            let path = state.config.textures_dir.join(&source.hash);
+            if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                if metadata.is_file() {
+                    modified = metadata.modified().ok();
+                    if let Ok(bytes) = tokio::fs::read(path).await {
+                        source_skin = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
+                            .ok()
+                            .filter(|image| {
+                                image.width() == 64
+                                    && (image.height() == 64 || image.height() == 32)
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    let image = match source_skin {
+        Some(skin) => render_skin_avatar(&skin.to_rgba8(), three_d),
+        None => default_avatar(three_d),
+    };
+    let image = image.resize_exact(size, size, image::imageops::FilterType::Nearest);
+    let mut bytes = Vec::new();
+    if image
+        .write_to(&mut Cursor::new(&mut bytes), format)
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let etag = content_etag(&bytes);
+    let ttl = cache_ttl(state).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(if use_png { "image/png" } else { "image/webp" }),
+    );
+    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+    );
+    if let Some(modified) = modified {
+        headers.insert(
+            LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
+        );
+    }
+    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
+        || (!request_headers.contains_key(IF_NONE_MATCH)
+            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        *response.headers_mut() = headers;
+        response.headers_mut().remove(CONTENT_TYPE);
+        response.headers_mut().remove(CONTENT_LENGTH);
+        return response;
+    }
+    let mut response = Response::new(Body::from(bytes));
+    *response.headers_mut() = headers;
+    response
+}
+
+fn default_avatar(three_d: bool) -> DynamicImage {
+    let bytes = if three_d {
+        include_bytes!("../resources/misc/textures/avatar3d.png").as_slice()
+    } else {
+        include_bytes!("../resources/misc/textures/avatar2d.png").as_slice()
+    };
+    image::load_from_memory_with_format(bytes, ImageFormat::Png).expect("built-in avatar is valid")
+}
+
+fn render_skin_avatar(skin: &RgbaImage, three_d: bool) -> DynamicImage {
+    if skin.width() < 64 || skin.height() < 32 {
+        return default_avatar(three_d);
+    }
+    if !three_d {
+        let mut face = image::imageops::crop_imm(skin, 8, 8, 8, 8).to_image();
+        if skin.height() >= 64 {
+            let hat = image::imageops::crop_imm(skin, 40, 8, 8, 8).to_image();
+            image::imageops::overlay(&mut face, &hat, 0, 0);
+        }
+        return DynamicImage::ImageRgba8(face);
+    }
+
+    let mut canvas = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
+    let right = textured_head_face(
+        skin,
+        (16, 8),
+        if skin.height() >= 64 {
+            Some((48, 8))
+        } else {
+            None
+        },
+    );
+    let top = textured_head_face(
+        skin,
+        (8, 0),
+        if skin.height() >= 64 {
+            Some((40, 0))
+        } else {
+            None
+        },
+    );
+    let front = textured_head_face(
+        skin,
+        (8, 8),
+        if skin.height() >= 64 {
+            Some((40, 8))
+        } else {
+            None
+        },
+    );
+    draw_textured_quad(&mut canvas, &right, (43.0, 24.0), (11.0, -7.0), (0.0, 30.0));
+    draw_textured_quad(&mut canvas, &top, (13.0, 24.0), (30.0, 0.0), (11.0, -7.0));
+    draw_textured_quad(&mut canvas, &front, (13.0, 24.0), (30.0, 0.0), (0.0, 30.0));
+    DynamicImage::ImageRgba8(canvas)
+}
+
+fn textured_head_face(
+    skin: &RgbaImage,
+    base: (u32, u32),
+    overlay: Option<(u32, u32)>,
+) -> RgbaImage {
+    let mut face = image::imageops::crop_imm(skin, base.0, base.1, 8, 8).to_image();
+    if let Some((x, y)) = overlay {
+        let hat = image::imageops::crop_imm(skin, x, y, 8, 8).to_image();
+        image::imageops::overlay(&mut face, &hat, 0, 0);
+    }
+    face
+}
+
+fn draw_textured_quad(
+    destination: &mut RgbaImage,
+    texture: &RgbaImage,
+    origin: (f32, f32),
+    axis_u: (f32, f32),
+    axis_v: (f32, f32),
+) {
+    let determinant = axis_u.0 * axis_v.1 - axis_u.1 * axis_v.0;
+    if determinant.abs() < f32::EPSILON {
+        return;
+    }
+    for y in 0..destination.height() {
+        for x in 0..destination.width() {
+            let dx = x as f32 + 0.5 - origin.0;
+            let dy = y as f32 + 0.5 - origin.1;
+            let u = (dx * axis_v.1 - dy * axis_v.0) / determinant;
+            let v = (axis_u.0 * dy - axis_u.1 * dx) / determinant;
+            if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
+                let sx = (u * texture.width() as f32) as u32;
+                let sy = (v * texture.height() as f32) as u32;
+                let foreground = texture.get_pixel(sx.min(7), sy.min(7));
+                let background = destination.get_pixel(x, y);
+                let alpha = u32::from(foreground[3]);
+                if alpha == 255 {
+                    destination.put_pixel(x, y, *foreground);
+                } else if alpha > 0 {
+                    let background_alpha = u32::from(background[3]);
+                    let inverse_alpha = 255 - alpha;
+                    let output_alpha = alpha + (background_alpha * inverse_alpha + 127) / 255;
+                    let mut blended = [0_u8; 4];
+                    for channel in 0..3 {
+                        let front = u32::from(foreground[channel]) * alpha;
+                        let back =
+                            (u32::from(background[channel]) * background_alpha * inverse_alpha
+                                + 127)
+                                / 255;
+                        blended[channel] = ((front + back) / output_alpha.max(1)).min(255) as u8;
+                    }
+                    blended[3] = output_alpha.min(255) as u8;
+                    destination.put_pixel(x, y, Rgba(blended));
+                }
+            }
+        }
+    }
+}
+
 async fn serve_texture(state: &AppState, hash: &str, request_headers: &HeaderMap) -> Response {
     let file_path = state.config.textures_dir.join(hash);
     let metadata = match tokio::fs::metadata(&file_path).await {
@@ -7770,7 +8128,12 @@ const COPYRIGHTS: [&str; 7] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
+    use image::{GenericImageView, ImageFormat};
+
+    use super::{
+        Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_skin_avatar, router,
+        valid_texture_hash,
+    };
 
     async fn submit_test_registration(
         app: &axum::Router,
@@ -8138,6 +8501,29 @@ mod tests {
     }
 
     #[test]
+    fn renders_skin_face_and_isometric_avatar_layers() {
+        let mut skin = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
+        for y in 8..16 {
+            for x in 8..16 {
+                skin.put_pixel(x, y, Rgba([220, 30, 40, 255]));
+            }
+        }
+        for y in 8..16 {
+            for x in 40..48 {
+                skin.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            }
+        }
+        let flat = render_skin_avatar(&skin, false);
+        assert_eq!((flat.width(), flat.height()), (8, 8));
+        assert_eq!(flat.get_pixel(0, 0), Rgba([220, 30, 40, 255]));
+
+        let isometric = render_skin_avatar(&skin, true);
+        assert_eq!((isometric.width(), isometric.height()), (64, 64));
+        assert_eq!(isometric.get_pixel(20, 30), Rgba([220, 30, 40, 255]));
+        assert!(isometric.pixels().any(|(_, _, pixel)| pixel[3] > 0));
+    }
+
+    #[test]
     fn validates_legacy_texture_types() {
         assert!(super::valid_texture_type("steve"));
         assert!(super::valid_texture_type("alex"));
@@ -8402,6 +8788,77 @@ mod tests {
         let homepage_html = String::from_utf8(homepage_html.to_vec()).unwrap();
         assert!(homepage_html.contains("Skin Server"));
         assert!(homepage_html.contains("/skinlib"));
+
+        let avatar = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/avatar/user/7?png&size=16")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(avatar.status(), StatusCode::OK);
+        assert_eq!(
+            avatar
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/png"
+        );
+        assert!(
+            avatar
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("public, max-age=")
+        );
+        let avatar_etag = avatar
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .clone();
+        let avatar_bytes = to_bytes(avatar.into_body(), usize::MAX).await.unwrap();
+        let decoded_avatar =
+            image::load_from_memory_with_format(&avatar_bytes, ImageFormat::Png).unwrap();
+        assert_eq!((decoded_avatar.width(), decoded_avatar.height()), (16, 16));
+        let cached_avatar = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/avatar/user/7?png&size=16")
+                    .header(axum::http::header::IF_NONE_MATCH, avatar_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_avatar.status(), StatusCode::NOT_MODIFIED);
+
+        let avatar_webp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/avatar/player/Alex?3d&size=24")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(avatar_webp.status(), StatusCode::OK);
+        assert_eq!(
+            avatar_webp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/webp"
+        );
+        let avatar_webp = to_bytes(avatar_webp.into_body(), usize::MAX).await.unwrap();
+        let decoded_avatar = image::load_from_memory(&avatar_webp).unwrap();
+        assert_eq!((decoded_avatar.width(), decoded_avatar.height()), (24, 24));
 
         let login_page = app
             .clone()

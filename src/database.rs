@@ -2317,6 +2317,38 @@ impl DatabasePool {
         }
     }
 
+    pub async fn texture_id_by_hash(
+        &self,
+        prefix: &str,
+        hash: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = $1 LIMIT 1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(tid AS SIGNED) FROM {prefix}textures WHERE hash = ? LIMIT 1")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = ? LIMIT 1")
+            }
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
+
     pub async fn texture_hash(
         &self,
         prefix: &str,
