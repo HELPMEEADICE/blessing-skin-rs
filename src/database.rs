@@ -4995,6 +4995,44 @@ impl DatabasePool {
         })
     }
 
+    pub async fn closet_item_ids(
+        &self,
+        prefix: &str,
+        user_id: i64,
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(texture_tid AS BIGINT) FROM {prefix}user_closet WHERE user_uid = $1 ORDER BY texture_tid"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(texture_tid AS SIGNED) FROM {prefix}user_closet WHERE user_uid = ? ORDER BY texture_tid"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(texture_tid AS BIGINT) FROM {prefix}user_closet WHERE user_uid = ? ORDER BY texture_tid"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
     pub async fn closet_items(
         &self,
         prefix: &str,

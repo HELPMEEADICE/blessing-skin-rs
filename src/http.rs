@@ -74,6 +74,16 @@ pub fn router(state: AppState) -> Router {
             put(web_set_player_textures).delete(web_clear_player_textures),
         )
         .route("/user/player/{pid}", delete(web_delete_player))
+        .route(
+            "/user/closet",
+            get(web_closet_page).post(web_add_closet_item),
+        )
+        .route("/user/closet/list", get(web_closet_list))
+        .route("/user/closet/ids", get(web_closet_ids))
+        .route(
+            "/user/closet/{tid}",
+            put(web_rename_closet_item).delete(web_remove_closet_item),
+        )
         .route("/user/profile", post(user_profile_update))
         .route("/user/profile/avatar", post(user_set_avatar))
         .route("/user/dark-mode", put(toggle_user_dark_mode))
@@ -1039,6 +1049,14 @@ struct PlayerManagementPage {
     max_length: usize,
 }
 
+#[derive(Template)]
+#[template(path = "closet.html")]
+struct ClosetManagementPage {
+    site_name: String,
+    locale: String,
+    user: UserProfile,
+}
+
 #[derive(Deserialize)]
 struct OAuthClientRequest {
     name: Option<String>,
@@ -1807,6 +1825,318 @@ async fn web_delete_player(
         Ok(crate::database::PlayerDeleteOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             tracing::error!(%error, user_id = user.uid, player_id, "failed to delete web player");
+            unavailable()
+        }
+    }
+}
+
+async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if session_user_id(&state, &headers).is_none() {
+        return Redirect::to("/auth/login").into_response();
+    }
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let page = ClosetManagementPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        user,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render closet page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_closet_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ClosetListQuery>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(6).clamp(1, 100);
+    let category = query.category.as_deref().unwrap_or("skin");
+    let search = query
+        .q
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "0");
+    match database
+        .closet_items(
+            &state.config.database.table_prefix,
+            user.uid,
+            category,
+            search,
+            page,
+            per_page,
+        )
+        .await
+    {
+        Ok((items, total)) => {
+            let data = items.into_iter().map(closet_item_json).collect::<Vec<_>>();
+            let last_page = total.saturating_add(per_page - 1) / per_page;
+            let offset = page.saturating_sub(1).saturating_mul(per_page);
+            let from = (!data.is_empty()).then_some(offset + 1);
+            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
+            Json(serde_json::json!({"current_page":page,"data":data,"last_page":last_page.max(1),"per_page":per_page,"from":from,"to":to,"total":total})).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, "failed to load web closet items");
+            unavailable()
+        }
+    }
+}
+
+async fn web_closet_ids(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .closet_item_ids(&state.config.database.table_prefix, user.uid)
+        .await
+    {
+        Ok(ids) => Json(ids).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, "failed to load web closet texture IDs");
+            unavailable()
+        }
+    }
+}
+
+async fn web_add_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return closet_validation_error("tid", &state.config.locale),
+    };
+    let Some(tid) = texture_id_from_request(request.get("tid")) else {
+        return closet_validation_error("tid", &state.config.locale);
+    };
+    let Some(name) = request
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return closet_validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let score_cost = match database.option(prefix, "score_per_closet_item").await {
+        Ok(value) => value
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet score cost");
+            return unavailable();
+        }
+    };
+    let like_award = match database.option(prefix, "score_award_per_like").await {
+        Ok(value) => value
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load texture like award");
+            return unavailable();
+        }
+    };
+    match database
+        .add_closet_item(
+            prefix,
+            user.uid,
+            tid,
+            name,
+            score_cost,
+            user.permission >= 1,
+            like_award,
+        )
+        .await
+    {
+        Ok(crate::database::ClosetAddOutcome::Added) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("材质 {name} 收藏成功")
+            } else {
+                format!("Added {name} to closet successfully.")
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "你已经收藏过这个材质啦"
+            } else {
+                "You have already added this texture."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::InsufficientScore) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "收藏失败，积分不足"
+            } else {
+                "You don't have enough score to add it to closet."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::TextureNotFound) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "该材质不存在"
+            } else {
+                "We cannot find this texture."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetAddOutcome::PrivateTexture) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "请求的材质已经设为私密，仅上传者和管理员可查看"
+            } else {
+                "The requested texture is private and only visible to the uploader and admins."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, tid, "failed to add web closet item");
+            unavailable()
+        }
+    }
+}
+
+async fn web_rename_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_tid): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(tid) = raw_tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return closet_validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return closet_validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .rename_closet_item(&state.config.database.table_prefix, user.uid, tid, name)
+        .await
+    {
+        Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("衣柜物品成功重命名至 {name}")
+            } else {
+                format!("The item is successfully renamed to {name}")
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetRenameOutcome::NotInCloset) => closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, tid, "failed to rename web closet item");
+            unavailable()
+        }
+    }
+}
+
+async fn web_remove_closet_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_tid): RoutePath<String>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(tid) = raw_tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let refund = match database.option(prefix, "return_score").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet refund option");
+            return unavailable();
+        }
+    };
+    let score_refund = if refund {
+        match database.option(prefix, "score_per_closet_item").await {
+            Ok(value) => value
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to load closet refund score");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    let like_award = match database.option(prefix, "score_award_per_like").await {
+        Ok(value) => value
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load like award");
+            return unavailable();
+        }
+    };
+    match database
+        .remove_closet_item(prefix, user.uid, tid, refund, score_refund, like_award)
+        .await
+    {
+        Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
+            0,
+            if state.config.locale.starts_with("zh") {
+                "材质已从衣柜中移除"
+            } else {
+                "The texture was removed from closet successfully."
+            },
+            None,
+        ),
+        Ok(crate::database::ClosetRemoveOutcome::NotInCloset) => closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, tid, "failed to remove web closet item");
             unavailable()
         }
     }
@@ -8046,6 +8376,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refunded_score, 73);
+
+        let closet_page =
+            session_request(&app, &registered_cookie, "GET", "/user/closet", None).await;
+        assert_eq!(closet_page.status(), StatusCode::OK);
+        let closet_page = String::from_utf8(
+            to_bytes(closet_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(closet_page.contains("Closet"));
+        assert!(closet_page.contains("/user/closet/list"));
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (20,'Closet texture','steve','closet-hash',8,?,1,'2026-10-02 14:00:00',0)")
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('score_per_closet_item','5'), ('score_award_per_like','0')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE options SET option_value = 'true' WHERE option_name = 'return_score'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let initial_closet_ids =
+            session_request(&app, &registered_cookie, "GET", "/user/closet/ids", None).await;
+        let initial_closet_ids: serde_json::Value = serde_json::from_slice(
+            &to_bytes(initial_closet_ids.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(initial_closet_ids, serde_json::json!([2]));
+
+        let added_closet_item = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/closet",
+            Some(r#"{"tid":20,"name":"Closet item"}"#),
+        )
+        .await;
+        let added_closet_item: serde_json::Value = serde_json::from_slice(
+            &to_bytes(added_closet_item.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(added_closet_item["code"], 0);
+
+        let closet_list = session_request(
+            &app,
+            &registered_cookie,
+            "GET",
+            "/user/closet/list?category=skin&q=Closet&page=1&perPage=6",
+            None,
+        )
+        .await;
+        assert_eq!(closet_list.status(), StatusCode::OK);
+        let closet_list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(closet_list.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(closet_list["total"], 1);
+        assert_eq!(closet_list["data"][0]["pivot"]["item_name"], "Closet item");
+        assert_eq!(closet_list["data"][0]["hash"], "closet-hash");
+
+        let all_closet_ids =
+            session_request(&app, &registered_cookie, "GET", "/user/closet/ids", None).await;
+        let all_closet_ids: serde_json::Value = serde_json::from_slice(
+            &to_bytes(all_closet_ids.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all_closet_ids, serde_json::json!([2, 20]));
+
+        let renamed_closet_item = session_request(
+            &app,
+            &registered_cookie,
+            "PUT",
+            "/user/closet/20",
+            Some(r#"{"name":"Renamed closet item"}"#),
+        )
+        .await;
+        let renamed_closet_item: serde_json::Value = serde_json::from_slice(
+            &to_bytes(renamed_closet_item.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renamed_closet_item["code"], 0);
+
+        let removed_closet_item =
+            session_request(&app, &registered_cookie, "DELETE", "/user/closet/20", None).await;
+        let removed_closet_item: serde_json::Value = serde_json::from_slice(
+            &to_bytes(removed_closet_item.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removed_closet_item["code"], 0);
+        let closet_refunded_score: i64 =
+            sqlx::query_scalar("SELECT score FROM users WHERE uid = ?")
+                .bind(registered_user.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(closet_refunded_score, 73);
+        sqlx::query("UPDATE options SET option_value = 'false' WHERE option_name = 'return_score'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE options SET option_value = '0' WHERE option_name = 'score_per_closet_item'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         sqlx::query(
             "UPDATE options SET option_value = '100' WHERE option_name = 'score_per_player'",
         )

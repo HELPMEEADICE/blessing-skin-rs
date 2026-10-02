@@ -10,7 +10,7 @@
   <header><h1>{{ site_name }}</h1><button id="logout">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></header>
   <h2>{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else %}Welcome, {{ user.nickname }}{% endif %}</h2>
   <p>{{ user.email }}</p>
-  <p><a href="/user/player">{% if locale.starts_with("zh") %}管理角色{% else %}Manage players{% endif %}</a></p>
+  <p><a href="/user/player">{% if locale.starts_with("zh") %}管理角色{% else %}Manage players{% endif %}</a> · <a href="/user/closet">{% if locale.starts_with("zh") %}管理衣柜{% else %}Manage closet{% endif %}</a></p>
   <h3>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h3>
   <ul>{% for player in players %}<li>{{ player.name }}</li>{% else %}<li>{% if locale.starts_with("zh") %}还没有角色{% else %}No players yet{% endif %}</li>{% endfor %}</ul>
 </main><script>document.getElementById('logout').addEventListener('click',async()=>{await fetch('/auth/logout',{method:'POST',headers:{'Accept':'application/json'}});window.location.href='/auth/login';});</script></body>
