@@ -174,6 +174,11 @@ pub enum ReportSubmissionOutcome {
     Submitted,
 }
 #[derive(Debug, PartialEq, Eq)]
+pub enum ReportReviewOutcome {
+    NotFound,
+    Rejected,
+}
+#[derive(Debug, PartialEq, Eq)]
 pub enum TexturePrivacyOutcome {
     DuplicatePublicTexture(i64),
     InsufficientScore,
@@ -674,6 +679,113 @@ impl DatabasePool {
             }
         };
         Ok((rows, count))
+    }
+
+    pub async fn reject_report(
+        &self,
+        prefix: &str,
+        report_id: i64,
+        reporter_score_modification: i64,
+    ) -> Result<ReportReviewOutcome, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let lock_clause = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let report_sql = format!(
+            "SELECT status, reporter FROM {prefix}reports WHERE id = {} LIMIT 1{lock_clause}",
+            marker(1)
+        );
+        let retract_score_sql = format!(
+            "UPDATE {prefix}users SET score = score - {} WHERE uid = {}",
+            marker(1),
+            marker(2)
+        );
+        let update_report_sql = format!(
+            "UPDATE {prefix}reports SET status = 2 WHERE id = {}",
+            marker(1)
+        );
+        let reporter_score_modification = reporter_score_modification.max(0);
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && reporter_score_modification > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_score_sql))
+                        .bind(reporter_score_modification)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(update_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && reporter_score_modification > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_score_sql))
+                        .bind(reporter_score_modification)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(update_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some((status, reporter_id)) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                if status == 0 && reporter_score_modification > 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(retract_score_sql))
+                        .bind(reporter_score_modification)
+                        .bind(reporter_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(update_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(ReportReviewOutcome::Rejected)
     }
 
     pub async fn toggle_texture_privacy(
@@ -4174,5 +4286,28 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let score_before_rejection: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 8")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            database.reject_report("bs_", 1, 5).await.unwrap(),
+            super::ReportReviewOutcome::Rejected
+        );
+        assert_eq!(
+            database.reject_report("bs_", 1, 5).await.unwrap(),
+            super::ReportReviewOutcome::Rejected
+        );
+        let reporter_score: i64 = sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reporter_score, score_before_rejection - 5);
+        let rejected_status: i64 = sqlx::query_scalar("SELECT status FROM bs_reports WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rejected_status, 2);
     }
 }

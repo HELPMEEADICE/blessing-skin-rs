@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/admin/reports/list", get(admin_report_list))
+        .route("/admin/reports/{id}", put(web_review_report))
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
@@ -70,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/admin/reports", get(api_admin_report_list))
+        .route("/api/admin/reports/{id}", put(api_review_report))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players).post(api_add_player))
         .route("/api/players/{pid}", delete(api_delete_player))
@@ -2951,6 +2953,150 @@ async fn api_admin_report_list(
     }
 }
 
+async fn web_review_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "message": "This action is unauthorized." })),
+            )
+                .into_response();
+        }
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load report administrator");
+            return unavailable();
+        }
+    }
+    reject_report_request(&state, id, &body).await
+}
+
+async fn api_review_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("ReportsManagement.ReadWrite") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {}
+        Ok(Some(_)) | Ok(None) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "message": "This action is unauthorized." })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load API report administrator");
+            return unavailable();
+        }
+    }
+    reject_report_request(&state, id, &body).await
+}
+
+async fn reject_report_request(state: &AppState, id: i64, body: &[u8]) -> Response {
+    let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+    if request
+        .as_ref()
+        .and_then(|request| request.get("action"))
+        .and_then(serde_json::Value::as_str)
+        != Some("reject")
+    {
+        return report_review_validation_error(&state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let reporter_score_modification = match database
+        .option(
+            &state.config.database.table_prefix,
+            "reporter_score_modification",
+        )
+        .await
+    {
+        Ok(value) => value
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read report score modifier");
+            return unavailable();
+        }
+    };
+    match database
+        .reject_report(
+            &state.config.database.table_prefix,
+            id,
+            reporter_score_modification,
+        )
+        .await
+    {
+        Ok(crate::database::ReportReviewOutcome::Rejected) => {
+            let message = if state.config.locale.starts_with("zh") {
+                "操作成功"
+            } else {
+                "Operated successfully."
+            };
+            login_result(0, message, Some(serde_json::json!({ "status": 2 })))
+        }
+        Ok(crate::database::ReportReviewOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, report_id = id, "failed to reject report");
+            unavailable()
+        }
+    }
+}
+
+fn report_review_validation_error(locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = if chinese {
+        "所选操作无效。"
+    } else {
+        "The selected action is invalid."
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "message": message,
+            "errors": { "action": [field_error] }
+        })),
+    )
+        .into_response()
+}
+
 async fn admin_reports_response(state: &AppState, query: AdminReportListQuery) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -3692,6 +3838,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn formats_report_review_validation_errors_by_action() {
+        use axum::body::to_bytes;
+
+        let response = super::report_review_validation_error("en");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["errors"]["action"][0].as_str().is_some());
+    }
+
+    #[tokio::test]
     async fn formats_report_validation_errors_by_field() {
         use axum::body::to_bytes;
 
@@ -3941,6 +4101,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE options (id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let password_hash = bcrypt::hash("correct horse", 4).unwrap();
         sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (7,'alex@example.test','Alex User','en',5,0,?,1,'','',1,0)")
             .bind(password_hash)
@@ -3948,6 +4112,18 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO players (pid,uid,name,tid_skin,tid_cape,last_modified) VALUES (3,7,'Alex',0,0,'2026-10-02 12:00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (2,'Reported skin','alex','reported-hash',8,7,1,'2026-10-01 10:00:00',1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO reports (id,tid,uploader,reporter,reason,status,report_at) VALUES (1,2,7,7,'stolen skin',0,'2026-10-02 14:00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('reporter_score_modification','2')")
             .execute(&pool)
             .await
             .unwrap();
@@ -3973,7 +4149,7 @@ mod tests {
         };
         let app = router(crate::AppState {
             config: Arc::new(config),
-            database: Some(crate::database::DatabasePool::Sqlite(pool)),
+            database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
             passport_key: None,
             session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
             login_failures: Default::default(),
@@ -4070,7 +4246,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/reports/list?q=status%3A0%20sort%3A-report_at")
-                    .header("cookie", cookie)
+                    .header("cookie", cookie.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4081,7 +4257,39 @@ mod tests {
         let report_page: serde_json::Value = serde_json::from_slice(&report_page).unwrap();
         assert_eq!(report_page["current_page"], 1);
         assert_eq!(report_page["last_page"], 1);
-        assert_eq!(report_page["data"].as_array().unwrap().len(), 0);
+        assert_eq!(report_page["total"], 1);
+        assert_eq!(report_page["data"][0]["tid"], 2);
+        assert_eq!(report_page["data"][0]["texture"]["hash"], "reported-hash");
+        assert_eq!(report_page["data"][0]["informer"]["ip"], "");
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/reports/1")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"reject"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let rejected_body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let rejected_body: serde_json::Value = serde_json::from_slice(&rejected_body).unwrap();
+        assert_eq!(rejected_body["code"], 0);
+        assert_eq!(rejected_body["data"]["status"], 2);
+        let score: i64 = sqlx::query_scalar("SELECT score FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(score, 3);
+        let report_status: i64 = sqlx::query_scalar("SELECT status FROM reports WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(report_status, 2);
 
         let logout = app
             .oneshot(
