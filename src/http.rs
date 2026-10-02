@@ -55,6 +55,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", any(live))
         .route("/health/ready", any(ready))
+        .route(
+            "/.well-known/change-password",
+            get(change_password_discovery),
+        )
         .route("/api", any(api_root))
         .route("/api/", any(api_root))
         .route("/", get(home))
@@ -4993,6 +4997,10 @@ struct Health {
 
 async fn live() -> Json<Health> {
     Json(Health { status: "ok" })
+}
+
+async fn change_password_discovery() -> Response {
+    (StatusCode::FOUND, [(LOCATION, "/user/profile")]).into_response()
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
@@ -11338,7 +11346,10 @@ mod tests {
     async fn login_issues_a_session_that_opens_the_user_dashboard() {
         use axum::{
             body::{Body, to_bytes},
-            http::{Request, StatusCode, header::SET_COOKIE},
+            http::{
+                Request, StatusCode,
+                header::{LOCATION, SET_COOKIE},
+            },
         };
         use bcrypt;
         use sqlx::sqlite::SqlitePoolOptions;
@@ -11493,6 +11504,20 @@ mod tests {
             mail_limits: Default::default(),
             wasm_plugins: Vec::new(),
         });
+        let change_password = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/change-password")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(change_password.status(), StatusCode::FOUND);
+        assert_eq!(
+            change_password.headers().get(LOCATION).unwrap(),
+            "/user/profile"
+        );
         let now = jsonwebtoken::get_current_timestamp();
         let unbound_claims = crate::auth::WebSessionClaims {
             sub: "9".to_owned(),
