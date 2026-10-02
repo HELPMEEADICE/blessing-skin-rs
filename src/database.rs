@@ -378,6 +378,16 @@ pub struct AdminDashboardStats {
 }
 
 #[derive(Debug, FromRow)]
+pub struct LanguageLineRecord {
+    pub id: i64,
+    #[sqlx(rename = "group")]
+    pub group_name: String,
+    pub key: String,
+    pub text: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+#[derive(Debug, FromRow)]
 pub struct AccessTokenRecord {
     pub user_id: Option<i64>,
     pub client_id: i64,
@@ -847,6 +857,285 @@ impl DatabasePool {
         }
     }
 
+    pub async fn language_lines_page(
+        &self,
+        prefix: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<LanguageLineRecord>, i64), sqlx::Error> {
+        let page = page.max(1);
+        let per_page = per_page.max(1);
+        let offset = (page - 1).saturating_mul(per_page);
+        let count_sql = format!("SELECT COUNT(*) FROM {prefix}language_lines");
+        let mysql = matches!(self, Self::MySql(_));
+        let group_column = if mysql {
+            format!("{}group{}", char::from(96), char::from(96))
+        } else {
+            "\"group\"".to_owned()
+        };
+        let key_column = if mysql {
+            format!("{}key{}", char::from(96), char::from(96))
+        } else {
+            "\"key\"".to_owned()
+        };
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, {group_column} AS \"group\", {key_column} AS \"key\", text, CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at FROM {prefix}language_lines ORDER BY {group_column}, {key_column}, id LIMIT $1 OFFSET $2"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(id AS SIGNED) AS id, {group_column}, {key_column}, text, CAST(created_at AS CHAR) AS created_at, CAST(updated_at AS CHAR) AS updated_at FROM {prefix}language_lines ORDER BY {group_column}, {key_column}, id LIMIT ? OFFSET ?"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, {group_column} AS \"group\", {key_column} AS \"key\", text, CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at FROM {prefix}language_lines ORDER BY {group_column}, {key_column}, id LIMIT ? OFFSET ?"
+            ),
+        };
+        let total = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, LanguageLineRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, LanguageLineRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, LanguageLineRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok((rows, total))
+    }
+
+    pub async fn language_line_exists(
+        &self,
+        prefix: &str,
+        group: &str,
+        key: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let group_column = if matches!(self, Self::MySql(_)) {
+            format!("{}group{}", char::from(96), char::from(96))
+        } else {
+            "\"group\"".to_owned()
+        };
+        let key_column = if matches!(self, Self::MySql(_)) {
+            format!("{}key{}", char::from(96), char::from(96))
+        } else {
+            "\"key\"".to_owned()
+        };
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}language_lines WHERE {group_column} = $1 AND {key_column} = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}language_lines WHERE {group_column} = ? AND {key_column} = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(group)
+                .bind(key)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(group)
+                .bind(key)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(group)
+                .bind(key)
+                .fetch_one(pool)
+                .await?
+                > 0),
+        }
+    }
+
+    pub async fn create_language_line(
+        &self,
+        prefix: &str,
+        group: &str,
+        key: &str,
+        locale: &str,
+        text: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let translations = serde_json::json!({ (locale): text }).to_string();
+        let mysql = matches!(self, Self::MySql(_));
+        let group_column = if mysql {
+            format!("{}group{}", char::from(96), char::from(96))
+        } else {
+            "\"group\"".to_owned()
+        };
+        let key_column = if mysql {
+            format!("{}key{}", char::from(96), char::from(96))
+        } else {
+            "\"key\"".to_owned()
+        };
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}language_lines ({group_column}, {key_column}, text, created_at, updated_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING CAST(id AS BIGINT)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}language_lines ({group_column}, {key_column}, text, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(group)
+                    .bind(key)
+                    .bind(translations)
+                    .execute(pool)
+                    .await?;
+                Ok(result.last_insert_rowid())
+            }
+            Self::MySql(pool) => {
+                let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(group)
+                    .bind(key)
+                    .bind(translations)
+                    .execute(pool)
+                    .await?;
+                Ok(result.last_insert_id() as i64)
+            }
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(group)
+                .bind(key)
+                .bind(translations)
+                .fetch_one(pool)
+                .await?),
+        }
+    }
+
+    pub async fn update_language_line(
+        &self,
+        prefix: &str,
+        id: i64,
+        locale: &str,
+        text: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let select_sql = match self {
+            Self::Postgres(_) => format!("SELECT text FROM {prefix}language_lines WHERE id = $1"),
+            _ => format!("SELECT text FROM {prefix}language_lines WHERE id = ?"),
+        };
+        let stored = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some(stored) = stored else {
+            return Ok(false);
+        };
+        let mut translations =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&stored)
+                .unwrap_or_default();
+        translations.insert(
+            locale.to_owned(),
+            serde_json::Value::String(text.to_owned()),
+        );
+        let updated_text = serde_json::Value::Object(translations).to_string();
+        let update_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}language_lines SET text = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            ),
+            _ => format!(
+                "UPDATE {prefix}language_lines SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(updated_text)
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(updated_text)
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(updated_text)
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn delete_language_line(&self, prefix: &str, id: i64) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("DELETE FROM {prefix}language_lines WHERE id = $1"),
+            _ => format!("DELETE FROM {prefix}language_lines WHERE id = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+                > 0),
+            Self::MySql(pool) => Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+                > 0),
+            Self::Postgres(pool) => Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+                > 0),
+        }
+    }
     pub async fn set_option(
         &self,
         prefix: &str,
@@ -7944,5 +8233,65 @@ mod tests {
                 .await
                 .unwrap();
         assert!(revoked_access && revoked_refresh && revoked_code);
+    }
+}
+
+#[cfg(test)]
+mod language_line_tests {
+    use super::DatabasePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn language_line_crud_preserves_other_locales_and_paginates() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE bs_language_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, \"group\" TEXT NOT NULL, \"key\" TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT, updated_at TEXT, UNIQUE(\"group\", \"key\"))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database = DatabasePool::Sqlite(pool);
+
+        assert!(
+            !database
+                .language_line_exists("bs_", "front-end", "nav.home")
+                .await
+                .unwrap()
+        );
+        let id = database
+            .create_language_line("bs_", "front-end", "nav.home", "en", "Home")
+            .await
+            .unwrap();
+        assert!(
+            database
+                .language_line_exists("bs_", "front-end", "nav.home")
+                .await
+                .unwrap()
+        );
+        assert!(
+            database
+                .update_language_line("bs_", id, "zh_CN", "首页")
+                .await
+                .unwrap()
+        );
+
+        let (rows, total) = database.language_lines_page("bs_", 1, 10).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_name, "front-end");
+        assert_eq!(rows[0].key, "nav.home");
+        let translations: serde_json::Value = serde_json::from_str(&rows[0].text).unwrap();
+        assert_eq!(translations["en"], "Home");
+        assert_eq!(translations["zh_CN"], "首页");
+
+        assert!(database.delete_language_line("bs_", id).await.unwrap());
+        assert!(!database.delete_language_line("bs_", id).await.unwrap());
+        let (rows, total) = database.language_lines_page("bs_", 1, 10).await.unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
     }
 }

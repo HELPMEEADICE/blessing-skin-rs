@@ -12,6 +12,7 @@ use rsa::{
     RsaPrivateKey,
     pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
 };
+#[cfg(test)]
 use sqlx::sqlite::SqlitePoolOptions;
 use thiserror::Error;
 
@@ -304,7 +305,7 @@ async fn initialize_schema(pool: &DatabasePool, prefix: &str) -> Result<(), sqlx
             "CREATE TABLE IF NOT EXISTS {prefix}jobs (id {big_id}, queue VARCHAR(255) NOT NULL, payload {long_text} NOT NULL, attempts INTEGER NOT NULL, reserved_at INTEGER, available_at INTEGER NOT NULL, created_at INTEGER NOT NULL)"
         ),
         format!(
-            "CREATE TABLE IF NOT EXISTS {prefix}language_lines (id {id}, {group_column} VARCHAR(255) NOT NULL, {key_column} VARCHAR(255) NOT NULL, text TEXT NOT NULL, created_at {datetime}, updated_at {datetime})"
+            "CREATE TABLE IF NOT EXISTS {prefix}language_lines (id {id}, {group_column} VARCHAR(255) NOT NULL, {key_column} VARCHAR(255) NOT NULL, text TEXT NOT NULL, created_at {datetime}, updated_at {datetime}, UNIQUE({group_column}, {key_column}))"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {prefix}oauth_clients (id {big_id}, user_id BIGINT, name VARCHAR(255) NOT NULL, secret VARCHAR(100), provider VARCHAR(255), redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at {datetime}, updated_at {datetime})"
@@ -646,6 +647,7 @@ mod tests {
         );
         assert!(table_exists(&pool, "bs_oauth_auth_codes").await.unwrap());
         assert!(table_exists(&pool, "bs_notifications").await.unwrap());
+        assert!(table_exists(&pool, "bs_language_lines").await.unwrap());
         let copyright = sqlx::query_scalar::<_, String>(
             "SELECT option_value FROM bs_options WHERE option_name = 'copyright_text'",
         )

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}多语言管理{% else %}Internationalization{% endif %} · {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:1180px;margin:2rem auto;padding:1.5rem;background:white;border-radius:8px;box-shadow:0 6px 24px #0001}
+    nav{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0 2rem}
+    nav a{color:#075fb8}
+    .layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:1.5rem}
+    .panel{border:1px solid #dee2e6;border-radius:6px;overflow:hidden}
+    .panel h2{font-size:1.1rem;margin:0;padding:1rem;background:#f8f9fa}
+    .panel-body{padding:1rem}
+    table{border-collapse:collapse;width:100%;font-size:.95rem}
+    th,td{text-align:left;padding:.7rem;border-bottom:1px solid #dee2e6;vertical-align:top;overflow-wrap:anywhere}
+    th{background:#f8f9fa}
+    input{box-sizing:border-box;width:100%;padding:.55rem;border:1px solid #adb5bd;border-radius:4px}
+    label{display:block;font-weight:600;margin:.8rem 0 .35rem}
+    button{padding:.55rem .85rem;border:0;border-radius:4px;background:#007bff;color:#fff;cursor:pointer}
+    button:disabled{opacity:.5;cursor:default}
+    .danger{background:#dc3545}.muted{color:#687078}.operations{white-space:nowrap}
+    .operations button{margin-right:.35rem}
+    #notice{padding:.75rem;margin:.75rem 0;border-radius:4px;background:#e9f7ef;color:#176b38}
+    #status{min-height:1.4rem;margin:.75rem 0}
+    .pager{display:flex;justify-content:space-between;align-items:center;padding:1rem}
+    @media(max-width:780px){main{margin:0;padding:1rem;border-radius:0}.layout{grid-template-columns:1fr}.table-wrap{overflow:auto}}
+  </style>
+</head>
+<body>
+<main id="translation-app" data-locale="{{ locale }}">
+  <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Back to admin dashboard{% endif %}</a>
+  <h1>{% if locale.starts_with("zh") %}多语言管理{% else %}Internationalization{% endif %}</h1>
+  <nav>
+    <a href="/admin/users/list">{% if locale.starts_with("zh") %}用户{% else %}Users{% endif %}</a>
+    <a href="/admin/players/list">{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</a>
+    <a href="/admin/reports/list">{% if locale.starts_with("zh") %}举报{% else %}Reports{% endif %}</a>
+    <a href="/admin/options">{% if locale.starts_with("zh") %}站点设置{% else %}Site settings{% endif %}</a>
+  </nav>
+  {% if added %}
+    <p id="notice" role="status">{% if locale.starts_with("zh") %}条目增加成功{% else %}Language line added.{% endif %}</p>
+  {% endif %}
+  <div class="layout">
+    <section class="panel">
+      <h2>{% if locale.starts_with("zh") %}翻译条目{% else %}Translation entries{% endif %}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>{% if locale.starts_with("zh") %}分组{% else %}Group{% endif %}</th>
+            <th>{% if locale.starts_with("zh") %}键{% else %}Key{% endif %}</th>
+            <th>{% if locale.starts_with("zh") %}文本{% else %}Text{% endif %}</th>
+            <th>{% if locale.starts_with("zh") %}操作{% else %}Actions{% endif %}</th>
+          </tr></thead>
+          <tbody id="translation-rows"><tr><td colspan="4" class="muted">{% if locale.starts_with("zh") %}正在加载…{% else %}Loading…{% endif %}</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="previous" type="button">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</button>
+        <span id="page-label" class="muted"></span>
+        <button id="next" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>{% if locale.starts_with("zh") %}添加新条目{% else %}Add a translation{% endif %}</h2>
+      <div class="panel-body">
+        <form action="/admin/i18n" method="post">
+          <label for="group">{% if locale.starts_with("zh") %}分组{% else %}Group{% endif %}</label>
+          <input id="group" name="group" maxlength="255" required>
+          <label for="key">{% if locale.starts_with("zh") %}键{% else %}Key{% endif %}</label>
+          <input id="key" name="key" maxlength="255" required>
+          <label for="text">{% if locale.starts_with("zh") %}文本{% else %}Text{% endif %}</label>
+          <input id="text" name="text" required>
+          <p><button type="submit">{% if locale.starts_with("zh") %}提交{% else %}Add entry{% endif %}</button></p>
+        </form>
+        <p class="muted">{% if locale.starts_with("zh") %}新条目会写入当前站点语言。{% else %}New entries are saved for the site's current locale.{% endif %}</p>
+      </div>
+    </section>
+  </div>
+  <p id="status" role="status" aria-live="polite"></p>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('translation-app');
+  const locale = root.dataset.locale || 'en';
+  const rows = document.getElementById('translation-rows');
+  const status = document.getElementById('status');
+  const pageLabel = document.getElementById('page-label');
+  const previous = document.getElementById('previous');
+  const next = document.getElementById('next');
+  let page = 1;
+  let lastPage = 1;
+
+  const cell = (value) => {
+    const element = document.createElement('td');
+    element.textContent = value == null ? '' : String(value);
+    return element;
+  };
+
+  async function loadLines() {
+    status.textContent = '';
+    try {
+      const response = await fetch('/admin/i18n/list?page=' + page, {
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error('Unable to load translation entries.');
+      const result = await response.json();
+      rows.replaceChildren();
+      lastPage = result.last_page || 1;
+      if (result.data.length === 0) {
+        const row = document.createElement('tr');
+        const empty = cell(locale.startsWith('zh') ? '没有结果' : 'No results');
+        empty.colSpan = 4;
+        row.append(empty);
+        rows.append(row);
+      }
+      for (const line of result.data) {
+        const row = document.createElement('tr');
+        row.append(cell(line.group), cell(line.key), cell(line.text?.[locale] || ''));
+        const actions = document.createElement('td');
+        actions.className = 'operations';
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.textContent = locale.startsWith('zh') ? '修改' : 'Edit';
+        edit.addEventListener('click', async () => {
+          const value = window.prompt(
+            locale.startsWith('zh') ? '更新翻译' : 'Update translation',
+            line.text?.[locale] || '',
+          );
+          if (value == null) return;
+          const saved = await fetch('/admin/i18n/' + line.id, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ text: value }),
+          });
+          const message = await saved.json();
+          status.textContent = message.message || '';
+          if (saved.ok && message.code === 0) await loadLines();
+        });
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'danger';
+        remove.textContent = locale.startsWith('zh') ? '删除' : 'Delete';
+        remove.addEventListener('click', async () => {
+          if (!window.confirm(locale.startsWith('zh') ? '确定删除此条目？' : 'Delete this entry?')) return;
+          const deleted = await fetch('/admin/i18n/' + line.id, {
+            method: 'DELETE',
+            headers: { Accept: 'application/json' },
+            credentials: 'same-origin',
+          });
+          const message = await deleted.json();
+          status.textContent = message.message || '';
+          if (deleted.ok && message.code === 0) await loadLines();
+        });
+        actions.append(edit, remove);
+        row.append(actions);
+        rows.append(row);
+      }
+      pageLabel.textContent = page + ' / ' + lastPage;
+      previous.disabled = page <= 1;
+      next.disabled = page >= lastPage;
+    } catch (error) {
+      rows.replaceChildren();
+      status.textContent = error.message || 'Unable to load translation entries.';
+    }
+  }
+
+  previous.addEventListener('click', () => { if (page > 1) { page--; loadLines(); } });
+  next.addEventListener('click', () => { if (page < lastPage) { page++; loadLines(); } });
+  loadLines();
+})();
+</script>
+</body>
+</html>

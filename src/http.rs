@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Multipart, OriginalUri, Path as RoutePath, Query, RawQuery, State,
+        DefaultBodyLimit, Form, Multipart, OriginalUri, Path as RoutePath, Query, RawQuery, State,
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -45,8 +45,9 @@ use crate::{
     },
     database::{
         AdminDashboardStats, AdminUserRecord, ClosetTextureRecord, DatabasePool,
-        NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome, PlayerTextureOutcome,
-        ReportManagementRecord, ReportSearchFilters, TextureInfoRecord, UserProfile,
+        LanguageLineRecord, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
+        PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters, TextureInfoRecord,
+        UserProfile,
     },
 };
 
@@ -164,6 +165,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route(
+            "/admin/i18n",
+            get(web_admin_translations).post(web_create_language_line),
+        )
+        .route("/admin/i18n/list", get(web_admin_language_lines))
+        .route(
+            "/admin/i18n/{id}",
+            put(web_update_language_line).delete(web_delete_language_line),
+        )
+        .route(
             "/admin/options",
             get(crate::admin_settings::options_page).post(crate::admin_settings::save_options),
         )
@@ -278,6 +288,31 @@ struct LoginPage {
     forgot_link: String,
 }
 
+#[derive(Template)]
+#[template(path = "admin_i18n.html")]
+struct AdminTranslationsPage {
+    site_name: String,
+    locale: String,
+    added: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct AdminTranslationsQuery {
+    page: Option<i64>,
+    added: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct NewLanguageLineForm {
+    group: String,
+    key: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct LanguageLineTextForm {
+    text: String,
+}
 #[derive(Template)]
 #[template(path = "user_reports.html")]
 struct UserReportsPage {
@@ -2476,6 +2511,282 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     }
 }
 
+async fn web_admin_translations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminTranslationsQuery>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let page = AdminTranslationsPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        added: query.added.unwrap_or_default() == 1,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render translation management page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_language_lines(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminTranslationsQuery>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    const PER_PAGE: i64 = 10;
+    let page = query.page.unwrap_or(1).max(1);
+    let (lines, total) = match database
+        .language_lines_page(&state.config.database.table_prefix, page, PER_PAGE)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "failed to load language lines");
+            return unavailable();
+        }
+    };
+    let data = lines
+        .into_iter()
+        .map(|line: LanguageLineRecord| {
+            let text = serde_json::from_str::<serde_json::Value>(&line.text)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            serde_json::json!({
+                "id": line.id,
+                "group": line.group_name,
+                "key": line.key,
+                "text": text,
+                "created_at": line.created_at,
+                "updated_at": line.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let last_page = (total.saturating_add(PER_PAGE - 1) / PER_PAGE).max(1);
+    let from = if data.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!((page - 1).saturating_mul(PER_PAGE) + 1)
+    };
+    let to = if data.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!((page - 1).saturating_mul(PER_PAGE) + data.len() as i64)
+    };
+    let page_url = |number: i64| format!("/admin/i18n/list?page={number}");
+    let previous = if page > 1 {
+        Some(page_url(page - 1))
+    } else {
+        None
+    };
+    let next = if page < last_page {
+        Some(page_url(page + 1))
+    } else {
+        None
+    };
+    Json(serde_json::json!({
+        "current_page": page,
+        "data": data,
+        "first_page_url": page_url(1),
+        "from": from,
+        "last_page": last_page,
+        "last_page_url": page_url(last_page),
+        "links": [
+            { "url": previous, "label": "&laquo; Previous", "active": false },
+            { "url": page_url(page), "label": page.to_string(), "active": true },
+            { "url": next, "label": "Next &raquo;", "active": false }
+        ],
+        "next_page_url": next,
+        "path": "/admin/i18n/list",
+        "per_page": PER_PAGE,
+        "prev_page_url": previous,
+        "to": to,
+        "total": total
+    }))
+    .into_response()
+}
+
+async fn web_create_language_line(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<NewLanguageLineForm>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let group = form.group.trim();
+    let key = form.key.trim();
+    if group.is_empty() || group.chars().count() > 255 {
+        return translation_validation_error("group", &state.config.locale);
+    }
+    if key.is_empty() || key.chars().count() > 255 {
+        return translation_validation_error("key", &state.config.locale);
+    }
+    if form.text.trim().is_empty() {
+        return translation_validation_error("text", &state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    match database.language_line_exists(prefix, group, key).await {
+        Ok(true) => return translation_validation_error("key", &state.config.locale),
+        Err(error) => {
+            tracing::error!(%error, "failed to check language line key");
+            return unavailable();
+        }
+        Ok(false) => {}
+    }
+    if let Err(error) = database
+        .create_language_line(prefix, group, key, &state.config.locale, form.text.trim())
+        .await
+    {
+        tracing::error!(%error, "failed to create language line");
+        return unavailable();
+    }
+    Redirect::to("/admin/i18n?added=1").into_response()
+}
+
+async fn web_update_language_line(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+    Json(form): Json<LanguageLineTextForm>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if form.text.trim().is_empty() {
+        return translation_validation_error("text", &state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .update_language_line(
+            &state.config.database.table_prefix,
+            id,
+            &state.config.locale,
+            form.text.trim(),
+        )
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({
+            "code": 0,
+            "message": translation_admin_message("updated", &state.config.locale)
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": translation_admin_message("missing", &state.config.locale)
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to update language line");
+            unavailable()
+        }
+    }
+}
+
+async fn web_delete_language_line(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .delete_language_line(&state.config.database.table_prefix, id)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({
+            "code": 0,
+            "message": translation_admin_message("deleted", &state.config.locale)
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": translation_admin_message("missing", &state.config.locale)
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to delete language line");
+            unavailable()
+        }
+    }
+}
+
+fn translation_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let field_error = match (field, chinese) {
+        ("group", true) => "分组为必填项，且不能超过 255 个字符。",
+        ("key", true) => "键为必填项，且不能超过 255 个字符。",
+        ("text", true) => "文本为必填项。",
+        ("group", false) => "The group field is required and may not exceed 255 characters.",
+        ("key", false) => "The key field is required and may not exceed 255 characters.",
+        _ => "The text field is required.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "message": if chinese { "给定数据无效。" } else { "The given data was invalid." },
+            "errors": { (field): [field_error] }
+        })),
+    )
+        .into_response()
+}
+
+fn translation_admin_message(kind: &str, locale: &str) -> &'static str {
+    match (kind, locale.starts_with("zh")) {
+        ("updated", true) => "条目更新成功",
+        ("deleted", true) => "条目已删除",
+        ("missing", true) => "翻译条目不存在。",
+        ("updated", false) => "Language line updated.",
+        ("deleted", false) => "Language line deleted.",
+        _ => "Language line not found.",
+    }
+}
 async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -10431,6 +10742,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE language_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, \"group\" TEXT NOT NULL, \"key\" TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT, updated_at TEXT, UNIQUE(\"group\", \"key\"))")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE oauth_clients (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT NOT NULL, secret TEXT NOT NULL, provider TEXT, redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -10867,6 +11182,111 @@ mod tests {
         )
         .unwrap();
         let admin_cookie = format!("blessing_skin_session={admin_token}");
+        let denied_translation_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/i18n", None).await;
+        assert_eq!(denied_translation_page.status(), StatusCode::FORBIDDEN);
+
+        let translation_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/i18n", None).await;
+        assert_eq!(translation_page.status(), StatusCode::OK);
+        let translation_html = String::from_utf8(
+            to_bytes(translation_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(translation_html.contains("Translation entries"));
+        assert!(translation_html.contains("action=\"/admin/i18n\""));
+
+        let create_body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("group", "front-end")
+            .append_pair("key", "nav.home")
+            .append_pair("text", "Home")
+            .finish();
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/i18n")
+                    .header("cookie", admin_cookie.clone())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::SEE_OTHER);
+        assert_eq!(created.headers()["location"], "/admin/i18n?added=1");
+
+        let list_response =
+            session_request(&app, &admin_cookie, "GET", "/admin/i18n/list?page=1", None).await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["data"][0]["group"], "front-end");
+        assert_eq!(list["data"][0]["key"], "nav.home");
+        let line_id = list["data"][0]["id"].as_i64().unwrap();
+        sqlx::query(
+            "UPDATE language_lines SET text = '{\"en\":\"Home\",\"fr\":\"Accueil\"}' WHERE id = ?",
+        )
+        .bind(line_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let updated = session_request(
+            &app,
+            &admin_cookie,
+            "PUT",
+            &format!("/admin/i18n/{line_id}"),
+            Some(r#"{"text":"Homepage"}"#),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated: serde_json::Value =
+            serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["code"], 0);
+        let list_response =
+            session_request(&app, &admin_cookie, "GET", "/admin/i18n/list?page=1", None).await;
+        let list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list["data"][0]["text"]["en"], "Homepage");
+        assert_eq!(list["data"][0]["text"]["fr"], "Accueil");
+
+        let deleted = session_request(
+            &app,
+            &admin_cookie,
+            "DELETE",
+            &format!("/admin/i18n/{line_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(deleted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(deleted["code"], 0);
+        let list_response =
+            session_request(&app, &admin_cookie, "GET", "/admin/i18n/list?page=1", None).await;
+        let list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list["total"], 0);
         let admin_dashboard = session_request(&app, &admin_cookie, "GET", "/admin", None).await;
         assert_eq!(admin_dashboard.status(), StatusCode::OK);
         let admin_dashboard = String::from_utf8(
@@ -10882,6 +11302,7 @@ mod tests {
         assert!(admin_dashboard.contains("Storage"));
         assert!(admin_dashboard.contains("chart-users-registration"));
         assert!(admin_dashboard.contains("notification-form"));
+        assert!(admin_dashboard.contains("/admin/i18n"));
         assert!(admin_dashboard.contains("chart-textures-upload"));
         assert!(admin_dashboard.contains("fetch('/admin/chart'"));
         assert!(admin_dashboard.contains(">4<"));
