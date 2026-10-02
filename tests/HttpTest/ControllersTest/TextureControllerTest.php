@@ -6,8 +6,8 @@ use App\Models\Player;
 use App\Models\Texture;
 use App\Models\User;
 use Blessing\Minecraft;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 use Intervention\Image\Facades\Image;
 
