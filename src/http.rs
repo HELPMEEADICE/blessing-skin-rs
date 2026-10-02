@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/info/{tid}", get(skinlib_info))
         .route("/texture/{tid}", get(skinlib_info))
+        .route("/texture/{tid}/name", put(rename_texture))
         .route("/api/user", get(api_user))
         .route("/api/closet", get(api_closet).post(api_add_closet_item))
         .route(
@@ -1676,6 +1677,159 @@ fn texture_info_json(texture: TextureInfoRecord) -> serde_json::Value {
     })
 }
 
+fn valid_texture_name(name: &str, rule: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    rule.is_empty()
+        || RegexBuilder::new(rule)
+            .build()
+            .is_ok_and(|regex| regex.is_match(name))
+}
+
+async fn rename_texture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(tid): RoutePath<String>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return unauthenticated();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load texture rename user");
+            return unavailable();
+        }
+    };
+    if user.permission == -1 {
+        let message = if state.config.locale.starts_with("zh") {
+            "你已被本站封禁，详情请联系站点管理员"
+        } else {
+            "You are banned on this site. Please contact the admin."
+        };
+        let mut response = login_result(-1, message, None);
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    if user.email.is_empty() {
+        return Redirect::to("/auth/bind").into_response();
+    }
+    match database
+        .option(&state.config.database.table_prefix, "require_verification")
+        .await
+    {
+        Ok(value) if legacy_option_bool(value.as_deref()) && !user.verified => {
+            let message = if state.config.locale.starts_with("zh") {
+                "你必须验证邮箱后才能访问此页面"
+            } else {
+                "To access this page, you should verify your email address first."
+            };
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, "failed to read email verification option");
+            return unavailable();
+        }
+    }
+    let Ok(tid) = tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let texture = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => texture,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load texture for rename");
+            return unavailable();
+        }
+    };
+    let is_admin = user.permission >= 1;
+    if texture.uploader != user_id && !is_admin {
+        let message = if state.config.locale.starts_with("zh") {
+            "你没有权限修改此材质"
+        } else {
+            "You have no permission to moderate this texture."
+        };
+        let mut response = login_result(1, message, None);
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
+        return texture_name_validation_error(&state.config.locale);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return texture_name_validation_error(&state.config.locale);
+    }
+    let name_rule = match database
+        .option(&state.config.database.table_prefix, "texture_name_regexp")
+        .await
+    {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture name validation rule");
+            return unavailable();
+        }
+    };
+    if !name_rule.is_empty() {
+        if RegexBuilder::new(&name_rule).build().is_err() {
+            tracing::error!("invalid legacy texture name validation regex");
+            return unavailable();
+        }
+        if !valid_texture_name(name, &name_rule) {
+            return texture_name_validation_error(&state.config.locale);
+        }
+    }
+    if let Err(error) = database
+        .rename_texture(&state.config.database.table_prefix, tid, name)
+        .await
+    {
+        tracing::error!(%error, tid, "failed to rename texture");
+        return unavailable();
+    }
+    let message = if state.config.locale.starts_with("zh") {
+        format!("材质名称已被成功设置为 {name}")
+    } else {
+        format!("The texture was renamed to {name} successfully.")
+    };
+    login_result(0, &message, None)
+}
+
+fn texture_name_validation_error(locale: &str) -> Response {
+    let (message, field_error) = if locale.starts_with("zh") {
+        ("给定数据无效。", "材质名称为必填项或不符合本站规则。")
+    } else {
+        (
+            "The given data was invalid.",
+            "The name field is required or does not match the configured rule.",
+        )
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "message": message,
+            "errors": { "name": [field_error] }
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct SkinLibraryQuery {
     filter: Option<String>,
@@ -2330,6 +2484,15 @@ mod tests {
         assert_eq!(item["pivot"]["texture_tid"], 13);
         assert_eq!(item["pivot"]["item_name"], "Saved name");
     }
+    #[test]
+    fn validates_legacy_texture_name_rules() {
+        assert!(super::valid_texture_name("skin_01", ""));
+        assert!(!super::valid_texture_name("", ""));
+        assert!(super::valid_texture_name("skin_01", "^[a-z0-9_]+$"));
+        assert!(!super::valid_texture_name("Skin 01", "^[a-z0-9_]+$"));
+        assert!(!super::valid_texture_name("anything", "["));
+    }
+
     #[test]
     fn serializes_legacy_texture_info_fields() {
         use serde_json::json;

@@ -309,6 +309,43 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn rename_texture(
+        &self,
+        prefix: &str,
+        tid: i64,
+        name: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("UPDATE {prefix}textures SET name = $1 WHERE tid = $2")
+            }
+            _ => format!("UPDATE {prefix}textures SET name = ? WHERE tid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn texture_info(
         &self,
         prefix: &str,
@@ -2769,6 +2806,12 @@ mod tests {
         assert_eq!(second_skin_page_total, 2);
         assert_eq!(first_skin_page[0].tid, 13);
         assert_eq!(second_skin_page[0].tid, 11);
+        database
+            .rename_texture("bs_", 13, "Renamed texture")
+            .await
+            .unwrap();
+        let renamed_texture = database.texture_info("bs_", 13).await.unwrap().unwrap();
+        assert_eq!(renamed_texture.name, "Renamed texture");
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
