@@ -196,6 +196,8 @@ pub fn router(state: AppState) -> Router {
         .route("/avatar/user/{uid}", get(avatar_by_user))
         .route("/avatar/hash/{hash}", get(avatar_by_hash))
         .route("/avatar/{tid}", get(avatar_by_texture))
+        .route("/preview/{tid}", get(preview_by_texture))
+        .route("/preview/hash/{hash}", get(preview_by_hash))
         .with_state(state)
 }
 
@@ -7647,6 +7649,281 @@ struct AvatarSource {
     texture_type: String,
 }
 
+async fn preview_by_texture(
+    State(state): State<AppState>,
+    RoutePath(tid): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(tid) = tid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    preview_for_texture(&state, tid, &query, &request_headers).await
+}
+
+async fn preview_by_hash(
+    State(state): State<AppState>,
+    RoutePath(hash): RoutePath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
+) -> Response {
+    if !valid_texture_hash(&hash) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let tid = match database
+        .texture_id_by_hash(&state.config.database.table_prefix, &hash)
+        .await
+    {
+        Ok(Some(tid)) => tid,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, hash, "failed to find preview texture");
+            return unavailable();
+        }
+    };
+    preview_for_texture(&state, tid, &query, &request_headers).await
+}
+
+async fn preview_for_texture(
+    state: &AppState,
+    tid: i64,
+    query: &HashMap<String, String>,
+    request_headers: &HeaderMap,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let texture = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => texture,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load preview texture metadata");
+            return unavailable();
+        }
+    };
+    if !valid_texture_hash(&texture.hash) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = state.config.textures_dir.join(&texture.hash);
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let source = match tokio::fs::read(path).await {
+        Ok(bytes) => match image::load_from_memory_with_format(&bytes, ImageFormat::Png) {
+            Ok(image) => image.to_rgba8(),
+            Err(error) => {
+                tracing::warn!(%error, tid, "preview source is not a valid PNG");
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, tid, "preview source could not be read");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let is_cape = texture.texture_type == "cape";
+    if (is_cape && (source.width() < 12 || source.height() < 17))
+        || (!is_cape && (source.width() != 64 || (source.height() != 64 && source.height() != 32)))
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let height = query
+        .get("height")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|height| (1..=1024).contains(height))
+        .unwrap_or(200);
+    let use_png = query.contains_key("png");
+    let format = if use_png {
+        ImageFormat::Png
+    } else {
+        ImageFormat::WebP
+    };
+    let rendered = if is_cape {
+        render_cape_preview(&source, height)
+    } else {
+        render_skin_preview(&source, texture.texture_type == "alex", height)
+    };
+    let mut bytes = Vec::new();
+    if rendered
+        .write_to(&mut Cursor::new(&mut bytes), format)
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let etag = content_etag(&bytes);
+    let ttl = cache_ttl(state).await;
+    let modified = metadata.modified().ok();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(if use_png { "image/png" } else { "image/webp" }),
+    );
+    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+    );
+    if let Some(modified) = modified {
+        headers.insert(
+            LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
+        );
+    }
+    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
+        || (!request_headers.contains_key(IF_NONE_MATCH)
+            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        *response.headers_mut() = headers;
+        response.headers_mut().remove(CONTENT_TYPE);
+        response.headers_mut().remove(CONTENT_LENGTH);
+        return response;
+    }
+    let mut response = Response::new(Body::from(bytes));
+    *response.headers_mut() = headers;
+    response
+}
+
+fn render_skin_preview(skin: &RgbaImage, is_alex: bool, height: u32) -> DynamicImage {
+    let mut character = RgbaImage::from_pixel(64, 128, Rgba([0, 0, 0, 0]));
+    draw_skin_part(
+        &mut character,
+        skin,
+        (8, 8),
+        Some((40, 8)),
+        (16, 0),
+        8,
+        8,
+        4,
+    );
+    draw_skin_part(
+        &mut character,
+        skin,
+        (20, 20),
+        Some((20, 36)),
+        (16, 32),
+        8,
+        12,
+        4,
+    );
+
+    let arm_width = if is_alex { 3 } else { 4 };
+    let arm_pixels = arm_width * 4;
+    let arm_left_x = 16_i64 - i64::from(arm_pixels);
+    let arm_right_x = 48;
+    let (left_arm_base, left_arm_overlay) = if skin.height() >= 64 {
+        ((36, 52), Some((52, 52)))
+    } else {
+        ((44, 20), None)
+    };
+    let mut left_arm = skin_part(skin, left_arm_base, left_arm_overlay, arm_width, 12);
+    if skin.height() < 64 {
+        left_arm = image::imageops::flip_horizontal(&left_arm);
+    }
+    draw_scaled_skin_part(&mut character, &left_arm, (arm_left_x, 32), 4);
+    let right_arm = skin_part(
+        skin,
+        (44, 20),
+        (skin.height() >= 64).then_some((44, 36)),
+        arm_width,
+        12,
+    );
+    draw_scaled_skin_part(&mut character, &right_arm, (arm_right_x, 32), 4);
+
+    let left_leg = if skin.height() >= 64 {
+        skin_part(skin, (20, 52), Some((4, 52)), 4, 12)
+    } else {
+        image::imageops::flip_horizontal(&skin_part(skin, (4, 20), None, 4, 12))
+    };
+    let right_leg = skin_part(
+        skin,
+        (4, 20),
+        (skin.height() >= 64).then_some((4, 36)),
+        4,
+        12,
+    );
+    draw_scaled_skin_part(&mut character, &left_leg, (16, 80), 4);
+    draw_scaled_skin_part(&mut character, &right_leg, (32, 80), 4);
+
+    let mut square = RgbaImage::from_pixel(256, 256, Rgba([0, 0, 0, 0]));
+    let character =
+        image::imageops::resize(&character, 128, 256, image::imageops::FilterType::Nearest);
+    image::imageops::overlay(&mut square, &character, 64, 0);
+    DynamicImage::ImageRgba8(square).resize_exact(
+        height,
+        height,
+        image::imageops::FilterType::Nearest,
+    )
+}
+
+fn render_cape_preview(cape: &RgbaImage, height: u32) -> DynamicImage {
+    let front = image::imageops::crop_imm(cape, 1, 1, 10, 16).to_image();
+    let width = (height.saturating_mul(10) / 16).max(1);
+    DynamicImage::ImageRgba8(image::imageops::resize(
+        &front,
+        width,
+        height,
+        image::imageops::FilterType::Nearest,
+    ))
+}
+
+fn draw_skin_part(
+    destination: &mut RgbaImage,
+    source: &RgbaImage,
+    base: (u32, u32),
+    overlay: Option<(u32, u32)>,
+    position: (i64, i64),
+    width: u32,
+    height: u32,
+    scale: u32,
+) {
+    let part = skin_part(source, base, overlay, width, height);
+    draw_scaled_skin_part(destination, &part, position, scale);
+}
+
+fn skin_part(
+    source: &RgbaImage,
+    base: (u32, u32),
+    overlay: Option<(u32, u32)>,
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    let mut part = image::imageops::crop_imm(source, base.0, base.1, width, height).to_image();
+    if let Some((x, y)) =
+        overlay.filter(|(x, y)| x + width <= source.width() && y + height <= source.height())
+    {
+        let layer = image::imageops::crop_imm(source, x, y, width, height).to_image();
+        image::imageops::overlay(&mut part, &layer, 0, 0);
+    }
+    part
+}
+
+fn draw_scaled_skin_part(
+    destination: &mut RgbaImage,
+    part: &RgbaImage,
+    position: (i64, i64),
+    scale: u32,
+) {
+    let part = image::imageops::resize(
+        part,
+        part.width() * scale,
+        part.height() * scale,
+        image::imageops::FilterType::Nearest,
+    );
+    image::imageops::overlay(destination, &part, position.0, position.1);
+}
+
 async fn avatar_by_player(
     State(state): State<AppState>,
     RoutePath(name): RoutePath<String>,
@@ -7895,41 +8172,15 @@ fn render_skin_avatar(skin: &RgbaImage, three_d: bool) -> DynamicImage {
     }
     if !three_d {
         let mut face = image::imageops::crop_imm(skin, 8, 8, 8, 8).to_image();
-        if skin.height() >= 64 {
-            let hat = image::imageops::crop_imm(skin, 40, 8, 8, 8).to_image();
-            image::imageops::overlay(&mut face, &hat, 0, 0);
-        }
+        let hat = image::imageops::crop_imm(skin, 40, 8, 8, 8).to_image();
+        image::imageops::overlay(&mut face, &hat, 0, 0);
         return DynamicImage::ImageRgba8(face);
     }
 
     let mut canvas = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
-    let right = textured_head_face(
-        skin,
-        (16, 8),
-        if skin.height() >= 64 {
-            Some((48, 8))
-        } else {
-            None
-        },
-    );
-    let top = textured_head_face(
-        skin,
-        (8, 0),
-        if skin.height() >= 64 {
-            Some((40, 0))
-        } else {
-            None
-        },
-    );
-    let front = textured_head_face(
-        skin,
-        (8, 8),
-        if skin.height() >= 64 {
-            Some((40, 8))
-        } else {
-            None
-        },
-    );
+    let right = textured_head_face(skin, (16, 8), Some((48, 8)));
+    let top = textured_head_face(skin, (8, 0), Some((40, 0)));
+    let front = textured_head_face(skin, (8, 8), Some((40, 8)));
     draw_textured_quad(&mut canvas, &right, (43.0, 24.0), (11.0, -7.0), (0.0, 30.0));
     draw_textured_quad(&mut canvas, &top, (13.0, 24.0), (30.0, 0.0), (11.0, -7.0));
     draw_textured_quad(&mut canvas, &front, (13.0, 24.0), (30.0, 0.0), (0.0, 30.0));
@@ -8131,8 +8382,8 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_skin_avatar, router,
-        valid_texture_hash,
+        Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_cape_preview,
+        render_skin_avatar, render_skin_preview, router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -8501,6 +8752,19 @@ mod tests {
     }
 
     #[test]
+    fn renders_square_skin_and_aspect_preserving_cape_previews() {
+        let skin = RgbaImage::from_pixel(64, 64, Rgba([40, 80, 120, 255]));
+        let skin_preview = render_skin_preview(&skin, true, 200);
+        assert_eq!((skin_preview.width(), skin_preview.height()), (200, 200));
+        assert!(skin_preview.pixels().any(|(_, _, pixel)| pixel[3] > 0));
+
+        let cape = RgbaImage::from_pixel(64, 32, Rgba([10, 120, 30, 255]));
+        let cape_preview = render_cape_preview(&cape, 160);
+        assert_eq!((cape_preview.width(), cape_preview.height()), (100, 160));
+        assert_eq!(cape_preview.get_pixel(0, 0), Rgba([10, 120, 30, 255]));
+    }
+
+    #[test]
     fn renders_skin_face_and_isometric_avatar_layers() {
         let mut skin = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
         for y in 8..16 {
@@ -8750,6 +9014,27 @@ mod tests {
             .await
             .unwrap();
 
+        let texture_test_dir = std::env::temp_dir().join(format!(
+            "blessing-skin-rs-preview-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&texture_test_dir).unwrap();
+        let preview_skin_hash = "a".repeat(64);
+        let preview_cape_hash = "b".repeat(64);
+        for (hash, width, height, color) in [
+            (&preview_skin_hash, 64, 64, Rgba([40, 80, 120, 255])),
+            (&preview_cape_hash, 64, 32, Rgba([10, 120, 30, 255])),
+        ] {
+            let mut image_bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(width, height, color))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut image_bytes),
+                    ImageFormat::Png,
+                )
+                .unwrap();
+            std::fs::write(texture_test_dir.join(hash), image_bytes).unwrap();
+        }
+
         let secret = "a test APP_KEY with enough entropy".to_owned();
         let config = crate::config::Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
@@ -8761,7 +9046,7 @@ mod tests {
                 ),
                 table_prefix: String::new(),
             },
-            textures_dir: PathBuf::new(),
+            textures_dir: texture_test_dir.clone(),
             plugins_dir: PathBuf::new(),
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
@@ -10537,6 +10822,79 @@ mod tests {
             .unwrap();
         assert_eq!(deleted_users, 0);
         assert_eq!(deleted_players, 0);
+
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (900001,'Preview skin','alex',?,4096,7,1,'2026-10-02 12:00:00',0),(900002,'Preview cape','cape',?,4096,7,1,'2026-10-02 12:00:00',0)")
+            .bind(&preview_skin_hash)
+            .bind(&preview_cape_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let skin_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/preview/900001?png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skin_preview.status(), StatusCode::OK);
+        assert_eq!(
+            skin_preview
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/png"
+        );
+        let skin_preview_etag = skin_preview
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .clone();
+        let skin_preview_bytes = to_bytes(skin_preview.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded_skin_preview =
+            image::load_from_memory_with_format(&skin_preview_bytes, ImageFormat::Png).unwrap();
+        assert_eq!(
+            (decoded_skin_preview.width(), decoded_skin_preview.height()),
+            (200, 200)
+        );
+        let cached_skin_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/preview/900001?png")
+                    .header(axum::http::header::IF_NONE_MATCH, skin_preview_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_skin_preview.status(), StatusCode::NOT_MODIFIED);
+
+        let cape_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/preview/hash/{preview_cape_hash}?png&height=160"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cape_preview.status(), StatusCode::OK);
+        let cape_preview_bytes = to_bytes(cape_preview.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded_cape_preview =
+            image::load_from_memory_with_format(&cape_preview_bytes, ImageFormat::Png).unwrap();
+        assert_eq!(
+            (decoded_cape_preview.width(), decoded_cape_preview.height()),
+            (100, 160)
+        );
+        std::fs::remove_dir_all(&texture_test_dir).unwrap();
 
         let logout = app
             .oneshot(
