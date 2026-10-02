@@ -34,7 +34,8 @@ use crate::{
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
     database::{
         DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
-        PlayerTextureOutcome, TextureInfoRecord, UserProfile,
+        PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters, TextureInfoRecord,
+        UserProfile,
     },
 };
 
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(login_page).post(handle_login))
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
+        .route("/admin/reports/list", get(admin_report_list))
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
@@ -67,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/admin/notifications", post(api_send_notification))
+        .route("/api/admin/reports", get(api_admin_report_list))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players).post(api_add_player))
         .route("/api/players/{pid}", delete(api_delete_player))
@@ -2834,6 +2837,224 @@ fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_jso
         "nickname": item.nickname,
     })
 }
+
+#[derive(Deserialize)]
+struct AdminReportListQuery {
+    q: Option<String>,
+    page: Option<i64>,
+}
+
+struct ParsedReportSearch {
+    filters: ReportSearchFilters,
+    sort_field: String,
+    descending: bool,
+}
+
+fn parse_report_search(query: Option<&str>) -> ParsedReportSearch {
+    let mut parsed = ParsedReportSearch {
+        filters: ReportSearchFilters::default(),
+        sort_field: "report_at".to_owned(),
+        descending: true,
+    };
+    let mut free_text = Vec::new();
+    for token in query.unwrap_or_default().split_whitespace() {
+        let Some((field, value)) = token.split_once(':') else {
+            free_text.push(token);
+            continue;
+        };
+        match field {
+            "sort" => {
+                let (descending, field) = value
+                    .strip_prefix('-')
+                    .map_or((false, value), |field| (true, field));
+                if matches!(
+                    field,
+                    "id" | "tid" | "uploader" | "reporter" | "reason" | "status" | "report_at"
+                ) {
+                    parsed.sort_field = field.to_owned();
+                    parsed.descending = descending;
+                }
+            }
+            "status" => parsed.filters.status = value.parse().ok(),
+            "id" => parsed.filters.id = value.parse().ok(),
+            "tid" => parsed.filters.tid = value.parse().ok(),
+            "uploader" => parsed.filters.uploader = value.parse().ok(),
+            "reporter" => parsed.filters.reporter = value.parse().ok(),
+            "reason" if !value.is_empty() => free_text.push(value),
+            _ => {}
+        }
+    }
+    if !free_text.is_empty() {
+        parsed.filters.reason = Some(free_text.join(" "));
+    }
+    parsed
+}
+
+async fn admin_report_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminReportListQuery>,
+) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => admin_reports_response(&state, query).await,
+        Ok(Some(_)) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "message": "This action is unauthorized." })),
+        )
+            .into_response(),
+        Ok(None) => Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load report administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_report_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminReportListQuery>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["ReportsManagement.Read", "ReportsManagement.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => admin_reports_response(&state, query).await,
+        Ok(Some(_)) | Ok(None) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "message": "This action is unauthorized." })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API report administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn admin_reports_response(state: &AppState, query: AdminReportListQuery) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let parsed = parse_report_search(query.q.as_deref());
+    let page = query.page.unwrap_or(1).max(1);
+    const PER_PAGE: i64 = 9;
+    match database
+        .report_management_items(
+            &state.config.database.table_prefix,
+            &parsed.filters,
+            &parsed.sort_field,
+            parsed.descending,
+            page,
+            PER_PAGE,
+        )
+        .await
+    {
+        Ok((reports, total)) => {
+            let data = reports
+                .into_iter()
+                .map(report_management_json)
+                .collect::<Vec<_>>();
+            let last_page = total.saturating_add(PER_PAGE - 1) / PER_PAGE;
+            let offset = page.saturating_sub(1).saturating_mul(PER_PAGE);
+            let from = (!data.is_empty()).then_some(offset + 1);
+            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
+            Json(serde_json::json!({
+                "current_page": page,
+                "data": data,
+                "last_page": last_page.max(1),
+                "per_page": PER_PAGE,
+                "from": from,
+                "to": to,
+                "total": total
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to query admin reports");
+            unavailable()
+        }
+    }
+}
+
+fn report_management_json(report: ReportManagementRecord) -> serde_json::Value {
+    let texture = report.texture_tid.map(|tid| {
+        serde_json::json!({
+            "tid": tid,
+            "name": report.texture_name,
+            "type": report.texture_type,
+            "hash": report.texture_hash,
+            "size": report.texture_size,
+            "uploader": report.texture_uploader,
+            "public": report.texture_public,
+            "upload_at": report.texture_upload_at,
+            "likes": report.texture_likes,
+        })
+    });
+    let texture_uploader = report.texture_uploader_uid.map(|uid| {
+        serde_json::json!({
+            "uid": uid,
+            "email": report.texture_uploader_email,
+            "nickname": report.texture_uploader_nickname,
+            "locale": report.texture_uploader_locale,
+            "score": report.texture_uploader_score,
+            "avatar": report.texture_uploader_avatar,
+            "permission": report.texture_uploader_permission,
+            "ip": report.texture_uploader_ip,
+            "last_sign_at": report.texture_uploader_last_sign_at,
+            "register_at": report.texture_uploader_register_at,
+            "verified": report.texture_uploader_verified,
+            "is_dark_mode": report.texture_uploader_is_dark_mode,
+        })
+    });
+    let informer = report.informer_uid.map(|uid| {
+        serde_json::json!({
+            "uid": uid,
+            "email": report.informer_email,
+            "nickname": report.informer_nickname,
+            "locale": report.informer_locale,
+            "score": report.informer_score,
+            "avatar": report.informer_avatar,
+            "permission": report.informer_permission,
+            "ip": report.informer_ip,
+            "last_sign_at": report.informer_last_sign_at,
+            "register_at": report.informer_register_at,
+            "verified": report.informer_verified,
+            "is_dark_mode": report.informer_is_dark_mode,
+        })
+    });
+    serde_json::json!({
+        "id": report.id,
+        "tid": report.tid,
+        "texture": texture,
+        "uploader": report.uploader,
+        "texture_uploader": texture_uploader,
+        "reporter": report.reporter,
+        "informer": informer,
+        "reason": report.reason,
+        "status": report.status,
+        "report_at": report.report_at,
+    })
+}
 async fn api_closet(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3400,6 +3621,76 @@ mod tests {
         assert!(!super::valid_texture_name("anything", "["));
     }
 
+    #[test]
+    fn parses_legacy_admin_report_search_tokens() {
+        let parsed =
+            super::parse_report_search(Some("status:0 sort:-report_at tid:41 stolen skin"));
+        assert_eq!(parsed.filters.status, Some(0));
+        assert_eq!(parsed.filters.tid, Some(41));
+        assert_eq!(parsed.filters.reason.as_deref(), Some("stolen skin"));
+        assert_eq!(parsed.sort_field, "report_at");
+        assert!(parsed.descending);
+
+        let parsed = super::parse_report_search(None);
+        assert_eq!(parsed.sort_field, "report_at");
+        assert!(parsed.descending);
+        assert!(parsed.filters.status.is_none());
+    }
+
+    #[test]
+    fn serializes_legacy_admin_report_list_fields() {
+        let report = super::report_management_json(crate::database::ReportManagementRecord {
+            id: 5,
+            tid: 41,
+            uploader: 7,
+            reporter: 8,
+            reason: "stolen skin".to_owned(),
+            status: 0,
+            report_at: "2026-10-02 14:00:00".to_owned(),
+            texture_tid: Some(41),
+            texture_name: Some("Skin".to_owned()),
+            texture_type: Some("alex".to_owned()),
+            texture_hash: Some("skin-hash".to_owned()),
+            texture_size: Some(8),
+            texture_uploader: Some(7),
+            texture_public: Some(true),
+            texture_upload_at: Some("2026-10-01 10:00:00".to_owned()),
+            texture_likes: Some(1),
+            texture_uploader_uid: Some(7),
+            texture_uploader_email: Some("alex@example.test".to_owned()),
+            texture_uploader_nickname: Some("Alex User".to_owned()),
+            texture_uploader_locale: Some("zh_CN".to_owned()),
+            texture_uploader_score: Some(42),
+            texture_uploader_avatar: Some(11),
+            texture_uploader_permission: Some(0),
+            texture_uploader_ip: Some("192.0.2.1".to_owned()),
+            texture_uploader_last_sign_at: Some("2026-10-01 10:00:00".to_owned()),
+            texture_uploader_register_at: Some("2025-01-02 03:04:05".to_owned()),
+            texture_uploader_verified: Some(true),
+            texture_uploader_is_dark_mode: Some(false),
+            informer_uid: Some(8),
+            informer_email: Some("admin@example.test".to_owned()),
+            informer_nickname: Some("Admin".to_owned()),
+            informer_locale: Some("en".to_owned()),
+            informer_score: Some(50),
+            informer_avatar: Some(0),
+            informer_permission: Some(1),
+            informer_ip: Some("192.0.2.2".to_owned()),
+            informer_last_sign_at: Some(String::new()),
+            informer_register_at: Some(String::new()),
+            informer_verified: Some(true),
+            informer_is_dark_mode: Some(false),
+        });
+        assert_eq!(report["id"], 5);
+        assert_eq!(report["tid"], 41);
+        assert_eq!(report["texture"]["type"], "alex");
+        assert_eq!(report["texture_uploader"]["nickname"], "Alex User");
+        assert_eq!(report["texture_uploader"]["ip"], "192.0.2.1");
+        assert_eq!(report["informer"]["uid"], 8);
+        assert_eq!(report["informer"]["email"], "admin@example.test");
+        assert_eq!(report["reason"], "stolen skin");
+    }
+
     #[tokio::test]
     async fn formats_report_validation_errors_by_field() {
         use axum::body::to_bytes;
@@ -3596,6 +3887,7 @@ mod tests {
             login_failures: Default::default(),
         });
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/user")
@@ -3605,6 +3897,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let report_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3623,7 +3925,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL, nickname TEXT NOT NULL, locale TEXT, score INTEGER NOT NULL, avatar INTEGER NOT NULL, password TEXT NOT NULL, permission INTEGER NOT NULL, last_sign_at TEXT NOT NULL, register_at TEXT NOT NULL, verified BOOLEAN NOT NULL, is_dark_mode BOOLEAN NOT NULL)")
+        sqlx::query("CREATE TABLE users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL, nickname TEXT NOT NULL, locale TEXT, score INTEGER NOT NULL, avatar INTEGER NOT NULL, password TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', permission INTEGER NOT NULL, last_sign_at TEXT NOT NULL, register_at TEXT NOT NULL, verified BOOLEAN NOT NULL, is_dark_mode BOOLEAN NOT NULL)")
             .execute(&pool)
             .await
             .unwrap();
@@ -3631,8 +3933,16 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE textures (tid INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader INTEGER NOT NULL, public BOOLEAN NOT NULL, upload_at TEXT NOT NULL, likes INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE reports (id INTEGER PRIMARY KEY AUTOINCREMENT, tid INTEGER NOT NULL, uploader INTEGER NOT NULL, reporter INTEGER NOT NULL, reason TEXT NOT NULL, status INTEGER NOT NULL, report_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let password_hash = bcrypt::hash("correct horse", 4).unwrap();
-        sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (7,'alex@example.test','Alex User','en',5,0,?,0,'','',1,0)")
+        sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (7,'alex@example.test','Alex User','en',5,0,?,1,'','',1,0)")
             .bind(password_hash)
             .execute(&pool)
             .await
@@ -3743,7 +4053,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user")
-                    .header("cookie", cookie)
+                    .header("cookie", cookie.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3754,6 +4064,24 @@ mod tests {
         let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
         assert!(dashboard_html.contains("alex@example.test"));
         assert!(dashboard_html.contains("Alex"));
+
+        let reports = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/reports/list?q=status%3A0%20sort%3A-report_at")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reports.status(), StatusCode::OK);
+        let report_page = to_bytes(reports.into_body(), usize::MAX).await.unwrap();
+        let report_page: serde_json::Value = serde_json::from_slice(&report_page).unwrap();
+        assert_eq!(report_page["current_page"], 1);
+        assert_eq!(report_page["last_page"], 1);
+        assert_eq!(report_page["data"].as_array().unwrap().len(), 0);
 
         let logout = app
             .oneshot(

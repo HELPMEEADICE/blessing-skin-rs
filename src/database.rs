@@ -88,6 +88,58 @@ pub struct SkinLibraryRecord {
     pub likes: i64,
     pub nickname: String,
 }
+#[derive(Debug, Default)]
+pub struct ReportSearchFilters {
+    pub id: Option<i64>,
+    pub tid: Option<i64>,
+    pub uploader: Option<i64>,
+    pub reporter: Option<i64>,
+    pub status: Option<i32>,
+    pub reason: Option<String>,
+}
+#[derive(Debug, FromRow)]
+pub struct ReportManagementRecord {
+    pub id: i64,
+    pub tid: i64,
+    pub uploader: i64,
+    pub reporter: i64,
+    pub reason: String,
+    pub status: i32,
+    pub report_at: String,
+    pub texture_tid: Option<i64>,
+    pub texture_name: Option<String>,
+    pub texture_type: Option<String>,
+    pub texture_hash: Option<String>,
+    pub texture_size: Option<i64>,
+    pub texture_uploader: Option<i64>,
+    pub texture_public: Option<bool>,
+    pub texture_upload_at: Option<String>,
+    pub texture_likes: Option<i64>,
+    pub texture_uploader_uid: Option<i64>,
+    pub texture_uploader_email: Option<String>,
+    pub texture_uploader_nickname: Option<String>,
+    pub texture_uploader_locale: Option<String>,
+    pub texture_uploader_score: Option<i64>,
+    pub texture_uploader_avatar: Option<i64>,
+    pub texture_uploader_permission: Option<i32>,
+    pub texture_uploader_ip: Option<String>,
+    pub texture_uploader_last_sign_at: Option<String>,
+    pub texture_uploader_register_at: Option<String>,
+    pub texture_uploader_verified: Option<bool>,
+    pub texture_uploader_is_dark_mode: Option<bool>,
+    pub informer_uid: Option<i64>,
+    pub informer_email: Option<String>,
+    pub informer_nickname: Option<String>,
+    pub informer_locale: Option<String>,
+    pub informer_score: Option<i64>,
+    pub informer_avatar: Option<i64>,
+    pub informer_permission: Option<i32>,
+    pub informer_ip: Option<String>,
+    pub informer_last_sign_at: Option<String>,
+    pub informer_register_at: Option<String>,
+    pub informer_verified: Option<bool>,
+    pub informer_is_dark_mode: Option<bool>,
+}
 #[derive(Debug, FromRow)]
 pub struct TextureInfoRecord {
     pub tid: i64,
@@ -406,6 +458,224 @@ impl DatabasePool {
         }
         Ok(ReportSubmissionOutcome::Submitted)
     }
+    pub async fn report_management_items(
+        &self,
+        prefix: &str,
+        filters: &ReportSearchFilters,
+        sort_field: &str,
+        descending: bool,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<ReportManagementRecord>, i64), sqlx::Error> {
+        let is_postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if is_postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let status_enabled = marker(1);
+        let status_value = marker(2);
+        let tid_enabled = marker(3);
+        let tid_value = marker(4);
+        let id_enabled = marker(5);
+        let id_value = marker(6);
+        let uploader_enabled = marker(7);
+        let uploader_value = marker(8);
+        let reporter_enabled = marker(9);
+        let reporter_value = marker(10);
+        let reason_enabled = marker(11);
+        let reason_value = marker(12);
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let status_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "INTEGER"
+        };
+        let text_cast = if matches!(self, Self::MySql(_)) {
+            "CHAR"
+        } else {
+            "TEXT"
+        };
+        let where_sql = format!(
+            "({status_enabled} = FALSE OR r.status = {status_value}) \
+             AND ({tid_enabled} = FALSE OR r.tid = {tid_value}) \
+             AND ({id_enabled} = FALSE OR r.id = {id_value}) \
+             AND ({uploader_enabled} = FALSE OR r.uploader = {uploader_value}) \
+             AND ({reporter_enabled} = FALSE OR r.reporter = {reporter_value}) \
+             AND ({reason_enabled} = FALSE OR r.reason LIKE {reason_value})"
+        );
+        let count_sql = format!("SELECT COUNT(*) FROM {prefix}reports r WHERE {where_sql}");
+        let sort_column = match sort_field {
+            "id" => "r.id",
+            "tid" => "r.tid",
+            "uploader" => "r.uploader",
+            "reporter" => "r.reporter",
+            "reason" => "r.reason",
+            "status" => "r.status",
+            _ => "r.report_at",
+        };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let limit = marker(13);
+        let offset = marker(14);
+        let rows_sql = format!(
+            "SELECT CAST(r.id AS {integer_cast}) AS id, CAST(r.tid AS {integer_cast}) AS tid, \
+             CAST(r.uploader AS {integer_cast}) AS uploader, CAST(r.reporter AS {integer_cast}) AS reporter, \
+             r.reason, CAST(r.status AS {status_cast}) AS status, CAST(r.report_at AS {text_cast}) AS report_at, \
+             CAST(t.tid AS {integer_cast}) AS texture_tid, t.name AS texture_name, \
+             t.type AS texture_type, t.hash AS texture_hash, CAST(t.size AS {integer_cast}) AS texture_size, \
+             CAST(t.uploader AS {integer_cast}) AS texture_uploader, t.public AS texture_public, \
+             CAST(t.upload_at AS {text_cast}) AS texture_upload_at, CAST(t.likes AS {integer_cast}) AS texture_likes, \
+             CAST(tu.uid AS {integer_cast}) AS texture_uploader_uid, \
+             tu.email AS texture_uploader_email, tu.nickname AS texture_uploader_nickname, \
+             tu.locale AS texture_uploader_locale, CAST(tu.score AS {integer_cast}) AS texture_uploader_score, \
+             CAST(tu.avatar AS {integer_cast}) AS texture_uploader_avatar, \
+             CAST(tu.permission AS {status_cast}) AS texture_uploader_permission, \
+             tu.ip AS texture_uploader_ip, CAST(tu.last_sign_at AS {text_cast}) AS texture_uploader_last_sign_at, \
+             CAST(tu.register_at AS {text_cast}) AS texture_uploader_register_at, \
+             tu.verified AS texture_uploader_verified, tu.is_dark_mode AS texture_uploader_is_dark_mode, \
+             CAST(ru.uid AS {integer_cast}) AS informer_uid, ru.email AS informer_email, \
+             ru.nickname AS informer_nickname, ru.locale AS informer_locale, \
+             CAST(ru.score AS {integer_cast}) AS informer_score, CAST(ru.avatar AS {integer_cast}) AS informer_avatar, \
+             CAST(ru.permission AS {status_cast}) AS informer_permission, ru.ip AS informer_ip, \
+             CAST(ru.last_sign_at AS {text_cast}) AS informer_last_sign_at, \
+             CAST(ru.register_at AS {text_cast}) AS informer_register_at, \
+             ru.verified AS informer_verified, ru.is_dark_mode AS informer_is_dark_mode \
+             FROM {prefix}reports r \
+             LEFT JOIN {prefix}textures t ON t.tid = r.tid \
+             LEFT JOIN {prefix}users tu ON tu.uid = r.uploader \
+             LEFT JOIN {prefix}users ru ON ru.uid = r.reporter \
+             WHERE {where_sql} ORDER BY {sort_column} {direction} \
+             LIMIT {limit} OFFSET {offset}"
+        );
+        let reason_pattern = filters.reason.as_ref().map(|value| format!("%{value}%"));
+        let status = filters.status.unwrap_or_default();
+        let tid = filters.tid.unwrap_or_default();
+        let id = filters.id.unwrap_or_default();
+        let uploader = filters.uploader.unwrap_or_default();
+        let reporter = filters.reporter.unwrap_or_default();
+        let reason = reason_pattern.as_deref().unwrap_or_default();
+        let count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, ReportManagementRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, ReportManagementRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, ReportManagementRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(filters.status.is_some())
+                    .bind(status)
+                    .bind(filters.tid.is_some())
+                    .bind(tid)
+                    .bind(filters.id.is_some())
+                    .bind(id)
+                    .bind(filters.uploader.is_some())
+                    .bind(uploader)
+                    .bind(filters.reporter.is_some())
+                    .bind(reporter)
+                    .bind(filters.reason.is_some())
+                    .bind(reason)
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok((rows, count))
+    }
+
     pub async fn toggle_texture_privacy(
         &self,
         prefix: &str,
@@ -3136,6 +3406,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO bs_reports (tid, uploader, reporter, reason, status, report_at) VALUES (11, 7, 8, 'duplicate texture', 0, '2026-10-02 14:00:00'), (999, 8, 7, 'missing texture', 1, '2026-10-02 13:00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 11, 'Alex skin'), (7, 12, 'Alex cape')")
             .execute(&pool)
             .await
@@ -3164,6 +3438,48 @@ mod tests {
                 .unwrap();
         }
         let database = DatabasePool::Sqlite(pool.clone());
+        let (pending_reports, report_count) = database
+            .report_management_items(
+                "bs_",
+                &super::ReportSearchFilters {
+                    status: Some(0),
+                    ..Default::default()
+                },
+                "report_at",
+                true,
+                1,
+                9,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report_count, 1);
+        assert_eq!(pending_reports.len(), 1);
+        assert_eq!(pending_reports[0].tid, 11);
+        assert_eq!(pending_reports[0].texture_name.as_deref(), Some("Skin"));
+        assert_eq!(
+            pending_reports[0].texture_uploader_nickname.as_deref(),
+            Some("Alex User")
+        );
+        assert_eq!(
+            pending_reports[0].informer_nickname.as_deref(),
+            Some("Admin")
+        );
+        let (resolved_reports, resolved_count) = database
+            .report_management_items(
+                "bs_",
+                &super::ReportSearchFilters {
+                    status: Some(1),
+                    ..Default::default()
+                },
+                "report_at",
+                true,
+                1,
+                9,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved_count, 1);
+        assert!(resolved_reports[0].texture_tid.is_none());
         let profile = database
             .player_profile("bs_", "Alex")
             .await
@@ -3694,7 +4010,7 @@ mod tests {
                 .unwrap();
         assert_eq!(report_count, 1);
         let report = sqlx::query_as::<_, (i64, i64, i64, String, i64)>(
-            "SELECT tid, uploader, reporter, reason, status FROM bs_reports",
+            "SELECT tid, uploader, reporter, reason, status FROM bs_reports WHERE tid = 13 AND reporter = 7",
         )
         .fetch_one(&pool)
         .await
