@@ -2565,6 +2565,11 @@ struct SkinLibraryShowPage {
     likes: i64,
     logged_in: bool,
     can_manage: bool,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -7394,8 +7399,100 @@ async fn skinlib_show_page(
     if !valid_texture_hash(&texture.hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let uploader_profile = match database
+        .user_profile(&state.config.database.table_prefix, texture.uploader)
+        .await
+    {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::error!(%error, tid, uploader = texture.uploader, "failed to load skin library uploader");
+            return unavailable();
+        }
+    };
+    let uploader_exists = uploader_profile.is_some();
+    let nickname = uploader_profile
+        .as_ref()
+        .map(|user| user.nickname.clone())
+        .unwrap_or_else(|| {
+            if state.config.locale.starts_with("zh") {
+                "不存在的用户".to_owned()
+            } else {
+                "No such user.".to_owned()
+            }
+        });
+    let badges = uploader_profile
+        .as_ref()
+        .filter(|user| user.permission >= 1)
+        .map(|_| serde_json::json!([{ "text": "STAFF", "color": "primary" }]))
+        .unwrap_or_else(|| serde_json::json!([]));
+    let in_closet = if let Some(viewer_uid) = viewer_uid {
+        match database
+            .closet_item_ids(&state.config.database.table_prefix, viewer_uid)
+            .await
+        {
+            Ok(ids) => ids.contains(&texture.tid),
+            Err(error) => {
+                tracing::error!(%error, tid, viewer_uid, "failed to load skin library viewer closet");
+                return unavailable();
+            }
+        }
+    } else {
+        false
+    };
+    let can_download = match database
+        .option(
+            &state.config.database.table_prefix,
+            "allow_downloading_texture",
+        )
+        .await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load texture download option");
+            return unavailable();
+        }
+    };
+    let report_score = match database
+        .option(
+            &state.config.database.table_prefix,
+            "reporter_score_modification",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load texture report score option");
+            return unavailable();
+        }
+    };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        &format!("skinlib/show/{tid}"),
+        serde_json::json!({
+            "nickname": nickname,
+            "uploaderExists": uploader_exists,
+            "currentUid": viewer_uid.unwrap_or_default(),
+            "admin": is_admin,
+            "badges": badges,
+            "download": can_download,
+            "report": report_score,
+            "inCloset": in_closet,
+        }),
+        i18n,
+    );
     let page = SkinLibraryShowPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         tid: texture.tid,
         name: texture.name,
@@ -7408,6 +7505,11 @@ async fn skinlib_show_page(
         likes: texture.likes,
         logged_in: viewer_uid.is_some(),
         can_manage: viewer_uid == Some(texture.uploader) || is_admin,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14409,11 +14511,28 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(
-            skinlib_show
-                .contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        );
-        assert!(skinlib_show.contains("Add to closet"));
+        assert!(skinlib_show.contains(r#"id="previewer""#));
+        assert!(skinlib_show.contains(r#"id="side""#));
+        assert!(skinlib_show.contains("http://localhost/app/style.012abcd.css"));
+        assert!(skinlib_show.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_show_globals = skinlib_show
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let show_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_show_globals)
+            .unwrap();
+        let show_globals: serde_json::Value = serde_json::from_slice(&show_globals_bytes).unwrap();
+        assert_eq!(show_globals["route"], "skinlib/show/20");
+        assert_eq!(show_globals["extra"]["nickname"], "NewGuy");
+        assert_eq!(show_globals["extra"]["uploaderExists"], true);
+        assert_eq!(show_globals["extra"]["currentUid"], registered_user.0);
+        assert_eq!(show_globals["extra"]["admin"], false);
+        assert_eq!(show_globals["extra"]["inCloset"], false);
+        assert_eq!(show_globals["i18n"]["auth"]["login"], "Log In");
 
         let upload_page =
             session_request(&app, &registered_cookie, "GET", "/skinlib/upload", None).await;
