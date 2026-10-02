@@ -31,7 +31,7 @@ use crate::{
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
     database::{
         DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
-        PlayerTextureOutcome, UserProfile,
+        PlayerTextureOutcome, TextureInfoRecord, UserProfile,
     },
 };
 
@@ -46,6 +46,8 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/skinlib/list", get(skinlib_list))
+        .route("/skinlib/info/{tid}", get(skinlib_info))
+        .route("/texture/{tid}", get(skinlib_info))
         .route("/api/user", get(api_user))
         .route("/api/closet", get(api_closet).post(api_add_closet_item))
         .route(
@@ -1590,6 +1592,90 @@ struct ClosetListQuery {
     per_page: Option<i64>,
 }
 
+async fn skinlib_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(tid): RoutePath<String>,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let Ok(tid) = tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let texture = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => texture,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load legacy texture details");
+            return unavailable();
+        }
+    };
+    let session_user_id = session_user_id(&state, &headers);
+    let (user_id, is_admin) = match session_user_id {
+        Some(user_id) => match database
+            .user_profile(&state.config.database.table_prefix, user_id)
+            .await
+        {
+            Ok(Some(user)) => (Some(user_id), user.permission >= 1),
+            Ok(None) => (None, false),
+            Err(error) => {
+                tracing::error!(%error, "failed to load texture viewer");
+                return unavailable();
+            }
+        },
+        None => (None, false),
+    };
+    if !texture.is_public && user_id != Some(texture.uploader) && !is_admin {
+        let status_code = match database
+            .option(
+                &state.config.database.table_prefix,
+                "status_code_for_private",
+            )
+            .await
+        {
+            Ok(value) => value.and_then(|value| value.parse::<u16>().ok()),
+            Err(error) => {
+                tracing::error!(%error, "failed to read private texture status option");
+                return unavailable();
+            }
+        };
+        let status = status_code
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .unwrap_or(StatusCode::FORBIDDEN);
+        let message = if state.config.locale.starts_with("zh") {
+            if status == StatusCode::NOT_FOUND {
+                "请求的材质文件已经被删除"
+            } else {
+                "请求的材质已经设为私密，仅上传者和管理员可查看"
+            }
+        } else if status == StatusCode::NOT_FOUND {
+            "The requested texture was already deleted."
+        } else {
+            "The requested texture is private and only visible to the uploader and admins."
+        };
+        return (status, message).into_response();
+    }
+    Json(texture_info_json(texture)).into_response()
+}
+
+fn texture_info_json(texture: TextureInfoRecord) -> serde_json::Value {
+    serde_json::json!({
+        "tid": texture.tid,
+        "name": texture.name,
+        "type": texture.texture_type,
+        "hash": texture.hash,
+        "size": texture.size,
+        "uploader": texture.uploader,
+        "public": texture.is_public,
+        "upload_at": texture.upload_at,
+        "likes": texture.likes,
+    })
+}
+
 #[derive(Deserialize)]
 struct SkinLibraryQuery {
     filter: Option<String>,
@@ -2244,6 +2330,37 @@ mod tests {
         assert_eq!(item["pivot"]["texture_tid"], 13);
         assert_eq!(item["pivot"]["item_name"], "Saved name");
     }
+    #[test]
+    fn serializes_legacy_texture_info_fields() {
+        use serde_json::json;
+
+        let texture = super::texture_info_json(crate::database::TextureInfoRecord {
+            tid: 13,
+            name: "Other skin".to_owned(),
+            texture_type: "alex".to_owned(),
+            hash: "texture-hash".to_owned(),
+            size: 10,
+            uploader: 8,
+            is_public: true,
+            upload_at: "2026-10-01 10:02:00".to_owned(),
+            likes: 2,
+        });
+        assert_eq!(
+            texture,
+            json!({
+                "tid": 13,
+                "name": "Other skin",
+                "type": "alex",
+                "hash": "texture-hash",
+                "size": 10,
+                "uploader": 8,
+                "public": true,
+                "upload_at": "2026-10-01 10:02:00",
+                "likes": 2
+            })
+        );
+    }
+
     #[test]
     fn validates_texture_hashes_before_joining_them_to_storage_paths() {
         assert!(valid_texture_hash(&"a".repeat(64)));

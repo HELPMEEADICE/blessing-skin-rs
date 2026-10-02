@@ -89,6 +89,18 @@ pub struct SkinLibraryRecord {
     pub nickname: String,
 }
 #[derive(Debug, FromRow)]
+pub struct TextureInfoRecord {
+    pub tid: i64,
+    pub name: String,
+    pub texture_type: String,
+    pub hash: String,
+    pub size: i64,
+    pub uploader: i64,
+    pub is_public: bool,
+    pub upload_at: String,
+    pub likes: i64,
+}
+#[derive(Debug, FromRow)]
 pub struct ClosetTextureRecord {
     pub tid: i64,
     pub name: String,
@@ -295,6 +307,52 @@ impl DatabasePool {
                 .bind(tid)
                 .fetch_optional(pool)
                 .await?),
+        }
+    }
+    pub async fn texture_info(
+        &self,
+        prefix: &str,
+        tid: i64,
+    ) -> Result<Option<TextureInfoRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(tid AS BIGINT) AS tid, name, type AS texture_type, hash, \
+                 CAST(size AS BIGINT) AS size, CAST(uploader AS BIGINT) AS uploader, \
+                 public AS is_public, TO_CHAR(upload_at, 'YYYY-MM-DD HH24:MI:SS') AS upload_at, \
+                 CAST(likes AS BIGINT) AS likes FROM {prefix}textures WHERE tid = $1 LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(tid AS SIGNED) AS tid, name, type AS texture_type, hash, \
+                 CAST(size AS SIGNED) AS size, CAST(uploader AS SIGNED) AS uploader, \
+                 public AS is_public, DATE_FORMAT(upload_at, '%Y-%m-%d %H:%i:%s') AS upload_at, \
+                 CAST(likes AS SIGNED) AS likes FROM {prefix}textures WHERE tid = ? LIMIT 1"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(tid AS BIGINT) AS tid, name, type AS texture_type, hash, \
+                 CAST(size AS BIGINT) AS size, CAST(uploader AS BIGINT) AS uploader, \
+                 public AS is_public, CAST(upload_at AS TEXT) AS upload_at, \
+                 CAST(likes AS BIGINT) AS likes FROM {prefix}textures WHERE tid = ? LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, TextureInfoRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(tid)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, TextureInfoRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(tid)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, TextureInfoRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(tid)
+            .fetch_optional(pool)
+            .await?),
         }
     }
     pub async fn access_token(
@@ -2621,6 +2679,17 @@ mod tests {
                 .unwrap(),
             super::ClosetRenameOutcome::NotInCloset
         ));
+        let texture = database.texture_info("bs_", 13).await.unwrap().unwrap();
+        assert_eq!(texture.tid, 13);
+        assert_eq!(texture.name, "Other skin");
+        assert_eq!(texture.texture_type, "alex");
+        assert_eq!(texture.hash, "not-in-closet");
+        assert_eq!(texture.size, 10);
+        assert_eq!(texture.uploader, 8);
+        assert!(texture.is_public);
+        assert_eq!(texture.upload_at, "2026-10-01 10:02:00");
+        assert_eq!(texture.likes, 0);
+        assert!(database.texture_info("bs_", 99).await.unwrap().is_none());
         let skin_likes: i64 = sqlx::query_scalar("SELECT likes FROM bs_textures WHERE tid = 13")
             .fetch_one(&pool)
             .await
