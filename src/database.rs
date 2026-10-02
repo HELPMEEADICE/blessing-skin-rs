@@ -177,6 +177,9 @@ pub enum ReportSubmissionOutcome {
 pub enum ReportReviewOutcome {
     NotFound,
     Rejected,
+    Resolved,
+    UploaderNotFound,
+    UploaderPermissionDenied,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum TexturePrivacyOutcome {
@@ -700,8 +703,19 @@ impl DatabasePool {
         } else {
             " FOR UPDATE"
         };
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let status_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "INTEGER"
+        };
         let report_sql = format!(
-            "SELECT status, reporter FROM {prefix}reports WHERE id = {} LIMIT 1{lock_clause}",
+            "SELECT CAST(status AS {status_cast}), CAST(reporter AS {integer_cast}) \
+             FROM {prefix}reports WHERE id = {} LIMIT 1{lock_clause}",
             marker(1)
         );
         let retract_score_sql = format!(
@@ -786,6 +800,196 @@ impl DatabasePool {
             }
         }
         Ok(ReportReviewOutcome::Rejected)
+    }
+
+    pub async fn ban_report_uploader(
+        &self,
+        prefix: &str,
+        report_id: i64,
+        admin_permission: i32,
+        reporter_score_modification: i64,
+        reporter_reward_score: i64,
+    ) -> Result<ReportReviewOutcome, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let lock_clause = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let status_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "INTEGER"
+        };
+        let report_sql = format!(
+            "SELECT CAST(status AS {status_cast}), CAST(uploader AS {integer_cast}), \
+             CAST(reporter AS {integer_cast}) FROM {prefix}reports \
+             WHERE id = {} LIMIT 1{lock_clause}",
+            marker(1)
+        );
+        let uploader_sql = format!(
+            "SELECT CAST(permission AS {status_cast}) FROM {prefix}users \
+             WHERE uid = {} LIMIT 1{lock_clause}",
+            marker(1)
+        );
+        let ban_uploader_sql = format!(
+            "UPDATE {prefix}users SET permission = -1 WHERE uid = {}",
+            marker(1)
+        );
+        let update_reporter_score_sql = format!(
+            "UPDATE {prefix}users SET score = score + {} WHERE uid = {}",
+            marker(1),
+            marker(2)
+        );
+        let resolve_report_sql = format!(
+            "UPDATE {prefix}reports SET status = 1 WHERE id = {}",
+            marker(1)
+        );
+        let lock_report = |report: (i32, i64, i64), uploader_permission: i32| {
+            if admin_permission <= uploader_permission {
+                return Err(ReportReviewOutcome::UploaderPermissionDenied);
+            }
+            Ok(report)
+        };
+        let score_adjustment = reporter_score_modification
+            .min(0)
+            .saturating_neg()
+            .saturating_add(reporter_reward_score);
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(report) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                let uploader_permission =
+                    sqlx::query_scalar::<_, i32>(sqlx::AssertSqlSafe(uploader_sql))
+                        .bind(report.1)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                let Some(uploader_permission) = uploader_permission else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::UploaderNotFound);
+                };
+                if let Err(outcome) = lock_report(report, uploader_permission) {
+                    transaction.rollback().await?;
+                    return Ok(outcome);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(ban_uploader_sql))
+                    .bind(report.1)
+                    .execute(&mut *transaction)
+                    .await?;
+                if report.0 == 0 && score_adjustment != 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(update_reporter_score_sql))
+                        .bind(score_adjustment)
+                        .bind(report.2)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(resolve_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(report) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                let uploader_permission =
+                    sqlx::query_scalar::<_, i32>(sqlx::AssertSqlSafe(uploader_sql))
+                        .bind(report.1)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                let Some(uploader_permission) = uploader_permission else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::UploaderNotFound);
+                };
+                if let Err(outcome) = lock_report(report, uploader_permission) {
+                    transaction.rollback().await?;
+                    return Ok(outcome);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(ban_uploader_sql))
+                    .bind(report.1)
+                    .execute(&mut *transaction)
+                    .await?;
+                if report.0 == 0 && score_adjustment != 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(update_reporter_score_sql))
+                        .bind(score_adjustment)
+                        .bind(report.2)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(resolve_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let report = sqlx::query_as::<_, (i32, i64, i64)>(sqlx::AssertSqlSafe(report_sql))
+                    .bind(report_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(report) = report else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::NotFound);
+                };
+                let uploader_permission =
+                    sqlx::query_scalar::<_, i32>(sqlx::AssertSqlSafe(uploader_sql))
+                        .bind(report.1)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                let Some(uploader_permission) = uploader_permission else {
+                    transaction.rollback().await?;
+                    return Ok(ReportReviewOutcome::UploaderNotFound);
+                };
+                if let Err(outcome) = lock_report(report, uploader_permission) {
+                    transaction.rollback().await?;
+                    return Ok(outcome);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(ban_uploader_sql))
+                    .bind(report.1)
+                    .execute(&mut *transaction)
+                    .await?;
+                if report.0 == 0 && score_adjustment != 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(update_reporter_score_sql))
+                        .bind(score_adjustment)
+                        .bind(report.2)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(resolve_report_sql))
+                    .bind(report_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(ReportReviewOutcome::Resolved)
     }
 
     pub async fn toggle_texture_privacy(
@@ -4309,5 +4513,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected_status, 2);
+        sqlx::query("INSERT INTO bs_reports (id, tid, uploader, reporter, reason, status, report_at) VALUES (100, 13, 8, 7, 'abusive skin', 0, '2026-10-02 15:00:00'), (101, 11, 7, 8, 'admin target', 0, '2026-10-02 16:00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reporter_score_before_ban: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            database
+                .ban_report_uploader("bs_", 100, 2, -3, 5)
+                .await
+                .unwrap(),
+            super::ReportReviewOutcome::Resolved
+        );
+        let reporter_score_after_ban: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reporter_score_after_ban, reporter_score_before_ban + 8);
+        let banned_permission: i64 =
+            sqlx::query_scalar("SELECT permission FROM bs_users WHERE uid = 8")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(banned_permission, -1);
+        let resolved_status: i64 =
+            sqlx::query_scalar("SELECT status FROM bs_reports WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(resolved_status, 1);
+        assert_eq!(
+            database
+                .ban_report_uploader("bs_", 101, 0, -3, 5)
+                .await
+                .unwrap(),
+            super::ReportReviewOutcome::UploaderPermissionDenied
+        );
     }
 }

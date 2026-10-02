@@ -2969,7 +2969,9 @@ async fn web_review_report(
         .user_profile(&state.config.database.table_prefix, user_id)
         .await
     {
-        Ok(Some(user)) if user.permission >= 1 => {}
+        Ok(Some(user)) if user.permission >= 1 => {
+            return review_report_action(&state, id, &body, user.permission).await;
+        }
         Ok(Some(_)) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -2983,7 +2985,6 @@ async fn web_review_report(
             return unavailable();
         }
     }
-    reject_report_request(&state, id, &body).await
 }
 
 async fn api_review_report(
@@ -3006,7 +3007,9 @@ async fn api_review_report(
         .user_profile(&state.config.database.table_prefix, identity.user_id)
         .await
     {
-        Ok(Some(user)) if user.permission >= 1 => {}
+        Ok(Some(user)) if user.permission >= 1 => {
+            return review_report_action(&state, id, &body, user.permission).await;
+        }
         Ok(Some(_)) | Ok(None) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -3019,19 +3022,23 @@ async fn api_review_report(
             return unavailable();
         }
     }
-    reject_report_request(&state, id, &body).await
 }
 
-async fn reject_report_request(state: &AppState, id: i64, body: &[u8]) -> Response {
+async fn review_report_action(
+    state: &AppState,
+    id: i64,
+    body: &[u8],
+    admin_permission: i32,
+) -> Response {
     let request = serde_json::from_slice::<serde_json::Value>(body).ok();
-    if request
+    let Some(action) = request
         .as_ref()
         .and_then(|request| request.get("action"))
         .and_then(serde_json::Value::as_str)
-        != Some("reject")
-    {
+        .filter(|action| matches!(*action, "reject" | "ban"))
+    else {
         return report_review_validation_error(&state.config.locale);
-    }
+    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -3051,28 +3058,72 @@ async fn reject_report_request(state: &AppState, id: i64, body: &[u8]) -> Respon
             return unavailable();
         }
     };
-    match database
-        .reject_report(
-            &state.config.database.table_prefix,
-            id,
-            reporter_score_modification,
-        )
-        .await
-    {
-        Ok(crate::database::ReportReviewOutcome::Rejected) => {
+    let outcome = if action == "reject" {
+        database
+            .reject_report(
+                &state.config.database.table_prefix,
+                id,
+                reporter_score_modification,
+            )
+            .await
+    } else {
+        let reporter_reward_score = match database
+            .option(&state.config.database.table_prefix, "reporter_reward_score")
+            .await
+        {
+            Ok(value) => value
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to read reporter reward score");
+                return unavailable();
+            }
+        };
+        database
+            .ban_report_uploader(
+                &state.config.database.table_prefix,
+                id,
+                admin_permission,
+                reporter_score_modification,
+                reporter_reward_score,
+            )
+            .await
+    };
+    match outcome {
+        Ok(crate::database::ReportReviewOutcome::Rejected) => report_review_success(state, 2),
+        Ok(crate::database::ReportReviewOutcome::Resolved) => report_review_success(state, 1),
+        Ok(crate::database::ReportReviewOutcome::UploaderNotFound) => {
             let message = if state.config.locale.starts_with("zh") {
-                "操作成功"
+                "用户不存在"
             } else {
-                "Operated successfully."
+                "No such user."
             };
-            login_result(0, message, Some(serde_json::json!({ "status": 2 })))
+            login_result(1, message, None)
+        }
+        Ok(crate::database::ReportReviewOutcome::UploaderPermissionDenied) => {
+            let message = if state.config.locale.starts_with("zh") {
+                "你无权操作此用户"
+            } else {
+                "You have no permission to operate this user."
+            };
+            login_result(1, message, None)
         }
         Ok(crate::database::ReportReviewOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            tracing::error!(%error, report_id = id, "failed to reject report");
+            tracing::error!(%error, report_id = id, "failed to review report");
             unavailable()
         }
     }
+}
+
+fn report_review_success(state: &AppState, status: i32) -> Response {
+    let message = if state.config.locale.starts_with("zh") {
+        "操作成功"
+    } else {
+        "Operated successfully."
+    };
+    login_result(0, message, Some(serde_json::json!({ "status": status })))
 }
 
 fn report_review_validation_error(locale: &str) -> Response {
@@ -4111,6 +4162,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (8,'uploader@example.test','Uploader','en',20,0,'',0,'','',1,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO players (pid,uid,name,tid_skin,tid_cape,last_modified) VALUES (3,7,'Alex',0,0,'2026-10-02 12:00:00')")
             .execute(&pool)
             .await
@@ -4119,11 +4174,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO reports (id,tid,uploader,reporter,reason,status,report_at) VALUES (1,2,7,7,'stolen skin',0,'2026-10-02 14:00:00')")
+        sqlx::query("INSERT INTO reports (id,tid,uploader,reporter,reason,status,report_at) VALUES (1,2,7,7,'stolen skin',0,'2026-10-02 14:00:00'), (2,2,8,7,'second report',0,'2026-10-02 15:00:00')")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('reporter_score_modification','2')")
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('reporter_score_modification','2'), ('reporter_reward_score','3')")
             .execute(&pool)
             .await
             .unwrap();
@@ -4257,7 +4312,7 @@ mod tests {
         let report_page: serde_json::Value = serde_json::from_slice(&report_page).unwrap();
         assert_eq!(report_page["current_page"], 1);
         assert_eq!(report_page["last_page"], 1);
-        assert_eq!(report_page["total"], 1);
+        assert_eq!(report_page["total"], 2);
         assert_eq!(report_page["data"][0]["tid"], 2);
         assert_eq!(report_page["data"][0]["texture"]["hash"], "reported-hash");
         assert_eq!(report_page["data"][0]["informer"]["ip"], "");
@@ -4290,6 +4345,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report_status, 2);
+
+        let banned = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/reports/2")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"ban"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(banned.status(), StatusCode::OK);
+        let banned_body = to_bytes(banned.into_body(), usize::MAX).await.unwrap();
+        let banned_body: serde_json::Value = serde_json::from_slice(&banned_body).unwrap();
+        assert_eq!(banned_body["code"], 0);
+        assert_eq!(banned_body["data"]["status"], 1);
+        let uploader_permission: i64 =
+            sqlx::query_scalar("SELECT permission FROM users WHERE uid = 8")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(uploader_permission, -1);
+        let rewarded_score: i64 = sqlx::query_scalar("SELECT score FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rewarded_score, 6);
 
         let logout = app
             .oneshot(
