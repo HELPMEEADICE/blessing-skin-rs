@@ -13,8 +13,9 @@ pulldown-cmark = "0.13"
 pbkdf2 = "0.12"
 rand = "0.8.8"
 regex = "1"
+rsa = { version = "0.9", features = ["pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 ctr = "0.9"
 axum = { version = "0.8", features = ["multipart"] }
 dotenvy = "0.15"

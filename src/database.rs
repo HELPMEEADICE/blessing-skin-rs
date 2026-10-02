@@ -760,6 +760,29 @@ impl DatabasePool {
         Ok(pool)
     }
 
+    pub async fn connect_for_install(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
+        let pool = match &config.connection {
+            DatabaseConnection::Sqlite(options) => Self::Sqlite(
+                SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(options.clone().create_if_missing(true))
+                    .await?,
+            ),
+            DatabaseConnection::MySql(options) => Self::MySql(
+                MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(options.clone())
+                    .await?,
+            ),
+            DatabaseConnection::Postgres(options) => Self::Postgres(
+                PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(options.clone())
+                    .await?,
+            ),
+        };
+        Ok(pool)
+    }
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
         match self {
             Self::Sqlite(pool) => {

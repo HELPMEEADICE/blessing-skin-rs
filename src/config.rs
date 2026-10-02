@@ -108,7 +108,12 @@ impl Config {
             ),
             password_method: env::var("PWD_METHOD").unwrap_or_else(|_| "BCRYPT".to_owned()),
             password_salt: env::var("SALT").unwrap_or_default(),
-            app_key: env::var("APP_KEY").ok().filter(|value| !value.is_empty()),
+            app_key: env::var("APP_KEY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| std::fs::read_to_string(storage.join("app.key")).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             mail: MailConfig::from_env(),
         })
     }

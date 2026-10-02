@@ -4,6 +4,7 @@ mod config;
 mod database;
 mod defuse;
 mod http;
+mod installer;
 mod mailer;
 mod oauth;
 mod plugin_runtime;
@@ -43,6 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    if std::env::args().nth(1).as_deref() == Some("install") {
+        installer::run(&config).await?;
+        return Ok(());
+    }
     let mut plugins = plugin_runtime::PluginRuntime::load(&config.plugins_dir)?;
     let database = match DatabasePool::connect(&config.database).await {
         Ok(pool) => Some(pool),
