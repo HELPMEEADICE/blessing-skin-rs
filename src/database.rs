@@ -519,6 +519,33 @@ pub struct ReportManagementRecord {
     pub informer_verified: Option<bool>,
     pub informer_is_dark_mode: Option<bool>,
 }
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct AdminClosetUserRecord {
+    pub uid: i64,
+    pub email: String,
+    pub nickname: String,
+    pub locale: Option<String>,
+    pub score: i64,
+    pub avatar: i64,
+    pub ip: String,
+    pub permission: i32,
+    pub last_sign_at: String,
+    pub register_at: String,
+    pub verified: bool,
+    pub is_dark_mode: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdminClosetAddOutcome {
+    Added,
+    Repeated,
+    TextureNotFound,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdminClosetRemoveOutcome {
+    Removed,
+    NonExistent,
+}
+
 #[derive(Debug, FromRow)]
 pub struct TextureInfoRecord {
     pub tid: i64,
@@ -3447,6 +3474,49 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn admin_closet_user(
+        &self,
+        prefix: &str,
+        uid: i64,
+    ) -> Result<Option<AdminClosetUserRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, \
+                 CAST(avatar AS BIGINT) AS avatar, ip, permission, CAST(last_sign_at AS TEXT) AS last_sign_at, \
+                 CAST(register_at AS TEXT) AS register_at, verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(uid AS SIGNED) AS uid, email, nickname, locale, CAST(score AS SIGNED) AS score, \
+                 CAST(avatar AS SIGNED) AS avatar, ip, permission, DATE_FORMAT(last_sign_at, '%Y-%m-%d %H:%i:%s') AS last_sign_at, \
+                 DATE_FORMAT(register_at, '%Y-%m-%d %H:%i:%s') AS register_at, verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, \
+                 CAST(avatar AS BIGINT) AS avatar, ip, permission, to_char(last_sign_at, 'YYYY-MM-DD HH24:MI:SS') AS last_sign_at, \
+                 to_char(register_at, 'YYYY-MM-DD HH24:MI:SS') AS register_at, verified, is_dark_mode FROM {prefix}users WHERE uid = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, AdminClosetUserRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, AdminClosetUserRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, AdminClosetUserRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
     pub async fn players_for_user(
         &self,
         prefix: &str,
@@ -4311,6 +4381,178 @@ impl DatabasePool {
         };
         Ok((rows, count))
     }
+    pub async fn admin_closet_items(
+        &self,
+        prefix: &str,
+        user_id: i64,
+    ) -> Result<Vec<ClosetTextureRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS BIGINT) AS size, CAST(t.uploader AS BIGINT) AS uploader, t.public AS is_public, \
+                 CAST(t.upload_at AS TEXT) AS upload_at, CAST(t.likes AS BIGINT) AS likes, \
+                 CAST(c.user_uid AS BIGINT) AS user_uid, CAST(c.texture_tid AS BIGINT) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = ? ORDER BY c.texture_tid"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(t.tid AS SIGNED) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS SIGNED) AS size, CAST(t.uploader AS SIGNED) AS uploader, t.public AS is_public, \
+                 DATE_FORMAT(t.upload_at, '%Y-%m-%d %H:%i:%s') AS upload_at, CAST(t.likes AS SIGNED) AS likes, \
+                 CAST(c.user_uid AS SIGNED) AS user_uid, CAST(c.texture_tid AS SIGNED) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = ? ORDER BY c.texture_tid"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS BIGINT) AS size, CAST(t.uploader AS BIGINT) AS uploader, t.public AS is_public, \
+                 to_char(t.upload_at, 'YYYY-MM-DD HH24:MI:SS') AS upload_at, CAST(t.likes AS BIGINT) AS likes, \
+                 CAST(c.user_uid AS BIGINT) AS user_uid, CAST(c.texture_tid AS BIGINT) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = $1 ORDER BY c.texture_tid"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, ClosetTextureRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+            Self::MySql(pool) => Ok(
+                sqlx::query_as::<_, ClosetTextureRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await?,
+            ),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, ClosetTextureRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+        }
+    }
+
+    pub async fn add_admin_closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+    ) -> Result<AdminClosetAddOutcome, sqlx::Error> {
+        let Some(texture) = self.texture_info(prefix, tid).await? else {
+            return Ok(AdminClosetAddOutcome::TextureNotFound);
+        };
+        let exists_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        let count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(exists_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if count > 0 {
+            return Ok(AdminClosetAddOutcome::Repeated);
+        }
+        let insert_sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES ($1, $2, $3)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (?, ?, ?)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(&texture.name)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(&texture.name)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .bind(&texture.name)
+                    .execute(pool)
+                    .await?;
+            }
+        };
+        Ok(AdminClosetAddOutcome::Added)
+    }
+
+    pub async fn remove_admin_closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+    ) -> Result<AdminClosetRemoveOutcome, sqlx::Error> {
+        let delete_sql = match self {
+            Self::Postgres(_) => {
+                format!("DELETE FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2")
+            }
+            _ => format!("DELETE FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"),
+        };
+        let affected = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(user_id)
+                .bind(tid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(user_id)
+                .bind(tid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(user_id)
+                .bind(tid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        Ok(if affected == 0 {
+            AdminClosetRemoveOutcome::NonExistent
+        } else {
+            AdminClosetRemoveOutcome::Removed
+        })
+    }
+
     pub async fn closet_items(
         &self,
         prefix: &str,

@@ -36,9 +36,9 @@ use crate::{
         hash_legacy_password,
     },
     database::{
-        AdminUserRecord, DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord,
-        PlayerRenameOutcome, PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters,
-        TextureInfoRecord, UserProfile,
+        AdminUserRecord, ClosetTextureRecord, DatabasePool, NotificationRecord, PlayerProfile,
+        PlayerRecord, PlayerRenameOutcome, PlayerTextureOutcome, ReportManagementRecord,
+        ReportSearchFilters, TextureInfoRecord, UserProfile,
     },
 };
 
@@ -82,6 +82,10 @@ pub fn router(state: AppState) -> Router {
             put(web_admin_player_texture),
         )
         .route("/admin/players/{pid}", delete(web_admin_player_delete))
+        .route(
+            "/admin/closet/{uid}",
+            post(web_admin_closet_add).delete(web_admin_closet_remove),
+        )
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route("/skinlib/list", get(skinlib_list))
@@ -133,6 +137,12 @@ pub fn router(state: AppState) -> Router {
             put(api_admin_player_texture),
         )
         .route("/api/admin/players/{pid}", delete(api_admin_player_delete))
+        .route(
+            "/api/admin/closet/{uid}",
+            get(api_admin_closet_list)
+                .post(api_admin_closet_add)
+                .delete(api_admin_closet_remove),
+        )
         .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/admin/reports", get(api_admin_report_list))
         .route("/api/admin/reports/{id}", put(api_review_report))
@@ -4201,6 +4211,313 @@ fn forbidden_action() -> Response {
         .into_response()
 }
 
+async fn web_admin_closet_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(uid): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let Some(actor_uid) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, actor_uid)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_closet_mutation(&state, uid, body, false).await
+        }
+        Ok(Some(_)) => forbidden_action(),
+        Ok(None) => Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn web_admin_closet_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(uid): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let Some(actor_uid) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, actor_uid)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_closet_mutation(&state, uid, body, true).await
+        }
+        Ok(Some(_)) => forbidden_action(),
+        Ok(None) => Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load closet administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_closet_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(uid): RoutePath<i64>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["ClosetManagement.Read", "ClosetManagement.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {}
+        Ok(Some(_)) | Ok(None) => return forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API closet administrator");
+            return unavailable();
+        }
+    }
+    match database
+        .admin_closet_user(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load managed closet owner");
+            return unavailable();
+        }
+    }
+    match database
+        .admin_closet_items(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(items) => Json(serde_json::Value::Array(
+            items.into_iter().map(admin_closet_texture_json).collect(),
+        ))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to list managed closet");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_closet_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(uid): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("ClosetManagement.ReadWrite") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_closet_mutation(&state, uid, body, false).await
+        }
+        Ok(Some(_)) | Ok(None) => forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API closet administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_closet_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(uid): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("ClosetManagement.ReadWrite") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_closet_mutation(&state, uid, body, true).await
+        }
+        Ok(Some(_)) | Ok(None) => forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API closet administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: bool) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let user = match database
+        .admin_closet_user(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load managed closet owner");
+            return unavailable();
+        }
+    };
+    let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let tid = request
+        .as_ref()
+        .and_then(|value| value.get("tid"))
+        .and_then(|value| request_i64(Some(value)));
+    let chinese = state.config.locale.starts_with("zh");
+    let Some(tid) = tid else {
+        let message = if remove {
+            if chinese {
+                "衣柜中不存在此材质"
+            } else {
+                "The texture does not exist in your closet."
+            }
+        } else if chinese {
+            "该材质不存在"
+        } else {
+            "We cannot find this texture."
+        };
+        return login_result(1, message, None);
+    };
+    if remove {
+        match database
+            .remove_admin_closet_item(&state.config.database.table_prefix, uid, tid)
+            .await
+        {
+            Ok(crate::database::AdminClosetRemoveOutcome::NonExistent) => {
+                let message = if chinese {
+                    "衣柜中不存在此材质"
+                } else {
+                    "The texture does not exist in your closet."
+                };
+                login_result(1, message, None)
+            }
+            Ok(crate::database::AdminClosetRemoveOutcome::Removed) => {
+                let texture = match database
+                    .texture_info(&state.config.database.table_prefix, tid)
+                    .await
+                {
+                    Ok(texture) => texture.map(texture_info_json),
+                    Err(error) => {
+                        tracing::error!(%error, tid, "failed to load removed closet texture");
+                        return unavailable();
+                    }
+                };
+                login_result(
+                    0,
+                    "",
+                    Some(serde_json::json!({"user": user, "texture": texture})),
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, uid, tid, "failed to remove admin closet item");
+                unavailable()
+            }
+        }
+    } else {
+        match database
+            .add_admin_closet_item(&state.config.database.table_prefix, uid, tid)
+            .await
+        {
+            Ok(crate::database::AdminClosetAddOutcome::TextureNotFound) => {
+                let message = if chinese {
+                    "该材质不存在"
+                } else {
+                    "We cannot find this texture."
+                };
+                login_result(1, message, None)
+            }
+            Ok(crate::database::AdminClosetAddOutcome::Repeated) => {
+                let message = if chinese {
+                    "你已经收藏过这个材质啦"
+                } else {
+                    "You have already added this texture."
+                };
+                login_result(1, message, None)
+            }
+            Ok(crate::database::AdminClosetAddOutcome::Added) => {
+                let texture = match database
+                    .texture_info(&state.config.database.table_prefix, tid)
+                    .await
+                {
+                    Ok(Some(texture)) => texture,
+                    Ok(None) => return unavailable(),
+                    Err(error) => {
+                        tracing::error!(%error, tid, "failed to load added closet texture");
+                        return unavailable();
+                    }
+                };
+                let texture_json = texture_info_json(texture);
+                login_result(
+                    0,
+                    "",
+                    Some(serde_json::json!({"user": user, "texture": texture_json})),
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, uid, tid, "failed to add admin closet item");
+                unavailable()
+            }
+        }
+    }
+}
+
+fn admin_closet_texture_json(item: ClosetTextureRecord) -> serde_json::Value {
+    serde_json::json!({
+        "tid": item.tid,
+        "name": item.name,
+        "type": item.texture_type,
+        "hash": item.hash,
+        "size": item.size,
+        "uploader": item.uploader,
+        "public": item.is_public,
+        "upload_at": item.upload_at,
+        "likes": item.likes,
+        "pivot": {
+            "user_uid": item.user_uid,
+            "texture_tid": item.texture_tid,
+            "item_name": item.item_name,
+        }
+    })
+}
+
 async fn admin_report_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5638,6 +5955,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users_response.status(), StatusCode::UNAUTHORIZED);
+        let closet_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/closet/7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closet_response.status(), StatusCode::UNAUTHORIZED);
         let report_response = app
             .oneshot(
                 Request::builder()
@@ -6059,6 +6387,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(player_count, 0);
+
+        let managed_closet_add = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/closet/8")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tid":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(managed_closet_add.status(), StatusCode::OK);
+        let managed_closet_add: serde_json::Value = serde_json::from_slice(
+            &to_bytes(managed_closet_add.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(managed_closet_add["code"], 0);
+        assert_eq!(managed_closet_add["message"], "");
+        assert_eq!(managed_closet_add["data"]["user"]["uid"], 8);
+        assert_eq!(managed_closet_add["data"]["user"]["ip"], "");
+        assert_eq!(managed_closet_add["data"]["texture"]["tid"], 2);
+        let closet_row: (String,) = sqlx::query_as(
+            "SELECT item_name FROM user_closet WHERE user_uid = 8 AND texture_tid = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closet_row.0, "Reported skin");
+        let admin_closet_items = crate::database::DatabasePool::Sqlite(pool.clone())
+            .admin_closet_items("", 8)
+            .await
+            .unwrap();
+        assert_eq!(admin_closet_items.len(), 1);
+        assert_eq!(
+            admin_closet_items[0].item_name.as_deref(),
+            Some("Reported skin")
+        );
+
+        let repeated_closet_add = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/closet/8")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tid":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let repeated_closet_add: serde_json::Value = serde_json::from_slice(
+            &to_bytes(repeated_closet_add.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repeated_closet_add["code"], 1);
+
+        let managed_closet_remove = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/closet/8")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tid":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let managed_closet_remove: serde_json::Value = serde_json::from_slice(
+            &to_bytes(managed_closet_remove.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(managed_closet_remove["code"], 0);
+        assert_eq!(managed_closet_remove["message"], "");
+        assert_eq!(managed_closet_remove["data"]["user"]["uid"], 8);
+        assert_eq!(managed_closet_remove["data"]["texture"]["tid"], 2);
+        let closet_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_closet WHERE user_uid = 8 AND texture_tid = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closet_count, 0);
 
         let users = app
             .clone()
