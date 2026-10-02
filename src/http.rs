@@ -633,6 +633,28 @@ async fn load_frontend_translations(app_dir: &std::path::Path, locale: &str) -> 
     serde_json::json!({})
 }
 
+fn encode_frontend_globals(
+    state: &AppState,
+    site_name: &str,
+    route: &str,
+    extra: serde_json::Value,
+    i18n: serde_json::Value,
+) -> String {
+    let globals = serde_json::json!({
+        "version": state.config.version,
+        "locale": state.config.locale,
+        "base_url": state.config.app_url.trim_end_matches('/'),
+        "site_name": site_name,
+        "route": route,
+        "debug": cfg!(debug_assertions),
+        "env": if cfg!(debug_assertions) { "development" } else { "production" },
+        "extra": extra,
+        "i18n": i18n,
+    });
+    base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&globals).expect("frontend config is serializable"))
+}
+
 fn login_failure_count(state: &AppState, identification: &str) -> u32 {
     state
         .login_failures
@@ -702,24 +724,18 @@ async fn login_page(
         }
         None => (String::new(), false),
     };
-    let frontend_globals = serde_json::json!({
-        "version": state.config.version,
-        "locale": state.config.locale,
-        "base_url": state.config.app_url.trim_end_matches('/'),
-        "site_name": site_name,
-        "route": "auth/login",
-        "debug": cfg!(debug_assertions),
-        "env": if cfg!(debug_assertions) { "development" } else { "production" },
-        "extra": {
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "auth/login",
+        serde_json::json!({
             "tooManyFails": failures,
             "recaptcha": recaptcha_sitekey,
             "invisible": recaptcha_invisible,
             "redirectTo": redirect_to,
-        },
-        "i18n": i18n,
-    });
-    let frontend_globals_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&frontend_globals).expect("frontend config is serializable"));
+        }),
+        i18n,
+    );
     let page = LoginPage {
         site_name,
         locale: state.config.locale.clone(),
@@ -2344,6 +2360,11 @@ struct DashboardPage {
     notifications: Vec<DashboardNotification>,
     show_email_verification: bool,
     locale: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 struct DashboardNotification {
@@ -2812,13 +2833,30 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "user",
+        serde_json::json!({ "unverified": show_email_verification }),
+        i18n,
+    );
     let page = DashboardPage {
-        site_name: site_name(&state).await,
+        site_name,
         user,
         players,
         notifications,
         show_email_verification,
         locale: state.config.locale.clone(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13530,6 +13568,25 @@ mod tests {
         )
         .unwrap();
         assert!(admin_user_dashboard.contains(r#"href="/admin""#));
+        assert!(admin_user_dashboard.contains(r#"id="usage-box""#));
+        assert!(admin_user_dashboard.contains("http://localhost/app/style.012abcd.css"));
+        assert!(admin_user_dashboard.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_dashboard_globals = admin_user_dashboard
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let dashboard_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_dashboard_globals)
+            .unwrap();
+        let dashboard_globals: serde_json::Value =
+            serde_json::from_slice(&dashboard_globals_bytes).unwrap();
+        assert_eq!(dashboard_globals["route"], "user");
+        assert_eq!(dashboard_globals["base_url"], "http://localhost");
+        assert_eq!(dashboard_globals["extra"]["unverified"], false);
+        assert_eq!(dashboard_globals["i18n"]["auth"]["login"], "Log In");
         let profile_page =
             session_request(&app, &registered_cookie, "GET", "/user/profile", None).await;
         assert_eq!(profile_page.status(), StatusCode::OK);

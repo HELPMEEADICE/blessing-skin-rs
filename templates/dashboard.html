@@ -5,11 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ site_name }} - {{ user.nickname }}</title>
   <style>body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}main{max-width:760px;margin:4rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}header{display:flex;justify-content:space-between;align-items:center}button{cursor:pointer;padding:.55rem .9rem}li{padding:.45rem 0}</style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body><main>
   <header><h1>{{ site_name }}</h1><button id="logout">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></header>
   <h2>{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else %}Welcome, {{ user.nickname }}{% endif %}</h2>
   <p>{{ user.email }}</p>
+  {% if frontend_script_available %}<section id="usage-box" aria-label="Account usage and score"></section>{% endif %}
   {% if show_email_verification %}<p><button id="send-verification">{% if locale.starts_with("zh") %}发送验证邮件{% else %}Send verification email{% endif %}</button> <span id="verification-status" role="status"></span></p>{% endif %}
   <section aria-labelledby="notifications-title">
     <h3 id="notifications-title">{% if locale.starts_with("zh") %}站内通知{% else %}Notifications{% endif %} <span id="notification-count">{{ notifications.len() }}</span></h3>
@@ -46,5 +50,5 @@ if(verificationButton)verificationButton.addEventListener('click',async()=>{
   catch(_){status.textContent='Unable to connect to the server.';verificationButton.disabled=false;}
 });
 document.getElementById('logout').addEventListener('click',async()=>{await fetch('/auth/logout',{method:'POST',headers:{'Accept':'application/json'}});window.location.href='/auth/login';});
-</script></body>
+</script>{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}</body>
 </html>
