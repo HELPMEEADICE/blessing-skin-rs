@@ -53,10 +53,12 @@ describe('info box', () => {
         scoreInfo({}, { score: 3072 }, { storage: 4096 }),
       )
 
-      const { getByText } = render(<Dashboard />)
+      const { getByText, container } = render(<Dashboard />)
       await waitFor(() => expect(fetch.get).toBeCalledTimes(1))
       expect(getByText('4')).toBeInTheDocument()
-      expect(getByText(/4 \/ 7 MB/)).toBeInTheDocument()
+      expect(container.querySelector('.info-box-number')).toHaveTextContent(
+        '4 / 7 MB',
+      )
       expect(getByText(/MB/)).toBeInTheDocument()
     })
   })
