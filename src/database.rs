@@ -2771,6 +2771,241 @@ impl DatabasePool {
         }
     }
 
+    pub async fn user_email_exists(
+        &self,
+        prefix: &str,
+        email: &str,
+        except_uid: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT COUNT(*) FROM {prefix}users WHERE email = $1 AND uid <> $2")
+            }
+            _ => format!("SELECT COUNT(*) FROM {prefix}users WHERE email = ? AND uid <> ?"),
+        };
+        let count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(except_uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(except_uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(except_uid)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(count > 0)
+    }
+
+    pub async fn update_user_text(
+        &self,
+        prefix: &str,
+        uid: i64,
+        column: &'static str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("UPDATE {prefix}users SET {column} = $1 WHERE uid = $2"),
+            _ => format!("UPDATE {prefix}users SET {column} = ? WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn update_user_integer(
+        &self,
+        prefix: &str,
+        uid: i64,
+        column: &'static str,
+        value: i64,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("UPDATE {prefix}users SET {column} = $1 WHERE uid = $2"),
+            _ => format!("UPDATE {prefix}users SET {column} = ? WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn toggle_user_verification(
+        &self,
+        prefix: &str,
+        uid: i64,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("UPDATE {prefix}users SET verified = NOT verified WHERE uid = $1")
+            }
+            _ => format!("UPDATE {prefix}users SET verified = NOT verified WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_user(&self, prefix: &str, uid: i64) -> Result<bool, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = if postgres { "$1" } else { "?" };
+        let lock_clause = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let uid_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let select_sql = format!(
+            "SELECT CAST(uid AS {uid_cast}) FROM {prefix}users WHERE uid = {marker} LIMIT 1{lock_clause}"
+        );
+        let delete_players_sql = match self {
+            Self::Postgres(_) => format!("DELETE FROM {prefix}players WHERE uid = $1"),
+            _ => format!("DELETE FROM {prefix}players WHERE uid = ?"),
+        };
+        let delete_user_sql = match self {
+            Self::Postgres(_) => format!("DELETE FROM {prefix}users WHERE uid = $1"),
+            _ => format!("DELETE FROM {prefix}users WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(uid)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if exists.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(delete_players_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_user_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(uid)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if exists.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(delete_players_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_user_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let exists = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(uid)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if exists.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(delete_players_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_user_sql))
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn user_profile(
         &self,
         prefix: &str,

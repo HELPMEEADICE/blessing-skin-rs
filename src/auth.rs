@@ -1,4 +1,4 @@
-use argon2::password_hash::PasswordHash;
+use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
 use argon2::{Algorithm as ArgonAlgorithm, Argon2, Params, PasswordVerifier, Version};
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
@@ -114,6 +114,36 @@ pub fn verify_legacy_password(password: &str, encoded: &str, method: &str, salt:
             )
         }
         _ => false,
+    }
+}
+
+pub fn hash_legacy_password(password: &str, method: &str, salt: &str) -> Option<String> {
+    match method.to_ascii_uppercase().as_str() {
+        "BCRYPT" | "PHP_PASSWORD_HASH" => bcrypt::hash(password, 10).ok(),
+        "ARGON2I" => {
+            let argon = Argon2::new(ArgonAlgorithm::Argon2i, Version::V0x13, Params::default());
+            let salt = SaltString::generate(&mut rand::thread_rng());
+            argon
+                .hash_password(password.as_bytes(), &salt)
+                .ok()
+                .map(|hash| hash.to_string())
+        }
+        "MD5" => Some(format!("{:x}", Md5::digest(password.as_bytes()))),
+        "SALTED2MD5" => {
+            let first = format!("{:x}", Md5::digest(password.as_bytes()));
+            Some(format!("{:x}", Md5::digest(format!("{first}{salt}"))))
+        }
+        "SHA256" => Some(format!("{:x}", Sha256::digest(password.as_bytes()))),
+        "SALTED2SHA256" => {
+            let first = format!("{:x}", Sha256::digest(password.as_bytes()));
+            Some(format!("{:x}", Sha256::digest(format!("{first}{salt}"))))
+        }
+        "SHA512" => Some(format!("{:x}", Sha512::digest(password.as_bytes()))),
+        "SALTED2SHA512" => {
+            let first = format!("{:x}", Sha512::digest(password.as_bytes()));
+            Some(format!("{:x}", Sha512::digest(format!("{first}{salt}"))))
+        }
+        _ => None,
     }
 }
 
@@ -261,5 +291,39 @@ mod tests {
             "SALTED2SHA512",
             "pepper"
         ));
+    }
+
+    #[test]
+    fn hashes_new_passwords_in_configured_legacy_formats() {
+        let bcrypt = super::hash_legacy_password("correct horse", "BCRYPT", "").unwrap();
+        assert!(super::verify_legacy_password(
+            "correct horse",
+            &bcrypt,
+            "BCRYPT",
+            ""
+        ));
+        let argon = super::hash_legacy_password("correct horse", "ARGON2I", "").unwrap();
+        assert!(argon.starts_with("$argon2i$"));
+        assert!(super::verify_legacy_password(
+            "correct horse",
+            &argon,
+            "ARGON2I",
+            ""
+        ));
+        for method in [
+            "MD5",
+            "SALTED2MD5",
+            "SHA256",
+            "SALTED2SHA256",
+            "SHA512",
+            "SALTED2SHA512",
+        ] {
+            let hash = super::hash_legacy_password("correct horse", method, "legacy-salt").unwrap();
+            assert!(
+                super::verify_legacy_password("correct horse", &hash, method, "legacy-salt"),
+                "{method}"
+            );
+        }
+        assert!(super::hash_legacy_password("x", "UNKNOWN", "").is_none());
     }
 }

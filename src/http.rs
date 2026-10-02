@@ -31,7 +31,10 @@ use sha2::Sha256;
 
 use crate::{
     AppState,
-    auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
+    auth::{
+        audience_matches, bearer_token, decode_access_token, decode_web_session,
+        hash_legacy_password,
+    },
     database::{
         AdminUserRecord, DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord,
         PlayerRenameOutcome, PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters,
@@ -58,6 +61,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/user", get(web_dashboard))
         .route("/admin/users/list", get(admin_user_list))
+        .route("/admin/users/{uid}/email", put(web_admin_user_email))
+        .route(
+            "/admin/users/{uid}/verification",
+            put(web_admin_user_verification),
+        )
+        .route("/admin/users/{uid}/nickname", put(web_admin_user_nickname))
+        .route("/admin/users/{uid}/password", put(web_admin_user_password))
+        .route("/admin/users/{uid}/score", put(web_admin_user_score))
+        .route(
+            "/admin/users/{uid}/permission",
+            put(web_admin_user_permission),
+        )
+        .route("/admin/users/{uid}", delete(web_admin_user_delete))
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route("/skinlib/list", get(skinlib_list))
@@ -79,6 +95,25 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/admin/users", get(api_admin_user_list))
+        .route("/api/admin/users/{uid}/email", put(api_admin_user_email))
+        .route(
+            "/api/admin/users/{uid}/verification",
+            put(api_admin_user_verification),
+        )
+        .route(
+            "/api/admin/users/{uid}/nickname",
+            put(api_admin_user_nickname),
+        )
+        .route(
+            "/api/admin/users/{uid}/password",
+            put(api_admin_user_password),
+        )
+        .route("/api/admin/users/{uid}/score", put(api_admin_user_score))
+        .route(
+            "/api/admin/users/{uid}/permission",
+            put(api_admin_user_permission),
+        )
+        .route("/api/admin/users/{uid}", delete(api_admin_user_delete))
         .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/admin/reports", get(api_admin_report_list))
         .route("/api/admin/reports/{id}", put(api_review_report))
@@ -3049,6 +3084,412 @@ fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_jso
     })
 }
 
+#[derive(Clone, Copy)]
+enum AdminUserMutation {
+    Email,
+    Verification,
+    Nickname,
+    Password,
+    Score,
+    Permission,
+    Delete,
+}
+
+macro_rules! define_admin_user_mutation_handlers {
+    ($(($web:ident, $api:ident, $kind:ident)),+ $(,)?) => {
+        $(
+            async fn $web(
+                State(state): State<AppState>,
+                headers: HeaderMap,
+                RoutePath(uid): RoutePath<i64>,
+                body: Bytes,
+            ) -> Response {
+                web_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
+            }
+
+            async fn $api(
+                State(state): State<AppState>,
+                headers: HeaderMap,
+                RoutePath(uid): RoutePath<i64>,
+                body: Bytes,
+            ) -> Response {
+                api_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
+            }
+        )+
+    };
+}
+
+define_admin_user_mutation_handlers!(
+    (web_admin_user_email, api_admin_user_email, Email),
+    (
+        web_admin_user_verification,
+        api_admin_user_verification,
+        Verification
+    ),
+    (web_admin_user_nickname, api_admin_user_nickname, Nickname),
+    (web_admin_user_password, api_admin_user_password, Password),
+    (web_admin_user_score, api_admin_user_score, Score),
+    (
+        web_admin_user_permission,
+        api_admin_user_permission,
+        Permission
+    ),
+    (web_admin_user_delete, api_admin_user_delete, Delete),
+);
+
+async fn web_admin_user_mutation(
+    state: AppState,
+    headers: HeaderMap,
+    target_uid: i64,
+    body: Bytes,
+    mutation: AdminUserMutation,
+) -> Response {
+    let Some(actor_uid) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let actor = match database
+        .user_profile(&state.config.database.table_prefix, actor_uid)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => user,
+        Ok(Some(_)) => return forbidden_action(),
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load user administrator");
+            return unavailable();
+        }
+    };
+    apply_admin_user_mutation(
+        &state,
+        actor.uid,
+        actor.permission,
+        target_uid,
+        &body,
+        mutation,
+    )
+    .await
+}
+
+async fn api_admin_user_mutation(
+    state: AppState,
+    headers: HeaderMap,
+    target_uid: i64,
+    body: Bytes,
+    mutation: AdminUserMutation,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("UsersManagement.ReadWrite") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let actor = match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => user,
+        Ok(Some(_)) | Ok(None) => return forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API user administrator");
+            return unavailable();
+        }
+    };
+    apply_admin_user_mutation(
+        &state,
+        actor.uid,
+        actor.permission,
+        target_uid,
+        &body,
+        mutation,
+    )
+    .await
+}
+
+async fn apply_admin_user_mutation(
+    state: &AppState,
+    actor_uid: i64,
+    actor_permission: i32,
+    target_uid: i64,
+    body: &[u8],
+    mutation: AdminUserMutation,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let target = match database
+        .user_profile(&state.config.database.table_prefix, target_uid)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, target_uid, "failed to load managed user");
+            return unavailable();
+        }
+    };
+    if target.uid != actor_uid && target.permission >= actor_permission {
+        return admin_user_permission_error(&state.config.locale);
+    }
+
+    match mutation {
+        AdminUserMutation::Email => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(email) = request
+                .as_ref()
+                .and_then(|value| value.get("email"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return admin_user_validation_error("email", "required", &state.config.locale);
+            };
+            if !valid_email_address(email) {
+                return admin_user_validation_error("email", "email", &state.config.locale);
+            }
+            match database
+                .user_email_exists(&state.config.database.table_prefix, email, target_uid)
+                .await
+            {
+                Ok(true) => {
+                    return admin_user_validation_error("email", "unique", &state.config.locale);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, target_uid, "failed to check user email uniqueness");
+                    return unavailable();
+                }
+            }
+            if let Err(error) = database
+                .update_user_text(
+                    &state.config.database.table_prefix,
+                    target_uid,
+                    "email",
+                    email,
+                )
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to update user email");
+                return unavailable();
+            }
+            admin_user_success(AdminUserMutation::Email, &state.config.locale, None)
+        }
+        AdminUserMutation::Verification => {
+            if let Err(error) = database
+                .toggle_user_verification(&state.config.database.table_prefix, target_uid)
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to toggle user verification");
+                return unavailable();
+            }
+            admin_user_success(AdminUserMutation::Verification, &state.config.locale, None)
+        }
+        AdminUserMutation::Nickname => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(nickname) = request
+                .as_ref()
+                .and_then(|value| value.get("nickname"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return admin_user_validation_error("nickname", "required", &state.config.locale);
+            };
+            if let Err(error) = database
+                .update_user_text(
+                    &state.config.database.table_prefix,
+                    target_uid,
+                    "nickname",
+                    nickname,
+                )
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to update user nickname");
+                return unavailable();
+            }
+            admin_user_success(
+                AdminUserMutation::Nickname,
+                &state.config.locale,
+                Some(nickname),
+            )
+        }
+        AdminUserMutation::Password => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(password) = request
+                .as_ref()
+                .and_then(|value| value.get("password"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return admin_user_validation_error("password", "required", &state.config.locale);
+            };
+            if !(8..=16).contains(&password.chars().count()) {
+                return admin_user_validation_error("password", "length", &state.config.locale);
+            }
+            let Some(hash) = hash_legacy_password(
+                password,
+                &state.config.password_method,
+                &state.config.password_salt,
+            ) else {
+                tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
+                return unavailable();
+            };
+            if let Err(error) = database
+                .update_user_text(
+                    &state.config.database.table_prefix,
+                    target_uid,
+                    "password",
+                    &hash,
+                )
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to update user password");
+                return unavailable();
+            }
+            admin_user_success(AdminUserMutation::Password, &state.config.locale, None)
+        }
+        AdminUserMutation::Score => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(score) = request
+                .as_ref()
+                .and_then(|value| value.get("score"))
+                .and_then(|value| request_i64(Some(value)))
+            else {
+                return admin_user_validation_error("score", "integer", &state.config.locale);
+            };
+            if let Err(error) = database
+                .update_user_integer(
+                    &state.config.database.table_prefix,
+                    target_uid,
+                    "score",
+                    score,
+                )
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to update user score");
+                return unavailable();
+            }
+            admin_user_success(AdminUserMutation::Score, &state.config.locale, None)
+        }
+        AdminUserMutation::Permission => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(permission) = request
+                .as_ref()
+                .and_then(|value| value.get("permission"))
+                .and_then(|value| request_i64(Some(value)))
+                .filter(|value| matches!(*value, -1 | 0 | 1))
+            else {
+                return admin_user_validation_error("permission", "in", &state.config.locale);
+            };
+            if target_uid == actor_uid || (permission == 1 && actor_permission < 2) {
+                return admin_user_permission_error(&state.config.locale);
+            }
+            if let Err(error) = database
+                .update_user_integer(
+                    &state.config.database.table_prefix,
+                    target_uid,
+                    "permission",
+                    permission,
+                )
+                .await
+            {
+                tracing::error!(%error, target_uid, "failed to update user permission");
+                return unavailable();
+            }
+            admin_user_success(AdminUserMutation::Permission, &state.config.locale, None)
+        }
+        AdminUserMutation::Delete => match database
+            .delete_user(&state.config.database.table_prefix, target_uid)
+            .await
+        {
+            Ok(true) => admin_user_success(AdminUserMutation::Delete, &state.config.locale, None),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::error!(%error, target_uid, "failed to delete user");
+                unavailable()
+            }
+        },
+    }
+}
+
+fn admin_user_success(mutation: AdminUserMutation, locale: &str, value: Option<&str>) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = match (mutation, chinese) {
+        (AdminUserMutation::Email, true) => "邮箱修改成功".to_owned(),
+        (AdminUserMutation::Email, false) => "Email changed successfully.".to_owned(),
+        (AdminUserMutation::Verification, true) => "用户的邮箱验证状态已修改".to_owned(),
+        (AdminUserMutation::Verification, false) => {
+            "Account verification status toggled successfully.".to_owned()
+        }
+        (AdminUserMutation::Nickname, true) => {
+            format!("昵称已成功设置为 {}", value.unwrap_or_default())
+        }
+        (AdminUserMutation::Nickname, false) => "Nickname changed successfully.".to_owned(),
+        (AdminUserMutation::Password, true) => "密码修改成功".to_owned(),
+        (AdminUserMutation::Password, false) => "Password changed successfully.".to_owned(),
+        (AdminUserMutation::Score, true) => "积分修改成功".to_owned(),
+        (AdminUserMutation::Score, false) => "Score changed successfully.".to_owned(),
+        (AdminUserMutation::Permission, true) => "权限已更改".to_owned(),
+        (AdminUserMutation::Permission, false) => "Permission updated.".to_owned(),
+        (AdminUserMutation::Delete, true) => "账号已被成功删除".to_owned(),
+        (AdminUserMutation::Delete, false) => {
+            "The account has been deleted successfully.".to_owned()
+        }
+    };
+    login_result(0, &message, None)
+}
+
+fn admin_user_permission_error(locale: &str) -> Response {
+    let message = if locale.starts_with("zh") {
+        "你无权操作此用户"
+    } else {
+        "You have no permission to operate this user."
+    };
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "code": 1, "message": message })),
+    )
+        .into_response()
+}
+
+fn admin_user_validation_error(field: &str, rule: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, rule, chinese) {
+        ("email", "required", true) => "邮箱为必填项。",
+        ("email", "required", false) => "The email field is required.",
+        ("email", "email", true) => "邮箱格式无效。",
+        ("email", "email", false) => "The email must be a valid email address.",
+        ("email", "unique", true) => "该邮箱已被使用。",
+        ("email", "unique", false) => "The email has already been taken.",
+        ("nickname", "required", true) => "昵称为必填项。",
+        ("nickname", "required", false) => "The nickname field is required.",
+        ("password", "required", true) => "密码为必填项。",
+        ("password", "required", false) => "The password field is required.",
+        ("password", "length", true) => "密码长度必须为 8 至 16 个字符。",
+        ("password", "length", false) => "The password must be between 8 and 16 characters.",
+        ("score", "integer", true) => "积分必须是整数。",
+        ("score", "integer", false) => "The score must be an integer.",
+        ("permission", "in", true) => "权限值无效。",
+        ("permission", "in", false) => "The selected permission is invalid.",
+        _ => "The given field is invalid.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": { field: [field_error] } })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct AdminUserListQuery {
     q: Option<String>,
@@ -5202,7 +5643,7 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/reports/4")
-                    .header("cookie", cookie)
+                    .header("cookie", cookie.clone())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"action":"delete"}"#))
                     .unwrap(),
@@ -5225,6 +5666,190 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(final_reporter_score, 9);
+
+        let duplicate_email = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/8/email")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"alex@example.test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_email.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let duplicate_body = to_bytes(duplicate_email.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let duplicate_body: serde_json::Value = serde_json::from_slice(&duplicate_body).unwrap();
+        assert!(duplicate_body["errors"]["email"].is_array());
+
+        for (uri, body, expected) in [
+            (
+                "/admin/users/8/email",
+                r#"{"email":"uploader2@example.test"}"#,
+                "Email changed successfully.",
+            ),
+            (
+                "/admin/users/8/nickname",
+                r#"{"nickname":"Target User"}"#,
+                "Nickname changed successfully.",
+            ),
+            (
+                "/admin/users/8/score",
+                r#"{"score":17}"#,
+                "Score changed successfully.",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("cookie", cookie.clone())
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(response["code"], 0);
+            assert_eq!(response["message"], expected);
+        }
+
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/8/permission")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"permission":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::FORBIDDEN);
+        let self_role_change = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/7/permission")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"permission":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_role_change.status(), StatusCode::FORBIDDEN);
+
+        let verified_before: bool = sqlx::query_scalar("SELECT verified FROM users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let verification = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/8/verification")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verification.status(), StatusCode::OK);
+        let verified_after: bool = sqlx::query_scalar("SELECT verified FROM users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(verified_after, !verified_before);
+
+        let password_change = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/8/password")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"NewPass123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(password_change.status(), StatusCode::OK);
+        let changed_hash: String = sqlx::query_scalar("SELECT password FROM users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(crate::auth::verify_legacy_password(
+            "NewPass123",
+            &changed_hash,
+            "BCRYPT",
+            ""
+        ));
+
+        let set_permission = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/users/8/permission")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"permission":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(set_permission.status(), StatusCode::OK);
+        let user_eight_player = sqlx::query(
+            "INSERT INTO players (pid,uid,name,tid_skin,tid_cape,last_modified) VALUES (99,8,'Uploader player',0,0,'2026-10-02 12:00:00')",
+        );
+        user_eight_player.execute(&pool).await.unwrap();
+        let removed_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/users/8")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed_user.status(), StatusCode::OK);
+        let removed_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(removed_user.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removed_body["code"], 0);
+        let deleted_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let deleted_players: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM players WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted_users, 0);
+        assert_eq!(deleted_players, 0);
 
         let logout = app
             .oneshot(
