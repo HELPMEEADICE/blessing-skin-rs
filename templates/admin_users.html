@@ -18,8 +18,14 @@
     .status{min-height:1.4rem;color:#59636e}.pagination{display:flex;justify-content:center;align-items:center;gap:1rem;margin-top:1rem}
     @media(max-width:700px){main{margin:1rem;padding:1rem}th,td{padding:.45rem}}
   </style>
+<meta name="csrf-token" content="">
+{% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+{% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
-<body>
+<body data-current-uid="{{ current_uid }}" data-current-permission="{{ current_permission }}">
+{% if frontend_script_available %}
+<div class="wrapper"><div class="content-wrapper" style="margin-left:0;min-height:0;background:transparent"><section class="content-header"><div class="container-fluid"><h1>{% if locale.starts_with("zh") %}用户管理{% else %}User management{% endif %}</h1><a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a></div></section><section class="content"><div class="container-fluid"></div></section></div></div>
+{% else %}
 <main id="admin-users" data-current-uid="{{ current_uid }}" data-current-permission="{{ current_permission }}">
   <header>
     <h1>{% if locale.starts_with("zh") %}用户管理{% else %}User management{% endif %}</h1>
@@ -43,6 +49,7 @@
   </table></div>
   <div class="pagination"><button id="previous" class="secondary" type="button">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</button><span id="page-label"></span><button id="next" class="secondary" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button></div>
 </main>
+
 <script>
 (() => {
   const root = document.getElementById('admin-users');
@@ -138,5 +145,7 @@
   load(1);
 })();
 </script>
+{% endif %}
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>
