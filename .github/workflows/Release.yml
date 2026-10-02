@@ -1,40 +1,92 @@
-name: Release
+name: Rust Release
 
 on:
   push:
     tags:
       - '*.*.*'
 
+permissions: {}
+
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Build and create archive
-        run: ./tools/release.ps1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Run tests
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        id: package-unix
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="blessing-skin-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/blessing-skin-rs" "$name/"
+          cp LICENSE rust.env.example docs/rust-deployment.md "$name/"
+          tar -czf "${name}.tar.gz" "$name"
+          echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        id: package-windows
         shell: pwsh
-        env:
-          AZURE_TOKEN: ${{ secrets.AZURE_TOKEN }}
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $name = "blessing-skin-server-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/blessing-skin-rs.exe" "$name/"
+          Copy-Item LICENSE, rust.env.example, docs/rust-deployment.md $name/
+          Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
+          "archive=$name.zip" >> $env:GITHUB_OUTPUT
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
-      - name: Get version
-        id: get_version
-        run: echo "VERSION=${GITHUB_REF/refs\/tags\//}" >> $GITHUB_OUTPUT
-      - name: Upload release asset
-        id: upload_release_asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-${{ matrix.target }}
+          path: ${{ runner.os == 'Windows' && steps.package-windows.outputs.archive || steps.package-unix.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./blessing-skin-server-${{ steps.get_version.outputs.VERSION }}.zip
-          asset_name: blessing-skin-server-${{ steps.get_version.outputs.VERSION }}.zip
-          asset_content_type: application/zip
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(release-assets/*)
+          args=("$GITHUB_REF_NAME" "${assets[@]}" --generate-notes --verify-tag)
+          case "$GITHUB_REF_NAME" in
+            *alpha*|*beta*|*rc*) args+=(--prerelease) ;;
+          esac
+          gh release create "${args[@]}"
