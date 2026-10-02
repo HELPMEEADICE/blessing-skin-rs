@@ -13,6 +13,11 @@
     .stat{padding:1.25rem;background:#f4f6f9;border-radius:8px}
     .stat h2{font-size:1rem;margin:0 0 .65rem}
     .stat p{font-size:1.6rem;font-weight:700;margin:0;overflow-wrap:anywhere}
+    .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-top:2rem}
+    .chart{padding:1.25rem;background:#f4f6f9;border-radius:8px;min-width:0}
+    .chart h2{font-size:1rem;margin:0 0 .75rem}
+    .chart svg{display:block;width:100%;height:auto;overflow:visible}
+    .chart-labels{display:flex;justify-content:space-between;color:#667085;font-size:.8rem}
   </style>
 </head>
 <body><main>
@@ -30,5 +35,51 @@
     <article class="stat"><h2>{% if locale.starts_with("zh") %}纹理{% else %}Textures{% endif %}</h2><p>{{ stats.textures }}</p></article>
     <article class="stat"><h2>{% if locale.starts_with("zh") %}存储用量（字节）{% else %}Storage (bytes){% endif %}</h2><p>{{ stats.storage }}</p></article>
   </section>
-</main></body>
+  <section class="charts" aria-label="{% if locale.starts_with("zh") %}近一个月活动{% else %}Recent activity{% endif %}">
+    <article class="chart"><h2 id="users-chart-title">{% if locale.starts_with("zh") %}用户注册{% else %}User Registration{% endif %}</h2><div id="chart-users-registration" role="img" aria-labelledby="users-chart-title"></div></article>
+    <article class="chart"><h2 id="textures-chart-title">{% if locale.starts_with("zh") %}材质上传{% else %}Texture Uploads{% endif %}</h2><div id="chart-textures-upload" role="img" aria-labelledby="textures-chart-title"></div></article>
+  </section>
+</main><script>
+async function loadAdminCharts(){
+  const response=await fetch('/admin/chart',{headers:{Accept:'application/json'}});
+  if(!response.ok)throw new Error('Unable to load activity charts.');
+  const chartData=await response.json();
+  const namespace='http://www.w3.org/2000/svg';
+  const render=(id,index,color)=>{
+    const target=document.getElementById(id);
+    const values=chartData.data[index].map(value=>Number.isFinite(Number(value))?Number(value):0);
+    const width=640,height=220,padding=24,maximum=Math.max(1,...values);
+    const points=values.map((value,position)=>{
+      const x=padding+position*(width-padding*2)/Math.max(values.length-1,1);
+      const y=height-padding-value/maximum*(height-padding*2);
+      return String(x)+','+String(y);
+    }).join(' ');
+    const svg=document.createElementNS(namespace,'svg');
+    svg.setAttribute('viewBox','0 0 '+width+' '+height);
+    svg.setAttribute('role','img');
+    svg.setAttribute('aria-label',chartData.labels[index]);
+    const line=document.createElementNS(namespace,'polyline');
+    line.setAttribute('points',points);
+    line.setAttribute('fill','none');
+    line.setAttribute('stroke',color);
+    line.setAttribute('stroke-width','3');
+    line.setAttribute('stroke-linecap','round');
+    line.setAttribute('stroke-linejoin','round');
+    svg.append(line);
+    target.replaceChildren(svg);
+    const labels=document.createElement('div');
+    labels.className='chart-labels';
+    const start=document.createElement('span'),end=document.createElement('span');
+    start.textContent=chartData.xAxis[0]||'';
+    end.textContent=chartData.xAxis[chartData.xAxis.length-1]||'';
+    labels.append(start,end);
+    target.append(labels);
+    const heading=target.parentElement.querySelector('h2');
+    heading.textContent=chartData.labels[index];
+  };
+  render('chart-users-registration',0,'#17a2b8');
+  render('chart-textures-upload',1,'#6f42c1');
+}
+loadAdminCharts().catch(()=>{});
+</script></body>
 </html>

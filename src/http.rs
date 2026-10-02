@@ -10520,6 +10520,9 @@ mod tests {
         assert!(admin_dashboard.contains("Players"));
         assert!(admin_dashboard.contains("Textures"));
         assert!(admin_dashboard.contains("Storage"));
+        assert!(admin_dashboard.contains("chart-users-registration"));
+        assert!(admin_dashboard.contains("chart-textures-upload"));
+        assert!(admin_dashboard.contains("fetch('/admin/chart'"));
         assert!(admin_dashboard.contains(">3<"));
         assert!(admin_dashboard.contains(">2<"));
         assert!(admin_dashboard.contains(">1<"));
