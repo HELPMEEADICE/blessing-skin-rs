@@ -56,7 +56,7 @@ describe('info box', () => {
       const { getByText } = render(<Dashboard />)
       await waitFor(() => expect(fetch.get).toBeCalledTimes(1))
       expect(getByText('4')).toBeInTheDocument()
-      expect(getByText(/7/)).toBeInTheDocument()
+      expect(getByText(/4 \/ 7 MB/)).toBeInTheDocument()
       expect(getByText(/MB/)).toBeInTheDocument()
     })
   })
