@@ -82,6 +82,18 @@ pub enum PlayerRenameOutcome {
     },
 }
 #[derive(Debug)]
+pub enum PlayerAddOutcome {
+    NameExists,
+    InsufficientScore,
+    Added(PlayerRecord),
+}
+#[derive(Debug)]
+pub enum PlayerDeleteOutcome {
+    NotFound,
+    Forbidden,
+    Deleted(String),
+}
+#[derive(Debug)]
 pub enum PlayerTextureOutcome {
     NotFound,
     Forbidden,
@@ -474,6 +486,269 @@ impl DatabasePool {
         })
     }
 
+    pub async fn add_player(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        name: &str,
+        score_cost: i64,
+    ) -> Result<PlayerAddOutcome, sqlx::Error> {
+        let duplicate_sql = match self {
+            Self::Postgres(_) => format!("SELECT COUNT(*) FROM {prefix}players WHERE name = $1"),
+            _ => format!("SELECT COUNT(*) FROM {prefix}players WHERE name = ?"),
+        };
+        let duplicate_count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if duplicate_count > 0 {
+            return Ok(PlayerAddOutcome::NameExists);
+        }
+
+        let score_sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ?")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?")
+            }
+        };
+        let score = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some(score) = score else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+        if score < score_cost {
+            return Ok(PlayerAddOutcome::InsufficientScore);
+        }
+
+        let player_id = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {prefix}players (uid, name, tid_skin, tid_cape, last_modified) \
+                     VALUES (?, ?, 0, 0, CURRENT_TIMESTAMP)"
+            )))
+            .bind(user_id)
+            .bind(name)
+            .execute(pool)
+            .await?
+            .last_insert_rowid(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {prefix}players (uid, name, tid_skin, tid_cape, last_modified) \
+                     VALUES (?, ?, 0, 0, CURRENT_TIMESTAMP)"
+            )))
+            .bind(user_id)
+            .bind(name)
+            .execute(pool)
+            .await?
+            .last_insert_id() as i64,
+            Self::Postgres(pool) => {
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}players (uid, name, tid_skin, tid_cape, last_modified) \
+                     VALUES ($1, $2, 0, 0, CURRENT_TIMESTAMP) RETURNING CAST(pid AS BIGINT)"
+                );
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(user_id)
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+
+        if score_cost != 0 {
+            let update_sql = match self {
+                Self::Postgres(_) => format!(
+                    "UPDATE {prefix}users SET score = score - $1 WHERE uid = $2 AND score >= $3"
+                ),
+                _ => format!(
+                    "UPDATE {prefix}users SET score = score - ? WHERE uid = ? AND score >= ?"
+                ),
+            };
+            let updated = match self {
+                Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+                Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+                Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_cost)
+                    .bind(user_id)
+                    .bind(score_cost)
+                    .execute(pool)
+                    .await?
+                    .rows_affected(),
+            };
+            if updated == 0 {
+                let delete_sql = match self {
+                    Self::Postgres(_) => {
+                        format!("DELETE FROM {prefix}players WHERE pid = $1 AND uid = $2")
+                    }
+                    _ => format!("DELETE FROM {prefix}players WHERE pid = ? AND uid = ?"),
+                };
+                match self {
+                    Self::Sqlite(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(player_id)
+                            .bind(user_id)
+                            .execute(pool)
+                            .await?;
+                    }
+                    Self::MySql(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(player_id)
+                            .bind(user_id)
+                            .execute(pool)
+                            .await?;
+                    }
+                    Self::Postgres(pool) => {
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                            .bind(player_id)
+                            .bind(user_id)
+                            .execute(pool)
+                            .await?;
+                    }
+                }
+                return Ok(PlayerAddOutcome::InsufficientScore);
+            }
+        }
+        let player = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|player| player.pid == player_id)
+            .ok_or(sqlx::Error::RowNotFound)?;
+        Ok(PlayerAddOutcome::Added(player))
+    }
+
+    pub async fn delete_player(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        player_id: i64,
+        return_score: bool,
+        score_reward: i64,
+    ) -> Result<PlayerDeleteOutcome, sqlx::Error> {
+        let Some(player) = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|player| player.pid == player_id)
+        else {
+            return Ok(if self.player_exists(prefix, player_id).await? {
+                PlayerDeleteOutcome::Forbidden
+            } else {
+                PlayerDeleteOutcome::NotFound
+            });
+        };
+        let delete_sql = match self {
+            Self::Postgres(_) => format!("DELETE FROM {prefix}players WHERE pid = $1 AND uid = $2"),
+            _ => format!("DELETE FROM {prefix}players WHERE pid = ? AND uid = ?"),
+        };
+        let deleted = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        if deleted == 0 {
+            return Ok(if self.player_exists(prefix, player_id).await? {
+                PlayerDeleteOutcome::Forbidden
+            } else {
+                PlayerDeleteOutcome::NotFound
+            });
+        }
+        if return_score && score_reward != 0 {
+            let update_sql = match self {
+                Self::Postgres(_) => {
+                    format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2")
+                }
+                _ => format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?"),
+            };
+            match self {
+                Self::Sqlite(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                        .bind(score_reward)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::MySql(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                        .bind(score_reward)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+                Self::Postgres(pool) => {
+                    sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                        .bind(score_reward)
+                        .bind(user_id)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        Ok(PlayerDeleteOutcome::Deleted(player.name))
+    }
     pub async fn set_player_textures(
         &self,
         prefix: &str,
@@ -1095,11 +1370,67 @@ mod tests {
             }
             result => panic!("expected texture clear, got {result:?}"),
         }
+        let added = database
+            .add_player("bs_", 7, "NewPlayer", 10)
+            .await
+            .unwrap();
+        let new_player_id = match added {
+            super::PlayerAddOutcome::Added(player) => {
+                assert_eq!(player.name, "NewPlayer");
+                assert_eq!(player.uid, 7);
+                assert_eq!(player.tid_skin, 0);
+                assert_eq!(player.tid_cape, 0);
+                player.pid
+            }
+            result => panic!("expected a player to be added, got {result:?}"),
+        };
+        assert!(matches!(
+            database.add_player("bs_", 7, "Alex_New", 1).await.unwrap(),
+            super::PlayerAddOutcome::NameExists
+        ));
+        assert!(matches!(
+            database
+                .add_player("bs_", 7, "TooExpensive", 100)
+                .await
+                .unwrap(),
+            super::PlayerAddOutcome::InsufficientScore
+        ));
+        let refunded = database
+            .delete_player("bs_", 7, new_player_id, true, 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            refunded,
+            super::PlayerDeleteOutcome::Deleted(name) if name == "NewPlayer"
+        ));
+        let added_without_refund = database.add_player("bs_", 7, "NoRefund", 5).await.unwrap();
+        let no_refund_id = match added_without_refund {
+            super::PlayerAddOutcome::Added(player) => player.pid,
+            result => panic!("expected a player to be added, got {result:?}"),
+        };
+        assert!(matches!(
+            database
+                .delete_player("bs_", 7, no_refund_id, false, 5)
+                .await
+                .unwrap(),
+            super::PlayerDeleteOutcome::Deleted(name) if name == "NoRefund"
+        ));
+        assert!(matches!(
+            database.delete_player("bs_", 8, 3, false, 0).await.unwrap(),
+            super::PlayerDeleteOutcome::Forbidden
+        ));
+        assert!(matches!(
+            database
+                .delete_player("bs_", 7, 99, false, 0)
+                .await
+                .unwrap(),
+            super::PlayerDeleteOutcome::NotFound
+        ));
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
         assert_eq!(user.locale.as_deref(), Some("zh_CN"));
-        assert_eq!(user.score, 42);
+        assert_eq!(user.score, 37);
         assert_eq!(user.avatar, 11);
         assert!(user.verified);
         assert!(!user.is_dark_mode);

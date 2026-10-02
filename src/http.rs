@@ -16,7 +16,7 @@ use axum::{
         },
     },
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get, post, put},
+    routing::{any, delete, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use jsonwebtoken::{Algorithm, Header, encode};
@@ -47,7 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/user", get(api_user))
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/user/notifications/{id}", post(api_read_notification))
-        .route("/api/players", get(api_players))
+        .route("/api/players", get(api_players).post(api_add_player))
+        .route("/api/players/{pid}", delete(api_delete_player))
         .route("/api/players/{pid}/name", put(api_rename_player))
         .route(
             "/api/players/{pid}/textures",
@@ -426,6 +427,27 @@ fn validation_error(field: &str, locale: &str) -> Response {
         .into_response()
 }
 
+fn duplicate_player_name_error(locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = if chinese {
+        "名称已经被占用。"
+    } else {
+        "The name has already been taken."
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "message": message,
+            "errors": { "name": [field_error] }
+        })),
+    )
+        .into_response()
+}
 fn login_result(code: i32, message: &str, data: Option<serde_json::Value>) -> Response {
     let mut body = serde_json::json!({ "code": code, "message": message });
     if let Some(data) = data {
@@ -895,6 +917,185 @@ fn custom_player_name_matches(name: &str, pattern: &str) -> bool {
     builder.build().is_ok_and(|regex| regex.is_match(name))
 }
 
+async fn api_add_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Player.ReadWrite") {
+        return missing_scope();
+    }
+    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request.name.filter(|name| !name.is_empty()) else {
+        return validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let min_length = database
+        .option(prefix, "player_name_length_min")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    let max_length = database
+        .option(prefix, "player_name_length_max")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16);
+    let rule = database
+        .option(prefix, "player_name_rule")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "official".to_owned());
+    let custom_rule = database
+        .option(prefix, "custom_player_name_regexp")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
+        return validation_error("name", &state.config.locale);
+    }
+    let score_cost = match database.option(prefix, "score_per_player").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player score cost");
+            return unavailable();
+        }
+    };
+    match database
+        .add_player(prefix, identity.user_id, &name, score_cost)
+        .await
+    {
+        Ok(crate::database::PlayerAddOutcome::Added(player)) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("成功添加了角色 {}", player.name)
+            } else {
+                format!("Player {} was added successfully.", player.name)
+            };
+            login_result(
+                0,
+                &message,
+                Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
+            )
+        }
+        Ok(crate::database::PlayerAddOutcome::NameExists) => {
+            duplicate_player_name_error(&state.config.locale)
+        }
+        Ok(crate::database::PlayerAddOutcome::InsufficientScore) => login_result(
+            7,
+            if state.config.locale.starts_with("zh") {
+                "添加角色失败，积分不足"
+            } else {
+                "You don't have enough score to add a player."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to add player");
+            unavailable()
+        }
+    }
+}
+
+async fn api_delete_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Player.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let return_score = match database.option(prefix, "return_score").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player score refund option");
+            return unavailable();
+        }
+    };
+    let score_reward = if return_score {
+        match database.option(prefix, "score_per_player").await {
+            Ok(value) => value
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to load player score reward");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    match database
+        .delete_player(
+            prefix,
+            identity.user_id,
+            player_id,
+            return_score,
+            score_reward,
+        )
+        .await
+    {
+        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("角色 {name} 已被删除")
+            } else {
+                format!("Player {name} was deleted successfully.")
+            },
+            None,
+        ),
+        Ok(crate::database::PlayerDeleteOutcome::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": if state.config.locale.starts_with("zh") { "无权操作此角色" } else { "You are not allowed to modify this player." }
+            })),
+        )
+            .into_response(),
+        Ok(crate::database::PlayerDeleteOutcome::NotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to delete player");
+            unavailable()
+        }
+    }
+}
+
+fn legacy_option_bool(value: Option<&str>) -> bool {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("true" | "(true)") => true,
+        Some("" | "0" | "false" | "(false)" | "null" | "(null)") | None => false,
+        Some(_) => true,
+    }
+}
 async fn api_players(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let identity = match authenticate(&state, &headers).await {
         Ok(identity) => identity,
@@ -1305,6 +1506,14 @@ const COPYRIGHTS: [&str; 7] = [
 mod tests {
     use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
 
+    #[test]
+    fn parses_legacy_boolean_options() {
+        assert!(super::legacy_option_bool(Some("true")));
+        assert!(super::legacy_option_bool(Some("(true)")));
+        assert!(!super::legacy_option_bool(Some("false")));
+        assert!(!super::legacy_option_bool(Some("0")));
+        assert!(!super::legacy_option_bool(None));
+    }
     #[test]
     fn parses_legacy_texture_ids_and_clear_request_shapes() {
         use serde_json::json;
