@@ -2496,6 +2496,11 @@ struct AdminPlayersPage {
     locale: String,
     current_uid: i64,
     current_permission: i32,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -9398,11 +9403,28 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/players",
+        serde_json::json!({}),
+        i18n,
+    );
     let page = AdminPlayersPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         current_uid: user.uid,
         current_permission: user.permission,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13598,7 +13620,24 @@ mod tests {
         )
         .unwrap();
         assert!(players_html.contains("Player management"));
-        assert!(players_html.contains("/admin/players/list"));
+        assert!(players_html.contains(r#"class="container-fluid""#));
+        assert!(players_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(players_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_players_globals = players_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let players_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_players_globals)
+            .unwrap();
+        let players_globals: serde_json::Value =
+            serde_json::from_slice(&players_globals_bytes).unwrap();
+        assert_eq!(players_globals["route"], "admin/players");
+        assert_eq!(players_globals["extra"], serde_json::json!({}));
+        assert_eq!(players_globals["i18n"]["auth"]["login"], "Log In");
         let denied_reports_page =
             session_request(&app, &registered_cookie, "GET", "/admin/reports", None).await;
         assert_eq!(denied_reports_page.status(), StatusCode::FORBIDDEN);
