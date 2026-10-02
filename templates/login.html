@@ -20,6 +20,7 @@
     <h1>{{ site_name }}</h1>
     <p>{{ prompt }}</p>
     <form id="login-form">
+      <input id="redirect-to" type="hidden" value="{{ redirect_to }}">
       <label for="identification">{{ identification_label }}</label>
       <input id="identification" name="identification" type="text" autocomplete="username" required>
       <label for="password">{{ password_label }}</label>
@@ -44,7 +45,8 @@
           body: JSON.stringify({
             identification: document.getElementById('identification').value,
             password: document.getElementById('password').value,
-            keep: document.getElementById('keep').checked
+            keep: document.getElementById('keep').checked,
+            redirect_to: document.getElementById('redirect-to').value
           })
         });
         const result = await response.json();

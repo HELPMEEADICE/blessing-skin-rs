@@ -2,6 +2,7 @@ mod admin_settings;
 mod auth;
 mod config;
 mod database;
+mod defuse;
 mod http;
 mod mailer;
 mod oauth;

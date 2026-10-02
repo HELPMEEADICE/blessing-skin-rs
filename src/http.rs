@@ -70,6 +70,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
+        .route(
+            "/oauth/authorize",
+            get(crate::oauth::authorize)
+                .post(crate::oauth::authorization_decision)
+                .delete(crate::oauth::authorization_decision),
+        )
         .route("/oauth/token", post(crate::oauth::token))
         .route("/oauth/scopes", get(crate::oauth::list_scopes))
         .route("/oauth/tokens", get(crate::oauth::list_authorized_tokens))
@@ -259,6 +265,7 @@ pub fn router(state: AppState) -> Router {
 struct LoginPage {
     site_name: String,
     locale: String,
+    redirect_to: String,
     title: String,
     prompt: String,
     identification_label: String,
@@ -342,7 +349,27 @@ struct EmailVerificationPage {
     submit_label: String,
 }
 
-async fn login_page(State(state): State<AppState>) -> Response {
+#[derive(Deserialize, Default)]
+struct LoginPageQuery {
+    redirect_to: Option<String>,
+}
+
+fn safe_local_redirect(target: Option<&str>) -> Option<String> {
+    let target = target?;
+    if target.len() > 4096
+        || !target.starts_with('/')
+        || target.starts_with("//")
+        || target.contains('\\')
+        || target.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(target.to_owned())
+}
+async fn login_page(
+    State(state): State<AppState>,
+    Query(query): Query<LoginPageQuery>,
+) -> Response {
     let site_name = match &state.database {
         Some(database) => {
             let prefix = &state.config.database.table_prefix;
@@ -361,6 +388,7 @@ async fn login_page(State(state): State<AppState>) -> Response {
     let page = LoginPage {
         site_name,
         locale: state.config.locale.clone(),
+        redirect_to: safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default(),
         title: if chinese { "登录" } else { "Log In" }.to_owned(),
         prompt: if chinese {
             "登录以管理您的角色与皮肤"
@@ -1772,6 +1800,7 @@ struct LoginRequest {
     identification: Option<String>,
     password: Option<String>,
     keep: Option<bool>,
+    redirect_to: Option<String>,
 }
 
 async fn handle_login(State(state): State<AppState>, body: Bytes) -> Response {
@@ -1892,7 +1921,9 @@ async fn handle_login(State(state): State<AppState>, body: Bytes) -> Response {
     let mut response = login_result(
         0,
         message,
-        Some(serde_json::json!({ "redirectTo": "/user" })),
+        Some(
+            serde_json::json!({ "redirectTo": safe_local_redirect(request.redirect_to.as_deref()).unwrap_or_else(|| "/user".to_owned()) }),
+        ),
     );
     let secure = if state.config.app_url.starts_with("https://") {
         "; Secure"
@@ -3877,7 +3908,7 @@ async fn logout(State(state): State<AppState>) -> Response {
     response
 }
 
-fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+pub(crate) fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
     let cookie_header = headers.get(COOKIE)?.to_str().ok()?;
     let token = cookie_header.split(';').find_map(|cookie| {
         let (name, value) = cookie.trim().split_once('=')?;

@@ -426,6 +426,17 @@ pub struct OAuthGrantClientRecord {
 }
 
 #[derive(Debug, FromRow)]
+pub struct OAuthAuthorizationClientRecord {
+    pub id: i64,
+    pub name: String,
+    pub redirect: String,
+    pub secret: Option<String>,
+    pub personal_access_client: bool,
+    pub password_client: bool,
+    pub revoked: bool,
+}
+
+#[derive(Debug, FromRow)]
 pub struct OAuthAuthorizedTokenRecord {
     pub id: String,
     pub user_id: Option<i64>,
@@ -452,6 +463,14 @@ pub struct OAuthRefreshRecord {
     pub user_id: Option<i64>,
     pub client_id: i64,
     pub scopes: String,
+}
+
+#[derive(Debug, FromRow)]
+pub struct OAuthAuthCodeRecord {
+    pub user_id: Option<i64>,
+    pub client_id: i64,
+    pub scopes: String,
+    pub revoked: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -3561,6 +3580,130 @@ impl DatabasePool {
         }
     }
 
+    pub async fn oauth_authorization_client(
+        &self,
+        prefix: &str,
+        client_id: i64,
+    ) -> Result<Option<OAuthAuthorizationClientRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, name, redirect, secret, personal_access_client, password_client, revoked FROM {prefix}oauth_clients WHERE id = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(id AS SIGNED) AS id, name, redirect, secret, personal_access_client, password_client, revoked FROM {prefix}oauth_clients WHERE id = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, name, redirect, secret, personal_access_client, password_client, revoked FROM {prefix}oauth_clients WHERE id = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizationClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizationClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizationClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn create_oauth_auth_code(
+        &self,
+        prefix: &str,
+        auth_code_id: &str,
+        user_id: i64,
+        client_id: i64,
+        scopes: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}oauth_auth_codes (id,user_id,client_id,scopes,revoked) VALUES ($1,$2,$3,$4,FALSE)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}oauth_auth_codes (id,user_id,client_id,scopes,revoked) VALUES (?,?,?,?,FALSE)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(auth_code_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(auth_code_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(auth_code_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn oauth_auth_code(
+        &self,
+        prefix: &str,
+        auth_code_id: &str,
+    ) -> Result<Option<OAuthAuthCodeRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT user_id, CAST(client_id AS BIGINT) AS client_id, scopes, revoked FROM {prefix}oauth_auth_codes WHERE id = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT user_id, CAST(client_id AS SIGNED) AS client_id, scopes, revoked FROM {prefix}oauth_auth_codes WHERE id = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT user_id, CAST(client_id AS BIGINT) AS client_id, scopes, revoked FROM {prefix}oauth_auth_codes WHERE id = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthAuthCodeRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(auth_code_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(
+                sqlx::query_as::<_, OAuthAuthCodeRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(auth_code_id)
+                    .fetch_optional(pool)
+                    .await?,
+            ),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthAuthCodeRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(auth_code_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
     pub async fn oauth_refresh_token(
         &self,
         prefix: &str,
@@ -3753,6 +3896,7 @@ impl DatabasePool {
         refresh_token_id: &str,
         refresh_expires_at: &str,
         rotate_refresh_token_id: Option<&str>,
+        consume_auth_code: Option<(&str, i64, i64)>,
     ) -> Result<bool, sqlx::Error> {
         let postgres = matches!(self, Self::Postgres(_));
         let access_sql = if postgres {
@@ -3790,9 +3934,30 @@ impl DatabasePool {
                  WHERE id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP"
             )
         };
+        let consume_auth_code_sql = if postgres {
+            format!(
+                "UPDATE {prefix}oauth_auth_codes SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND client_id = $3 AND revoked = FALSE"
+            )
+        } else {
+            format!(
+                "UPDATE {prefix}oauth_auth_codes SET revoked = TRUE WHERE id = ? AND user_id = ? AND client_id = ? AND revoked = FALSE"
+            )
+        };
         macro_rules! issue_in_transaction {
             ($pool:expr) => {{
                 let mut transaction = $pool.begin().await?;
+                if let Some((code_id, code_user_id, code_client_id)) = consume_auth_code {
+                    let result = sqlx::query(sqlx::AssertSqlSafe(consume_auth_code_sql))
+                        .bind(code_id)
+                        .bind(code_user_id)
+                        .bind(code_client_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    if result.rows_affected() == 0 {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    }
+                }
                 if let Some(old_id) = rotate_refresh_token_id {
                     let result = sqlx::query(sqlx::AssertSqlSafe(revoke_sql))
                         .bind(old_id)

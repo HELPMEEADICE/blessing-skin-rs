@@ -3,27 +3,33 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use askama::Template;
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, PRAGMA},
     },
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use chrono::{DateTime, SecondsFormat, Utc};
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, Header, encode};
 use rand::{
     RngCore,
     distributions::{Alphanumeric, DistString},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{AppState, database::OAuthGrantClientRecord};
+use crate::{AppState, database::OAuthGrantClientRecord, defuse};
 
 const ACCESS_TOKEN_TTL: u64 = 365 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL: u64 = 365 * 24 * 60 * 60;
@@ -96,6 +102,43 @@ struct TokenRequest {
     fields: HashMap<String, String>,
 }
 
+#[derive(Deserialize)]
+struct PassportAuthorizationCodePayload {
+    client_id: serde_json::Value,
+    redirect_uri: Option<String>,
+    auth_code_id: String,
+    scopes: Vec<String>,
+    user_id: serde_json::Value,
+    expire_time: u64,
+    #[serde(default)]
+    code_challenge: Option<String>,
+    #[serde(default)]
+    code_challenge_method: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OAuthAuthorizationFormClaims {
+    user_id: i64,
+    client_id: i64,
+    redirect_uri: Option<String>,
+    callback_uri: String,
+    scopes: Vec<String>,
+    state: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+    exp: u64,
+}
+
+#[derive(Template)]
+#[template(path = "oauth_authorize.html")]
+struct OAuthAuthorizePage {
+    site_name: String,
+    locale: String,
+    client_name: String,
+    scopes: Vec<String>,
+    auth_token: String,
+    client_id: i64,
+}
 #[derive(Serialize)]
 struct PassportAccessTokenClaims {
     aud: String,
@@ -107,6 +150,488 @@ struct PassportAccessTokenClaims {
     sub: String,
 }
 
+fn login_redirect_url(return_to: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("redirect_to", return_to);
+    format!("/auth/login?{}", serializer.finish())
+}
+
+pub async fn authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let return_to = raw_query
+        .as_deref()
+        .map(|query| format!("/oauth/authorize?{query}"))
+        .unwrap_or_else(|| "/oauth/authorize".to_owned());
+    let login_url = login_redirect_url(&return_to);
+    let Some(user_id) = crate::http::session_user_id(&state, &headers) else {
+        return Redirect::to(&login_url).into_response();
+    };
+    if let Err(response) = crate::http::authenticated_web_user(&state, &headers).await {
+        return response;
+    }
+    let Some(raw_query) = raw_query else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The authorization request is invalid.",
+        );
+    };
+    let request = match TokenRequest::parse(raw_query.as_bytes()) {
+        Ok(request) => request,
+        Err(()) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The authorization request is invalid.",
+            );
+        }
+    };
+    if request.fields.get("response_type").map(String::as_str) != Some("code") {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_response_type",
+            "The response_type must be code.",
+        );
+    }
+    let Some(client_id) = request
+        .fields
+        .get("client_id")
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The client_id field is required.",
+        );
+    };
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let prefix = &state.config.database.table_prefix;
+    let client = match database.oauth_authorization_client(prefix, client_id).await {
+        Ok(Some(client)) if !client.revoked && !client.personal_access_client => client,
+        Ok(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "The OAuth client is invalid.",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load OAuth authorization client");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    let registered_redirects = client.redirect.split(',').collect::<Vec<_>>();
+    let requested_redirect = request.fields.get("redirect_uri").cloned();
+    let callback_uri = match requested_redirect.as_deref() {
+        Some(redirect) if registered_redirects.contains(&redirect) => redirect.to_owned(),
+        Some(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The redirect_uri does not match the registered URI.",
+            );
+        }
+        None if registered_redirects.len() == 1 => registered_redirects[0].to_owned(),
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The redirect_uri field is required.",
+            );
+        }
+    };
+    let known_scopes = load_known_scopes(database, prefix).await;
+    let scopes = match parse_scopes(
+        request.fields.get("scope").map(String::as_str),
+        None,
+        &known_scopes,
+    ) {
+        Ok(scopes) => scopes,
+        Err(()) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "The requested scope is invalid.",
+            );
+        }
+    };
+    let code_challenge = request
+        .fields
+        .get("code_challenge")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let code_challenge_method = request.fields.get("code_challenge_method").cloned();
+    if let Some(challenge) = code_challenge.as_deref() {
+        if !valid_pkce_verifier(challenge) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The code_challenge is invalid.",
+            );
+        }
+        if !matches!(
+            code_challenge_method.as_deref().unwrap_or("plain"),
+            "plain" | "S256"
+        ) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The code_challenge_method is invalid.",
+            );
+        }
+    } else if code_challenge_method.is_some() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "A code_challenge_method requires a code_challenge.",
+        );
+    } else if client.secret.as_deref().is_none_or(str::is_empty) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Public clients must use PKCE.",
+        );
+    }
+    if request
+        .fields
+        .get("state")
+        .is_some_and(|state| state.len() > 2048)
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The state parameter is too long.",
+        );
+    }
+    let Some(app_key) = state.config.app_key.as_deref() else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let claims = OAuthAuthorizationFormClaims {
+        user_id,
+        client_id,
+        redirect_uri: requested_redirect,
+        callback_uri,
+        scopes: scopes.clone(),
+        state: request.fields.get("state").cloned(),
+        code_challenge,
+        code_challenge_method,
+        exp: unix_now().saturating_add(600),
+    };
+    let auth_token = match sign_authorization_form(&claims, app_key) {
+        Some(token) => token,
+        None => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            );
+        }
+    };
+    let page = OAuthAuthorizePage {
+        site_name: crate::http::site_name(&state).await,
+        locale: state.config.locale.clone(),
+        client_name: client.name,
+        scopes,
+        auth_token,
+        client_id,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render OAuth authorization page");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            )
+        }
+    }
+}
+
+pub async fn authorization_decision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: axum::http::Method,
+    body: Bytes,
+) -> Response {
+    let Some(user_id) = crate::http::session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let user = match crate::http::authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request = match TokenRequest::parse(&body) {
+        Ok(request) => request,
+        Err(()) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The authorization decision is invalid.",
+            );
+        }
+    };
+    let Some(app_key) = state.config.app_key.as_deref() else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let Some(auth_token) = request.fields.get("auth_token") else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The authorization form has expired.",
+        );
+    };
+    let Some(claims) = verify_authorization_form(auth_token, app_key) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The authorization form has expired.",
+        );
+    };
+    if claims.exp <= unix_now()
+        || claims.user_id != user_id
+        || claims.user_id != user.uid
+        || request
+            .fields
+            .get("client_id")
+            .and_then(|value| value.parse::<i64>().ok())
+            != Some(claims.client_id)
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The authorization form has expired.",
+        );
+    }
+    let denied = method == axum::http::Method::DELETE
+        || request
+            .fields
+            .get("_method")
+            .is_some_and(|value| value.eq_ignore_ascii_case("DELETE"));
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let prefix = &state.config.database.table_prefix;
+    let client = match database
+        .oauth_authorization_client(prefix, claims.client_id)
+        .await
+    {
+        Ok(Some(client)) if !client.revoked && !client.personal_access_client => client,
+        Ok(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "The OAuth client is invalid.",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to reload OAuth authorization client");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    if !client
+        .redirect
+        .split(',')
+        .any(|redirect| redirect == claims.callback_uri)
+        || claims
+            .redirect_uri
+            .as_deref()
+            .is_some_and(|redirect| redirect != claims.callback_uri)
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The redirect_uri no longer matches the registered URI.",
+        );
+    }
+    if denied {
+        let mut params = vec![("error", "access_denied".to_owned())];
+        if let Some(state) = claims.state.as_deref() {
+            params.push(("state", state.to_owned()));
+        }
+        return redirect_with_query(&claims.callback_uri, &params);
+    }
+    let known_scopes = load_known_scopes(database, prefix).await;
+    if claims
+        .scopes
+        .iter()
+        .any(|scope| !known_scopes.contains(scope))
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "The requested scope is no longer available.",
+        );
+    }
+    let Some(configured_app_key) = state.config.app_key.as_deref() else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The Passport encryption key is not configured.",
+        );
+    };
+    let encryption_key = match defuse::laravel_app_key_bytes(configured_app_key) {
+        Ok(key) => key,
+        Err(()) => {
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The Passport encryption key is invalid.",
+            );
+        }
+    };
+    let auth_code_id = new_uuid();
+    let expires_at = unix_now().saturating_add(600);
+    let payload = serde_json::json!({
+        "client_id": claims.client_id.to_string(),
+        "redirect_uri": claims.redirect_uri,
+        "auth_code_id": auth_code_id,
+        "scopes": claims.scopes,
+        "user_id": claims.user_id.to_string(),
+        "expire_time": expires_at,
+        "code_challenge": claims.code_challenge,
+        "code_challenge_method": claims.code_challenge_method
+    });
+    let serialized = match serde_json::to_vec(&payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize Passport authorization code");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            );
+        }
+    };
+    let code = match defuse::encrypt_with_password(&serialized, &encryption_key) {
+        Ok(code) => code,
+        Err(()) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            );
+        }
+    };
+    let scopes_json = match serde_json::to_string(&claims.scopes) {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize authorization code scopes");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            );
+        }
+    };
+    if let Err(error) = database
+        .create_oauth_auth_code(
+            prefix,
+            &auth_code_id,
+            claims.user_id,
+            claims.client_id,
+            &scopes_json,
+        )
+        .await
+    {
+        tracing::error!(%error, "failed to persist OAuth authorization code");
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    }
+    let mut params = vec![("code", code)];
+    if let Some(state) = claims.state.as_deref() {
+        params.push(("state", state.to_owned()));
+    }
+    redirect_with_query(&claims.callback_uri, &params)
+}
+
+fn sign_authorization_form(claims: &OAuthAuthorizationFormClaims, key: &str) -> Option<String> {
+    let payload = serde_json::to_vec(claims).ok()?;
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(payload.as_bytes());
+    Some(format!(
+        "{payload}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ))
+}
+
+fn verify_authorization_form(token: &str, key: &str) -> Option<OAuthAuthorizationFormClaims> {
+    let (payload, signature) = token.split_once('.')?;
+    let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature).ok()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+fn redirect_with_query(uri: &str, params: &[(&str, String)]) -> Response {
+    let (without_fragment, fragment) = uri.split_once('#').unwrap_or((uri, ""));
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in params {
+        serializer.append_pair(key, value);
+    }
+    let query = serializer.finish();
+    let separator = if without_fragment.contains('?') {
+        if without_fragment.ends_with('?') || without_fragment.ends_with('&') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+    let location = if fragment.is_empty() {
+        format!("{without_fragment}{separator}{query}")
+    } else {
+        format!("{without_fragment}{separator}{query}#{fragment}")
+    };
+    let Ok(location) = HeaderValue::from_str(&location) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The redirect_uri is invalid.",
+        );
+    };
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::LOCATION, location);
+    response
+}
 pub async fn list_scopes(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = crate::http::authenticated_web_user(&state, &headers).await {
         return response;
@@ -426,6 +951,28 @@ pub async fn create_personal_access_token(
     .into_response()
 }
 
+fn oauth_json_identifier(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn valid_pkce_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn verify_pkce_challenge(verifier: &str, challenge: &str, method: &str) -> bool {
+    let expected = match method {
+        "plain" => verifier.to_owned(),
+        "S256" => URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+        _ => return false,
+    };
+    bool::from(expected.as_bytes().ct_eq(challenge.as_bytes()))
+}
+
 fn oauth_validation_error(message: &str, errors: serde_json::Value) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -483,7 +1030,10 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
         .get("grant_type")
         .map(String::as_str)
         .unwrap_or("");
-    if !matches!(grant_type, "password" | "refresh_token") {
+    if !matches!(
+        grant_type,
+        "password" | "refresh_token" | "authorization_code"
+    ) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
@@ -540,7 +1090,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
         }
     };
 
-    let (user_id, scopes, rotate_refresh) = match grant_type {
+    let (user_id, scopes, rotate_refresh, consume_auth_code) = match grant_type {
         "password" => {
             if !client.password_client {
                 return oauth_error(
@@ -621,7 +1171,175 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                     );
                 }
             };
-            (credential.uid, scopes, None)
+            (credential.uid, scopes, None, None)
+        }
+        "authorization_code" => {
+            let Some(code) = request.fields.get("code").filter(|value| !value.is_empty()) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "The code field is required.",
+                );
+            };
+            let Some(configured_app_key) = state.config.app_key.as_deref() else {
+                return oauth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "The Passport encryption key is not configured.",
+                );
+            };
+            let encryption_key = match defuse::laravel_app_key_bytes(configured_app_key) {
+                Ok(key) => key,
+                Err(()) => {
+                    tracing::error!("configured Laravel APP_KEY cannot be decoded");
+                    return oauth_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "server_error",
+                        "The Passport encryption key is invalid.",
+                    );
+                }
+            };
+            let payload = match defuse::decrypt_with_password(code, &encryption_key)
+                .ok()
+                .and_then(|plaintext| {
+                    serde_json::from_slice::<PassportAuthorizationCodePayload>(&plaintext).ok()
+                }) {
+                Some(payload) => payload,
+                None => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "The authorization code is invalid.",
+                    );
+                }
+            };
+            let payload_client_id = match oauth_json_identifier(&payload.client_id) {
+                Some(id) => id,
+                None => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "The authorization code is invalid.",
+                    );
+                }
+            };
+            let Some(user_id) = oauth_json_identifier(&payload.user_id) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "The authorization code is invalid.",
+                );
+            };
+            if payload_client_id != client.id || payload.expire_time <= unix_now() {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "The authorization code is invalid or expired.",
+                );
+            }
+            if request.fields.get("redirect_uri") != payload.redirect_uri.as_ref() {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "The redirect_uri does not match the authorization request.",
+                );
+            }
+            let code_verifier = request.fields.get("code_verifier").map(String::as_str);
+            match payload
+                .code_challenge
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                Some(challenge) => {
+                    let Some(verifier) = code_verifier else {
+                        return oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "The code_verifier field is required.",
+                        );
+                    };
+                    if !valid_pkce_verifier(verifier) {
+                        return oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "The code_verifier is invalid.",
+                        );
+                    }
+                    let method = payload.code_challenge_method.as_deref().unwrap_or("plain");
+                    if !verify_pkce_challenge(verifier, challenge, method) {
+                        return oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "The code_verifier could not be verified.",
+                        );
+                    }
+                }
+                None if code_verifier.is_some() => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "A code_verifier was received for an authorization code without PKCE.",
+                    );
+                }
+                None => {}
+            }
+
+            let known_scopes = load_known_scopes(database, prefix).await;
+            let mut scopes = Vec::with_capacity(payload.scopes.len());
+            for scope in payload.scopes {
+                if !known_scopes.iter().any(|known| known == &scope) {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_scope",
+                        "The authorization code contains an invalid scope.",
+                    );
+                }
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+            let code_record = match database
+                .oauth_auth_code(prefix, &payload.auth_code_id)
+                .await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "The authorization code is invalid or has already been used.",
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to load OAuth authorization code");
+                    return oauth_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "server_error",
+                        "The authorization service is unavailable.",
+                    );
+                }
+            };
+            let mut persisted_scopes = decode_stored_scopes(&code_record.scopes);
+            let mut payload_scopes = scopes.clone();
+            persisted_scopes.sort();
+            payload_scopes.sort();
+            if code_record.revoked
+                || code_record.client_id != client.id
+                || code_record.user_id != Some(user_id)
+                || persisted_scopes != payload_scopes
+            {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "The authorization code is invalid or has already been used.",
+                );
+            }
+            (
+                user_id,
+                scopes,
+                None,
+                Some((payload.auth_code_id, user_id, client.id)),
+            )
         }
         "refresh_token" => {
             let Some(refresh_id) = request
@@ -686,7 +1404,12 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                     "A refresh token cannot grant additional scopes.",
                 );
             }
-            (previous.user_id.unwrap(), scopes, Some(refresh_id.clone()))
+            (
+                previous.user_id.unwrap(),
+                scopes,
+                Some(refresh_id.clone()),
+                None,
+            )
         }
         _ => unreachable!(),
     };
@@ -738,6 +1461,9 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
             &refresh_id,
             &database_datetime(refresh_expires),
             rotate_refresh.as_deref(),
+            consume_auth_code
+                .as_ref()
+                .map(|(id, user_id, client_id)| (id.as_str(), *user_id, *client_id)),
         )
         .await
     {
@@ -1055,17 +1781,21 @@ mod integration_tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::{path::PathBuf, sync::Arc};
     use tower::ServiceExt;
+
+    use super::unix_now;
 
     use crate::{
         AppState,
         config::{Config, DatabaseConfig, DatabaseConnection, MailConfig},
         database::DatabasePool,
-        http,
+        defuse, http,
     };
 
     fn form(fields: &[(&str, &str)]) -> String {
@@ -1076,6 +1806,23 @@ mod integration_tests {
         serializer.finish()
     }
 
+    fn hidden_input_value(html: &str, name: &str) -> String {
+        let marker = format!("name=\"{name}\" value=\"");
+        html.split_once(&marker)
+            .unwrap()
+            .1
+            .split_once('"')
+            .unwrap()
+            .0
+            .to_owned()
+    }
+
+    fn redirect_parameter(location: &str, name: &str) -> Option<String> {
+        let query = location.split_once('?')?.1.split('#').next()?;
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    }
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -1119,6 +1866,8 @@ mod integration_tests {
         sqlx::query("CREATE TABLE oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, name TEXT, scopes TEXT, revoked BOOLEAN NOT NULL, created_at TEXT, updated_at TEXT, expires_at TEXT)")
             .execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE oauth_refresh_tokens (id TEXT PRIMARY KEY, access_token_id TEXT NOT NULL, revoked BOOLEAN NOT NULL, expires_at TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE oauth_auth_codes (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
             .execute(&pool).await.unwrap();
         let password = bcrypt::hash("correct horse", 4).unwrap();
         sqlx::query(
@@ -1215,6 +1964,292 @@ mod integration_tests {
             1
         );
 
+        let auth_code_id = "php-issued-code";
+        let code_verifier = "A".repeat(43);
+        let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+        let code_scopes = vec!["User.Read", "Plugin.Custom"];
+        sqlx::query(
+            "INSERT INTO oauth_auth_codes (id,user_id,client_id,scopes,revoked) VALUES (?,?,?, ?,FALSE)",
+        )
+        .bind(auth_code_id)
+        .bind(7_i64)
+        .bind(3_i64)
+        .bind(serde_json::to_string(&code_scopes).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let code_payload = serde_json::json!({
+            "client_id": "3",
+            "redirect_uri": "https://example.test/callback",
+            "auth_code_id": auth_code_id,
+            "scopes": code_scopes,
+            "user_id": "7",
+            "expire_time": unix_now() + 600,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256"
+        });
+        let encrypted_code = defuse::encrypt_with_password(
+            serde_json::to_string(&code_payload).unwrap().as_bytes(),
+            session_secret.as_bytes(),
+        )
+        .unwrap();
+        let wrong_code_request = form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", "3"),
+            ("client_secret", "never-return-this-secret"),
+            ("code", &encrypted_code),
+            ("redirect_uri", "https://example.test/callback"),
+            ("code_verifier", &"B".repeat(43)),
+        ]);
+        let rejected_code = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(wrong_code_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_code.status(), StatusCode::BAD_REQUEST);
+        let rejected_code: Value = response_json(rejected_code).await;
+        assert_eq!(rejected_code["error"], "invalid_grant");
+        assert_eq!(
+            sqlx::query_scalar::<_, bool>("SELECT revoked FROM oauth_auth_codes WHERE id = ?",)
+                .bind(auth_code_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            false
+        );
+
+        let valid_code_request = form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", "3"),
+            ("client_secret", "never-return-this-secret"),
+            ("code", &encrypted_code),
+            ("redirect_uri", "https://example.test/callback"),
+            ("code_verifier", &code_verifier),
+        ]);
+        let code_response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(valid_code_request.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code_response.status(), StatusCode::OK);
+        assert_eq!(
+            code_response.headers().get("cache-control").unwrap(),
+            "no-store"
+        );
+        let code_tokens: Value = response_json(code_response).await;
+        let code_claims = crate::auth::decode_access_token(
+            code_tokens["access_token"].as_str().unwrap(),
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(code_claims.sub, "7");
+        assert_eq!(code_claims.aud.unwrap(), "3");
+        assert_eq!(code_claims.scopes, vec!["User.Read", "Plugin.Custom"]);
+        assert_eq!(
+            sqlx::query_scalar::<_, bool>("SELECT revoked FROM oauth_auth_codes WHERE id = ?",)
+                .bind(auth_code_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            true
+        );
+        let replayed_code = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(valid_code_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed_code.status(), StatusCode::BAD_REQUEST);
+        let replayed_code: Value = response_json(replayed_code).await;
+        assert_eq!(replayed_code["error"], "invalid_grant");
+
+        let browser_verifier = "C".repeat(43);
+        let browser_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(browser_verifier.as_bytes()));
+        let authorize_path = format!(
+            "/oauth/authorize?response_type=code&client_id=3&scope=User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256"
+        );
+        let guest_authorize = app
+            .clone()
+            .oneshot(Request::get(&authorize_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(guest_authorize.status(), StatusCode::SEE_OTHER);
+        let login_location = guest_authorize
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(login_location.starts_with("/auth/login?redirect_to="));
+        let login_page = app
+            .clone()
+            .oneshot(Request::get(&login_location).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(login_page.status(), StatusCode::OK);
+        let login_html = String::from_utf8(
+            to_bytes(login_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(login_html.contains("id=\"redirect-to\" type=\"hidden\""));
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::post("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "identification": "alex@example.test",
+                        "password": "correct horse",
+                        "redirect_to": format!("/oauth/authorize?response_type=code&client_id=3&scope=User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256")
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let login_result: Value = response_json(login_response).await;
+        assert_eq!(login_result["data"]["redirectTo"], authorize_path);
+        let authorize_page = app
+            .clone()
+            .oneshot(
+                Request::get(&authorize_path)
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorize_page.status(), StatusCode::OK);
+        let page_html = String::from_utf8(
+            to_bytes(authorize_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(page_html.contains("Third-party app"));
+        assert!(page_html.contains("Plugin.Custom"));
+        let authorize_token = hidden_input_value(&page_html, "auth_token");
+        let authorize_form = form(&[
+            ("auth_token", &authorize_token),
+            ("client_id", "3"),
+            ("decision", "approve"),
+        ]);
+        let authorize_response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/authorize")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(authorize_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorize_response.status(), StatusCode::FOUND);
+        let authorize_location = authorize_response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(authorize_location.starts_with("https://example.test/callback?code="));
+        assert_eq!(
+            redirect_parameter(&authorize_location, "state").as_deref(),
+            Some("browser-state")
+        );
+        let browser_code = redirect_parameter(&authorize_location, "code").unwrap();
+        let browser_exchange = form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", "3"),
+            ("client_secret", "never-return-this-secret"),
+            ("code", &browser_code),
+            ("code_verifier", &browser_verifier),
+        ]);
+        let browser_tokens = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(browser_exchange))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_tokens.status(), StatusCode::OK);
+        let browser_tokens: Value = response_json(browser_tokens).await;
+        let browser_claims = crate::auth::decode_access_token(
+            browser_tokens["access_token"].as_str().unwrap(),
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(browser_claims.sub, "7");
+        assert_eq!(browser_claims.scopes, vec!["User.Read", "Plugin.Custom"]);
+
+        let deny_page = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/authorize?response_type=code&client_id=3&scope=User.Read&state=deny-state")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deny_page.status(), StatusCode::OK);
+        let deny_html = String::from_utf8(
+            to_bytes(deny_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let deny_token = hidden_input_value(&deny_html, "auth_token");
+        let deny_form = form(&[
+            ("auth_token", &deny_token),
+            ("client_id", "3"),
+            ("_method", "DELETE"),
+        ]);
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/authorize")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(deny_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FOUND);
+        let deny_location = denied.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            redirect_parameter(deny_location, "error").as_deref(),
+            Some("access_denied")
+        );
+        assert_eq!(
+            redirect_parameter(deny_location, "state").as_deref(),
+            Some("deny-state")
+        );
         let refresh_body = form(&[
             ("grant_type", "refresh_token"),
             ("client_id", "2"),
@@ -1276,11 +2311,23 @@ mod integration_tests {
             .unwrap();
         assert_eq!(listed.status(), StatusCode::OK);
         let listed: Value = response_json(listed).await;
-        assert_eq!(listed.as_array().unwrap().len(), 1);
-        assert_eq!(listed[0]["id"], "authorized-third-party");
-        assert_eq!(listed[0]["scopes"][0], "User.Read");
-        assert_eq!(listed[0]["client"]["name"], "Third-party app");
-        assert!(listed[0]["client"].get("secret").is_none());
+        assert_eq!(listed.as_array().unwrap().len(), 3);
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|token| token["id"] == "authorized-third-party")
+        );
+        let listed_code_token = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|token| token["id"] == code_claims.jti)
+            .unwrap();
+        assert_eq!(listed_code_token["scopes"][0], "User.Read");
+        assert_eq!(listed_code_token["client"]["name"], "Third-party app");
+        assert!(listed_code_token["client"].get("secret").is_none());
 
         let personal_created = app
             .clone()
