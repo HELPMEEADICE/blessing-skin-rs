@@ -126,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route("/user/score-info", get(user_score_info))
         .route("/user/sign", post(user_sign))
         .route("/admin", get(web_admin_dashboard))
+        .route("/admin/chart", get(web_admin_chart))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -2341,6 +2342,120 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
             tracing::error!(%error, "failed to render admin dashboard");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+async fn web_admin_chart(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+
+    let today = shanghai_now().date();
+    let month_ago = today
+        .checked_sub_months(chrono::Months::new(1))
+        .unwrap_or_else(|| today - chrono::Duration::days(30));
+    let since = month_ago
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let (user_registrations, texture_uploads) = match database
+        .admin_activity_counts(&state.config.database.table_prefix, &since)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!(%error, "failed to load admin chart activity");
+            return unavailable();
+        }
+    };
+
+    let user_counts = user_registrations
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let texture_counts = texture_uploads
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let axis_dates: Vec<_> = (0..=30)
+        .map(|days_ago| today - chrono::Duration::days(30 - days_ago))
+        .collect();
+    let x_axis = axis_dates
+        .iter()
+        .map(|date| admin_chart_date_label(*date, &state.config.locale))
+        .collect::<Vec<_>>();
+    let user_data = axis_dates
+        .iter()
+        .map(|date| {
+            *user_counts
+                .get(&date.format("%Y-%m-%d").to_string())
+                .unwrap_or(&0)
+        })
+        .collect::<Vec<_>>();
+    let texture_data = axis_dates
+        .iter()
+        .map(|date| {
+            *texture_counts
+                .get(&date.format("%Y-%m-%d").to_string())
+                .unwrap_or(&0)
+        })
+        .collect::<Vec<_>>();
+    let (user_label, texture_label) = admin_chart_series_labels(&state.config.locale);
+
+    Json(serde_json::json!({
+        "labels": [user_label, texture_label],
+        "xAxis": x_axis,
+        "data": [user_data, texture_data],
+    }))
+    .into_response()
+}
+
+fn admin_chart_series_labels(locale: &str) -> (&'static str, &'static str) {
+    if locale.starts_with("zh_TW") {
+        ("使用者註冊", "材質上載")
+    } else if locale.starts_with("zh") {
+        ("用户注册", "材质上传")
+    } else if locale.starts_with("de") {
+        ("Benutzerregistrierungen", "Hochgeladene Texturen")
+    } else if locale.starts_with("fr") {
+        ("Enregister un utilisateur", "Chargements de textures")
+    } else if locale.starts_with("es") {
+        ("Registro de Usuario", "Subidas de Texturas")
+    } else if locale.starts_with("ru") {
+        ("Регистрация пользователя", "Загрузки текстур")
+    } else if locale.starts_with("ja") {
+        ("ユーザー登録", "スキンのアップロード")
+    } else if locale.starts_with("ko") {
+        ("사용자 등록", "택스쳐 업로드")
+    } else if locale.starts_with("nl") {
+        ("Gebruikers Registratie", "Texture Uploads")
+    } else {
+        ("User Registration", "Texture Uploads")
+    }
+}
+
+fn admin_chart_date_label(date: chrono::NaiveDate, locale: &str) -> String {
+    use chrono::Datelike;
+
+    let year = date.year();
+    let month = date.month();
+    let day = date.day();
+    if locale.starts_with("zh") {
+        format!("{year}/{month}/{day}")
+    } else if locale.starts_with("ja") || locale.starts_with("ko") {
+        format!("{year}/{month:02}/{day:02}")
+    } else if locale.starts_with("en") {
+        format!("{month}/{day}/{year}")
+    } else if locale.starts_with("de") || locale.starts_with("ru") {
+        format!("{day:02}.{month:02}.{year}")
+    } else {
+        format!("{day:02}/{month:02}/{year}")
     }
 }
 
@@ -10376,6 +10491,9 @@ mod tests {
         let non_admin_dashboard =
             session_request(&app, &registered_cookie, "GET", "/admin", None).await;
         assert_eq!(non_admin_dashboard.status(), StatusCode::FORBIDDEN);
+        let non_admin_chart =
+            session_request(&app, &registered_cookie, "GET", "/admin/chart", None).await;
+        assert_eq!(non_admin_chart.status(), StatusCode::FORBIDDEN);
         let admin_now = jsonwebtoken::get_current_timestamp();
         let admin_claims = crate::auth::WebSessionClaims {
             sub: "7".to_owned(),
@@ -10406,6 +10524,34 @@ mod tests {
         assert!(admin_dashboard.contains(">2<"));
         assert!(admin_dashboard.contains(">1<"));
         assert!(admin_dashboard.contains(">8<"));
+        let admin_chart = session_request(&app, &admin_cookie, "GET", "/admin/chart", None).await;
+        assert_eq!(admin_chart.status(), StatusCode::OK);
+        let admin_chart: serde_json::Value =
+            serde_json::from_slice(&to_bytes(admin_chart.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(admin_chart["labels"][0], "User Registration");
+        assert_eq!(admin_chart["labels"][1], "Texture Uploads");
+        assert_eq!(admin_chart["xAxis"].as_array().unwrap().len(), 31);
+        assert_eq!(admin_chart["data"][0].as_array().unwrap().len(), 31);
+        assert_eq!(admin_chart["data"][1].as_array().unwrap().len(), 31);
+        assert_eq!(
+            admin_chart["data"][0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|count| count.as_i64().unwrap())
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            admin_chart["data"][1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|count| count.as_i64().unwrap())
+                .sum::<i64>(),
+            1
+        );
         let admin_user_dashboard = session_request(&app, &admin_cookie, "GET", "/user", None).await;
         assert_eq!(admin_user_dashboard.status(), StatusCode::OK);
         let admin_user_dashboard = String::from_utf8(

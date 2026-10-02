@@ -4523,6 +4523,70 @@ impl DatabasePool {
         }
     }
 
+    pub async fn admin_activity_counts(
+        &self,
+        prefix: &str,
+        since: &str,
+    ) -> Result<(Vec<(String, i64)>, Vec<(String, i64)>), sqlx::Error> {
+        let (date_sql, integer_cast, since_sql) = match self {
+            Self::Sqlite(_) => ("SUBSTR(CAST(register_at AS TEXT), 1, 10)", "BIGINT", "?"),
+            Self::MySql(_) => ("DATE_FORMAT(register_at, '%Y-%m-%d')", "SIGNED", "?"),
+            Self::Postgres(_) => (
+                "TO_CHAR(register_at, 'YYYY-MM-DD')",
+                "BIGINT",
+                "CAST($1 AS TIMESTAMP)",
+            ),
+        };
+        let users_sql = format!(
+            "SELECT {date_sql} AS activity_date, CAST(COUNT(*) AS {integer_cast}) AS amount FROM {prefix}users WHERE register_at >= {since_sql} GROUP BY activity_date"
+        );
+        let textures_sql = users_sql
+            .replace(
+                &format!("FROM {prefix}users"),
+                &format!("FROM {prefix}textures"),
+            )
+            .replace("register_at", "upload_at");
+
+        match self {
+            Self::Sqlite(pool) => {
+                let users = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(users_sql))
+                    .bind(since)
+                    .fetch_all(pool)
+                    .await?;
+                let textures =
+                    sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(textures_sql))
+                        .bind(since)
+                        .fetch_all(pool)
+                        .await?;
+                Ok((users, textures))
+            }
+            Self::MySql(pool) => {
+                let users = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(users_sql))
+                    .bind(since)
+                    .fetch_all(pool)
+                    .await?;
+                let textures =
+                    sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(textures_sql))
+                        .bind(since)
+                        .fetch_all(pool)
+                        .await?;
+                Ok((users, textures))
+            }
+            Self::Postgres(pool) => {
+                let users = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(users_sql))
+                    .bind(since)
+                    .fetch_all(pool)
+                    .await?;
+                let textures =
+                    sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(textures_sql))
+                        .bind(since)
+                        .fetch_all(pool)
+                        .await?;
+                Ok((users, textures))
+            }
+        }
+    }
+
     pub async fn user_usage(&self, prefix: &str, uid: i64) -> Result<(i64, i64), sqlx::Error> {
         let integer_cast = if matches!(self, Self::MySql(_)) {
             "SIGNED"
