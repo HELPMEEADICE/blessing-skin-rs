@@ -35,7 +35,11 @@ Blessing Skin is an open-source project written in PHP, which means you can depl
   - Integration with Authme/Discuz (available as plugin)
   - Support custom Yggdrasil API authentication (available as plugin)
 
-## Requirements
+## Rust migration status
+
+This repository is migrating the server to Rust incrementally. The migration is not complete: the PHP source remains, and Rust feature coverage is still growing. For the Rust service build, configuration, and standalone deployment, see the [Rust deployment guide](docs/rust-deployment.md) and [Rust environment example](rust.env.example). Validate database, texture, and protocol compatibility against a copy before switching an existing site.
+
+## Requirements for the legacy PHP version
 
 Blessing Skin has only a few system requirements. In most cases, these PHP extensions are already enabled.
 
@@ -54,7 +58,7 @@ Blessing Skin has only a few system requirements. In most cases, these PHP exten
   - zip
   - Imagick
 
-## Quick Install
+## Legacy PHP Quick Install
 
 Please read [Installation Guide](https://blessing.netlify.app/en/setup.html).
 
@@ -62,7 +66,7 @@ Please read [Installation Guide](https://blessing.netlify.app/en/setup.html).
 
 Blessing Skin provides an elegant and powerful plugin system, and you can attach plenty of functions and customization to your site via installing plugins.
 
-## Build From Source
+## Build the legacy PHP version from source
 
 Please refer to [Manual Build](https://blessing.netlify.app/build.html).
 

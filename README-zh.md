@@ -35,7 +35,11 @@ Blessing Skin 是一个开源的 PHP 项目，这意味着您可以自由地在�
   - 支持与 Authme/Discuz 等程序的用户数据对接（插件）
   - 支持自定义 Yggdrasil API 外置登录系统（插件）
 
-## 环境要求
+## Rust 重构进度
+
+本仓库正在将服务端逐步迁移到 Rust。迁移尚未完成，PHP 代码仍保留，Rust 服务的功能覆盖也仍在扩展。Rust 服务的构建、配置与独立部署请参阅 [Rust 服务部署指南](docs/rust-deployment.md) 和 [Rust 环境变量示例](rust.env.example)。切换现有站点前请先在副本上验证数据库、纹理和协议兼容性。
+
+## 旧 PHP 版本的环境要求
 
 Blessing Skin 对您的服务器有一定的要求。在大多数情况下，下列所需的 PHP 扩展已经开启。
 
@@ -54,7 +58,7 @@ Blessing Skin 对您的服务器有一定的要求。在大多数情况下，下
   - zip
   - Imagick
 
-## 快速使用
+## 旧 PHP 版本快速安装
 
 请参阅 [安装指南](https://blessing.netlify.app/setup.html)。
 
@@ -62,7 +66,7 @@ Blessing Skin 对您的服务器有一定的要求。在大多数情况下，下
 
 Blessing Skin 提供了强大的插件系统，您可以通过添加多种多样的插件来为您的皮肤站添加功能。
 
-## 自行构建
+## 旧 PHP 版本自行构建
 
 详情可阅读 [这里](https://blessing.netlify.app/build.html)。
 
