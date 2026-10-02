@@ -372,6 +372,11 @@ struct UserReportView {
 struct OAuthManagePage {
     site_name: String,
     locale: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -3821,9 +3826,26 @@ async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) ->
     if let Err(response) = authenticated_web_user(&state, &headers).await {
         return response;
     }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "user/oauth/manage",
+        serde_json::json!({}),
+        i18n,
+    );
     let page = OAuthManagePage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13852,7 +13874,24 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(oauth_html.contains("/oauth/clients"));
+        assert!(oauth_html.contains(r#"class="container-fluid""#));
+        assert!(oauth_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(oauth_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_oauth_globals = oauth_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let oauth_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_oauth_globals)
+            .unwrap();
+        let oauth_globals: serde_json::Value =
+            serde_json::from_slice(&oauth_globals_bytes).unwrap();
+        assert_eq!(oauth_globals["route"], "user/oauth/manage");
+        assert_eq!(oauth_globals["extra"], serde_json::json!({}));
+        assert_eq!(oauth_globals["i18n"]["auth"]["login"], "Log In");
         let read_notification = session_request(
             &app,
             &registered_cookie,
