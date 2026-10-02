@@ -32,6 +32,7 @@ pub struct AppState {
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     pub mail_limits: Arc<Mutex<HashMap<String, Instant>>>,
+    pub wasm_plugins: Vec<String>,
 }
 
 #[tokio::main]
@@ -49,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mut plugins = plugin_runtime::PluginRuntime::load(&config.plugins_dir)?;
+    let wasm_plugins = plugins.loaded_plugin_names();
     let database = match DatabasePool::connect(&config.database).await {
         Ok(pool) => Some(pool),
         Err(error) => {
@@ -89,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
         mail_limits: Arc::new(Mutex::new(HashMap::new())),
+        wasm_plugins,
     });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");

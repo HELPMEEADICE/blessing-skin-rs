@@ -1896,6 +1896,11 @@ mod integration_tests {
             database: DatabaseConfig {
                 connection: DatabaseConnection::Sqlite(sqlx::sqlite::SqliteConnectOptions::new()),
                 table_prefix: String::new(),
+                driver: "SQLite".to_owned(),
+                host: None,
+                port: None,
+                username: None,
+                database: "test.sqlite".to_owned(),
             },
             textures_dir: PathBuf::new(),
             plugins_dir: PathBuf::new(),
@@ -1916,6 +1921,7 @@ mod integration_tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            wasm_plugins: Vec::new(),
         });
 
         let password_body = form(&[

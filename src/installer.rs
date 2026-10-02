@@ -570,6 +570,11 @@ mod tests {
                     .create_if_missing(false),
             ),
             table_prefix: String::new(),
+            driver: "SQLite".to_owned(),
+            host: None,
+            port: None,
+            username: None,
+            database: database_file.display().to_string(),
         };
         let pool = DatabasePool::connect_for_install(&config).await.unwrap();
         pool.ping().await.unwrap();

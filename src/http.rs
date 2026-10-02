@@ -135,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/user/sign", post(user_sign))
         .route("/admin", get(web_admin_dashboard))
         .route("/admin/chart", get(web_admin_chart))
+        .route("/admin/status", get(web_admin_status))
         .route("/admin/notifications/send", post(web_send_notification))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
@@ -2167,6 +2168,25 @@ struct AdminDashboardPage {
 }
 
 #[derive(Template)]
+#[template(path = "admin_status.html")]
+struct AdminStatusPage {
+    site_name: String,
+    locale: String,
+    groups: Vec<AdminStatusGroup>,
+    wasm_plugins: Vec<String>,
+}
+
+struct AdminStatusGroup {
+    title: String,
+    fields: Vec<AdminStatusField>,
+}
+
+struct AdminStatusField {
+    label: String,
+    value: String,
+}
+
+#[derive(Template)]
 #[template(path = "players.html")]
 struct PlayerManagementPage {
     site_name: String,
@@ -2817,6 +2837,143 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to render admin dashboard");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let chinese = state.config.locale.starts_with("zh");
+    let debug = std::env::var("APP_DEBUG").ok().is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    let commit = std::env::var("GIT_COMMIT")
+        .or_else(|_| std::env::var("SOURCE_VERSION"))
+        .unwrap_or_default();
+    let commit = if commit.is_empty() {
+        if chinese {
+            "未知".to_owned()
+        } else {
+            "Unknown".to_owned()
+        }
+    } else {
+        commit.chars().take(16).collect()
+    };
+    let database = &state.config.database;
+    let groups = vec![
+        AdminStatusGroup {
+            title: "Blessing Skin".to_owned(),
+            fields: vec![
+                AdminStatusField {
+                    label: if chinese { "版本" } else { "Version" }.to_owned(),
+                    value: state.config.version.to_owned(),
+                },
+                AdminStatusField {
+                    label: if chinese {
+                        "运行环境"
+                    } else {
+                        "Environment"
+                    }
+                    .to_owned(),
+                    value: std::env::var("APP_ENV").unwrap_or_else(|_| "production".to_owned()),
+                },
+                AdminStatusField {
+                    label: if chinese {
+                        "调试模式"
+                    } else {
+                        "Debug mode"
+                    }
+                    .to_owned(),
+                    value: if chinese {
+                        if debug { "是" } else { "否" }
+                    } else if debug {
+                        "Yes"
+                    } else {
+                        "No"
+                    }
+                    .to_owned(),
+                },
+                AdminStatusField {
+                    label: if chinese { "提交" } else { "Commit" }.to_owned(),
+                    value: commit,
+                },
+            ],
+        },
+        AdminStatusGroup {
+            title: if chinese { "服务" } else { "Server" }.to_owned(),
+            fields: vec![
+                AdminStatusField {
+                    label: if chinese { "运行时" } else { "Runtime" }.to_owned(),
+                    value: "Rust / Axum / Tokio".to_owned(),
+                },
+                AdminStatusField {
+                    label: if chinese {
+                        "操作系统"
+                    } else {
+                        "Operating system"
+                    }
+                    .to_owned(),
+                    value: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                },
+            ],
+        },
+        AdminStatusGroup {
+            title: if chinese { "数据库" } else { "Database" }.to_owned(),
+            fields: vec![
+                AdminStatusField {
+                    label: if chinese { "类型" } else { "Type" }.to_owned(),
+                    value: database.driver.clone(),
+                },
+                AdminStatusField {
+                    label: if chinese { "主机" } else { "Host" }.to_owned(),
+                    value: database.host.clone().unwrap_or_else(|| "—".to_owned()),
+                },
+                AdminStatusField {
+                    label: if chinese { "端口" } else { "Port" }.to_owned(),
+                    value: database
+                        .port
+                        .map_or_else(|| "—".to_owned(), |port| port.to_string()),
+                },
+                AdminStatusField {
+                    label: if chinese { "用户名" } else { "Username" }.to_owned(),
+                    value: database.username.clone().unwrap_or_else(|| "—".to_owned()),
+                },
+                AdminStatusField {
+                    label: if chinese { "数据库" } else { "Database" }.to_owned(),
+                    value: database.database.clone(),
+                },
+                AdminStatusField {
+                    label: if chinese { "表前缀" } else { "Table prefix" }.to_owned(),
+                    value: if database.table_prefix.is_empty() {
+                        if chinese { "（空）" } else { "(none)" }.to_owned()
+                    } else {
+                        database.table_prefix.clone()
+                    },
+                },
+            ],
+        },
+    ];
+    let page = AdminStatusPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        groups,
+        wasm_plugins: state.wasm_plugins.clone(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render admin status page");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -10636,6 +10793,11 @@ mod tests {
             database: crate::config::DatabaseConfig {
                 connection: crate::config::DatabaseConnection::Sqlite(SqliteConnectOptions::new()),
                 table_prefix: String::new(),
+                driver: "SQLite".to_owned(),
+                host: None,
+                port: None,
+                username: None,
+                database: "test.sqlite".to_owned(),
             },
             textures_dir: PathBuf::new(),
             plugins_dir: PathBuf::new(),
@@ -10656,6 +10818,7 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            wasm_plugins: Vec::new(),
         });
         let response = app
             .clone()
@@ -10830,6 +10993,11 @@ mod tests {
                     sqlx::sqlite::SqliteConnectOptions::new(),
                 ),
                 table_prefix: String::new(),
+                driver: "SQLite".to_owned(),
+                host: None,
+                port: None,
+                username: None,
+                database: "test.sqlite".to_owned(),
             },
             textures_dir: texture_test_dir.clone(),
             plugins_dir: PathBuf::new(),
@@ -10854,6 +11022,7 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),
             mail_limits: Default::default(),
+            wasm_plugins: Vec::new(),
         });
         let now = jsonwebtoken::get_current_timestamp();
         let unbound_claims = crate::auth::WebSessionClaims {
@@ -11185,6 +11354,23 @@ mod tests {
         let denied_translation_page =
             session_request(&app, &registered_cookie, "GET", "/admin/i18n", None).await;
         assert_eq!(denied_translation_page.status(), StatusCode::FORBIDDEN);
+        let denied_status_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/status", None).await;
+        assert_eq!(denied_status_page.status(), StatusCode::FORBIDDEN);
+
+        let status_page = session_request(&app, &admin_cookie, "GET", "/admin/status", None).await;
+        assert_eq!(status_page.status(), StatusCode::OK);
+        let status_html = String::from_utf8(
+            to_bytes(status_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(status_html.contains("System status"));
+        assert!(status_html.contains("Rust / Axum / Tokio"));
+        assert!(status_html.contains("SQLite"));
+        assert!(status_html.contains("No WASM plugins loaded"));
 
         let translation_page =
             session_request(&app, &admin_cookie, "GET", "/admin/i18n", None).await;

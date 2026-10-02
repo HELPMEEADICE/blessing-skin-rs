@@ -56,6 +56,20 @@ impl PluginRuntime {
         Ok(runtime)
     }
 
+    pub fn loaded_plugin_names(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .map(|plugin| {
+                plugin
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
     fn load_component(&mut self, engine: &Engine, path: &Path) -> Result<(), Box<dyn Error>> {
         let metadata = fs::metadata(path)?;
         if metadata.len() > COMPONENT_FILE_LIMIT {

@@ -51,6 +51,11 @@ impl Default for MailConfig {
 pub struct DatabaseConfig {
     pub connection: DatabaseConnection,
     pub table_prefix: String,
+    pub driver: String,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub database: String,
 }
 
 #[derive(Clone, Debug)]
@@ -142,35 +147,67 @@ impl MailConfig {
 impl DatabaseConfig {
     fn from_env(table_prefix: String) -> Result<Self, ConfigError> {
         let driver = env::var("DB_CONNECTION").unwrap_or_else(|_| "mysql".to_owned());
-        let connection = match driver.to_ascii_lowercase().as_str() {
+        let (connection, display_driver, host, port, username, database) = match driver
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "sqlite" => {
-                let filename = env::var("DB_DATABASE")
+                let database = env::var("DB_DATABASE")
                     .unwrap_or_else(|_| "storage/database.sqlite".to_owned());
                 let mut options = SqliteConnectOptions::new()
-                    .filename(filename)
+                    .filename(&database)
                     .create_if_missing(false);
                 if env::var("DB_FOREIGN_KEYS").is_ok_and(|value| value == "false" || value == "0") {
                     options = options.foreign_keys(false);
                 }
-                DatabaseConnection::Sqlite(options)
+                (
+                    DatabaseConnection::Sqlite(options),
+                    "SQLite",
+                    None,
+                    None,
+                    None,
+                    database,
+                )
             }
             "mysql" | "mariadb" => {
+                let host = env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+                let port = parse_port("DB_PORT", 3306);
+                let username = env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned());
+                let database = env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned());
                 let options = MySqlConnectOptions::new()
-                    .host(&env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()))
-                    .port(parse_port("DB_PORT", 3306))
-                    .username(&env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned()))
+                    .host(&host)
+                    .port(port)
+                    .username(&username)
                     .password(&env::var("DB_PASSWORD").unwrap_or_default())
-                    .database(&env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned()));
-                DatabaseConnection::MySql(options)
+                    .database(&database);
+                (
+                    DatabaseConnection::MySql(options),
+                    "MySQL/MariaDB",
+                    Some(host),
+                    Some(port),
+                    Some(username),
+                    database,
+                )
             }
             "pgsql" | "postgres" | "postgresql" => {
+                let host = env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+                let port = parse_port("DB_PORT", 5432);
+                let username = env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned());
+                let database = env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned());
                 let options = PgConnectOptions::new()
-                    .host(&env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()))
-                    .port(parse_port("DB_PORT", 5432))
-                    .username(&env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned()))
+                    .host(&host)
+                    .port(port)
+                    .username(&username)
                     .password(&env::var("DB_PASSWORD").unwrap_or_default())
-                    .database(&env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned()));
-                DatabaseConnection::Postgres(options)
+                    .database(&database);
+                (
+                    DatabaseConnection::Postgres(options),
+                    "PostgreSQL",
+                    Some(host),
+                    Some(port),
+                    Some(username),
+                    database,
+                )
             }
             _ => return Err(ConfigError::UnsupportedDatabase(driver)),
         };
@@ -178,6 +215,11 @@ impl DatabaseConfig {
         Ok(Self {
             connection,
             table_prefix,
+            driver: display_driver.to_owned(),
+            host,
+            port,
+            username,
+            database,
         })
     }
 }
