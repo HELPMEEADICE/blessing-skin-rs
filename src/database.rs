@@ -115,6 +115,12 @@ pub struct ClosetTextureRecord {
     pub texture_tid: i64,
     pub item_name: Option<String>,
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReportSubmissionOutcome {
+    AlreadyReported,
+    InsufficientScore,
+    Submitted,
+}
 #[derive(Debug)]
 pub enum PlayerRenameOutcome {
     NotFound,
@@ -231,6 +237,163 @@ impl DatabasePool {
         }
     }
 
+    pub async fn submit_report(
+        &self,
+        prefix: &str,
+        tid: i64,
+        uploader_id: i64,
+        reporter_id: i64,
+        reason: &str,
+        score_modification: i64,
+    ) -> Result<ReportSubmissionOutcome, sqlx::Error> {
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql =
+                    format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?");
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(reporter_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                };
+                let duplicate_sql =
+                    format!("SELECT COUNT(*) FROM {prefix}reports WHERE reporter = ? AND tid = ?");
+                let duplicate = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(reporter_id)
+                    .bind(tid)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if duplicate > 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::AlreadyReported);
+                }
+                if score.saturating_add(score_modification) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                }
+                let update_sql =
+                    format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_modification)
+                    .bind(reporter_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}reports (tid, uploader, reporter, reason, status, report_at) \
+                     VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(tid)
+                    .bind(uploader_id)
+                    .bind(reporter_id)
+                    .bind(reason)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ? FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(reporter_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                };
+                let duplicate_sql =
+                    format!("SELECT COUNT(*) FROM {prefix}reports WHERE reporter = ? AND tid = ?");
+                let duplicate = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(reporter_id)
+                    .bind(tid)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if duplicate > 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::AlreadyReported);
+                }
+                if score.saturating_add(score_modification) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                }
+                let update_sql =
+                    format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_modification)
+                    .bind(reporter_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}reports (tid, uploader, reporter, reason, status, report_at) \
+                     VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(tid)
+                    .bind(uploader_id)
+                    .bind(reporter_id)
+                    .bind(reason)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1 FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(reporter_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                };
+                let duplicate_sql = format!(
+                    "SELECT COUNT(*) FROM {prefix}reports WHERE reporter = $1 AND tid = $2"
+                );
+                let duplicate = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(reporter_id)
+                    .bind(tid)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if duplicate > 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::AlreadyReported);
+                }
+                if score.saturating_add(score_modification) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(ReportSubmissionOutcome::InsufficientScore);
+                }
+                let update_sql =
+                    format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2");
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                    .bind(score_modification)
+                    .bind(reporter_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}reports (tid, uploader, reporter, reason, status, report_at) \
+                     VALUES ($1, $2, $3, $4, 0, CURRENT_TIMESTAMP)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(tid)
+                    .bind(uploader_id)
+                    .bind(reporter_id)
+                    .bind(reason)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(ReportSubmissionOutcome::Submitted)
+    }
     pub async fn player_profile(
         &self,
         prefix: &str,
@@ -2336,6 +2499,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE bs_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, tid INTEGER NOT NULL, uploader INTEGER NOT NULL, reporter INTEGER NOT NULL, reason TEXT NOT NULL, status INTEGER NOT NULL, report_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE bs_user_closet (user_uid INTEGER NOT NULL, texture_tid INTEGER NOT NULL, item_name TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -2886,5 +3053,56 @@ mod tests {
             database.texture_hash("bs_", 12).await.unwrap().as_deref(),
             Some("cape-hash")
         );
+        assert_eq!(
+            database
+                .submit_report("bs_", 13, 8, 7, "Not appropriate", -50)
+                .await
+                .unwrap(),
+            super::ReportSubmissionOutcome::InsufficientScore
+        );
+        let reports_after_rejection: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bs_reports WHERE reporter = 7 AND tid = 13")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let score_after_rejection: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reports_after_rejection, 0);
+        assert_eq!(score_after_rejection, 37);
+        assert_eq!(
+            database
+                .submit_report("bs_", 13, 8, 7, "Not appropriate", 3)
+                .await
+                .unwrap(),
+            super::ReportSubmissionOutcome::Submitted
+        );
+        assert_eq!(
+            database
+                .submit_report("bs_", 13, 8, 7, "Repeated report", -100)
+                .await
+                .unwrap(),
+            super::ReportSubmissionOutcome::AlreadyReported
+        );
+        let report_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bs_reports WHERE reporter = 7 AND tid = 13")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(report_count, 1);
+        let report = sqlx::query_as::<_, (i64, i64, i64, String, i64)>(
+            "SELECT tid, uploader, reporter, reason, status FROM bs_reports",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(report, (13, 8, 7, "Not appropriate".to_owned(), 0));
+        let reporter_score: i64 = sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reporter_score, 40);
     }
 }

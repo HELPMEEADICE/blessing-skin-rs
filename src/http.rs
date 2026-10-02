@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/skinlib/list", get(skinlib_list))
+        .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
         .route("/texture/{tid}", get(skinlib_info))
         .route("/texture/{tid}/name", put(rename_texture))
@@ -1678,11 +1679,10 @@ fn texture_info_json(texture: TextureInfoRecord) -> serde_json::Value {
     })
 }
 
-async fn texture_mutation_context(
+async fn authenticated_web_user(
     state: &AppState,
     headers: &HeaderMap,
-    tid_path: &str,
-) -> Result<(i64, TextureInfoRecord), Response> {
+) -> Result<UserProfile, Response> {
     let database = state.database.as_ref().ok_or_else(unavailable)?;
     let user_id = session_user_id(state, headers).ok_or_else(unauthenticated)?;
     let user = match database
@@ -1692,7 +1692,7 @@ async fn texture_mutation_context(
         Ok(Some(user)) => user,
         Ok(None) => return Err(unauthenticated()),
         Err(error) => {
-            tracing::error!(%error, "failed to load texture mutation user");
+            tracing::error!(%error, "failed to load authenticated web user");
             return Err(unavailable());
         }
     };
@@ -1731,6 +1731,16 @@ async fn texture_mutation_context(
             return Err(unavailable());
         }
     }
+    Ok(user)
+}
+
+async fn texture_mutation_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    tid_path: &str,
+) -> Result<(i64, TextureInfoRecord), Response> {
+    let database = state.database.as_ref().ok_or_else(unavailable)?;
+    let user = authenticated_web_user(state, headers).await?;
     let tid = tid_path
         .parse::<i64>()
         .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
@@ -1745,7 +1755,7 @@ async fn texture_mutation_context(
             return Err(unavailable());
         }
     };
-    if texture.uploader != user_id && user.permission < 1 {
+    if texture.uploader != user.uid && user.permission < 1 {
         let message = if state.config.locale.starts_with("zh") {
             "你没有权限修改此材质"
         } else {
@@ -1756,6 +1766,121 @@ async fn texture_mutation_context(
         return Err(response);
     }
     Ok((tid, texture))
+}
+async fn submit_skinlib_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let reporter = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(tid) = texture_id_from_request(request.get("tid")) else {
+        return report_validation_error("tid", &state.config.locale);
+    };
+    let Some(reason) = request.get("reason").and_then(serde_json::Value::as_str) else {
+        return report_validation_error("reason", &state.config.locale);
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return report_validation_error("reason", &state.config.locale);
+    }
+    let texture = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => texture,
+        Ok(None) => return report_validation_error("tid", &state.config.locale),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load reported texture");
+            return unavailable();
+        }
+    };
+    let score_modification = match database
+        .option(
+            &state.config.database.table_prefix,
+            "reporter_score_modification",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read report score option");
+            return unavailable();
+        }
+    };
+    match database
+        .submit_report(
+            &state.config.database.table_prefix,
+            tid,
+            texture.uploader,
+            reporter.uid,
+            reason,
+            score_modification,
+        )
+        .await
+    {
+        Ok(crate::database::ReportSubmissionOutcome::Submitted) => login_result(
+            0,
+            if state.config.locale.starts_with("zh") {
+                "举报已提交，请等待管理员处理"
+            } else {
+                "Thanks for reporting! The administrators will review it as soon as possible."
+            },
+            None,
+        ),
+        Ok(crate::database::ReportSubmissionOutcome::AlreadyReported) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "您已经举报过该材质了，请耐心等待管理员处理。您可以在用户中心查看举报的处理进度。"
+            } else {
+                "You have already reported this texture. The administrators will review it as soon as possible. You can also track the status of your report at User Center."
+            },
+            None,
+        ),
+        Ok(crate::database::ReportSubmissionOutcome::InsufficientScore) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "积分不足"
+            } else {
+                "You don't have enough score to upload this texture."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to submit skin library report");
+            unavailable()
+        }
+    }
+}
+
+fn report_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("tid", true) => "材质编号必须是存在的整数。",
+        ("tid", false) => "The tid field must reference an existing texture.",
+        ("reason", true) => "举报理由为必填项。",
+        ("reason", false) => "The reason field is required.",
+        _ => "The given field is invalid.",
+    };
+    let mut errors = serde_json::Map::new();
+    errors.insert(field.to_owned(), serde_json::json!([field_error]));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
 }
 
 fn valid_texture_name(name: &str, rule: &str) -> bool {
@@ -2560,6 +2685,20 @@ mod tests {
         assert!(!super::valid_texture_name("anything", "["));
     }
 
+    #[tokio::test]
+    async fn formats_report_validation_errors_by_field() {
+        use axum::body::to_bytes;
+
+        let response = super::report_validation_error("reason", "en");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["errors"]["reason"][0].as_str().is_some());
+        assert!(value["errors"]["field"].is_null());
+    }
     #[test]
     fn validates_legacy_texture_types() {
         assert!(super::valid_texture_type("steve"));
