@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(login_page).post(handle_login))
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
+        .route("/skinlib/list", get(skinlib_list))
         .route("/api/user", get(api_user))
         .route("/api/closet", get(api_closet).post(api_add_closet_item))
         .route(
@@ -1589,6 +1590,103 @@ struct ClosetListQuery {
     per_page: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct SkinLibraryQuery {
+    filter: Option<String>,
+    keyword: Option<String>,
+    uploader: Option<String>,
+    sort: Option<String>,
+    page: Option<i64>,
+}
+
+async fn skinlib_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkinLibraryQuery>,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let session_user_id = session_user_id(&state, &headers);
+    let (user_id, is_admin) = match session_user_id {
+        Some(user_id) => match database
+            .user_profile(&state.config.database.table_prefix, user_id)
+            .await
+        {
+            Ok(Some(user)) => (Some(user_id), user.permission >= 1),
+            Ok(None) => (None, false),
+            Err(error) => {
+                tracing::error!(%error, "failed to load skin library viewer");
+                return unavailable();
+            }
+        },
+        None => (None, false),
+    };
+    let filter = query.filter.as_deref().unwrap_or("skin");
+    let keyword = query
+        .keyword
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "0");
+    let uploader = query
+        .uploader
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "0")
+        .and_then(|value| value.parse::<i64>().ok());
+    let sort = query.sort.as_deref().unwrap_or("time");
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = 20_i64;
+    match database
+        .skinlib_items(
+            &state.config.database.table_prefix,
+            user_id,
+            is_admin,
+            filter,
+            keyword,
+            uploader,
+            sort,
+            page,
+            per_page,
+        )
+        .await
+    {
+        Ok((items, total)) => {
+            let data = items
+                .into_iter()
+                .map(skin_library_item_json)
+                .collect::<Vec<_>>();
+            let last_page = total.saturating_add(per_page - 1) / per_page;
+            let offset = page.saturating_sub(1).saturating_mul(per_page);
+            let from = (!data.is_empty()).then_some(offset + 1);
+            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
+            Json(serde_json::json!({
+                "current_page": page,
+                "data": data,
+                "last_page": last_page.max(1),
+                "per_page": per_page,
+                "from": from,
+                "to": to,
+                "total": total
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to query the skin library");
+            unavailable()
+        }
+    }
+}
+
+fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_json::Value {
+    serde_json::json!({
+        "tid": item.tid,
+        "name": item.name,
+        "type": item.texture_type,
+        "uploader": item.uploader,
+        "public": item.is_public,
+        "likes": item.likes,
+        "nickname": item.nickname,
+    })
+}
 async fn api_closet(
     State(state): State<AppState>,
     headers: HeaderMap,

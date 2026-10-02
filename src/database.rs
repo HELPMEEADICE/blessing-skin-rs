@@ -79,6 +79,16 @@ pub struct NotificationRecord {
     pub created_at: String,
 }
 #[derive(Debug, FromRow)]
+pub struct SkinLibraryRecord {
+    pub tid: i64,
+    pub name: String,
+    pub texture_type: String,
+    pub uploader: i64,
+    pub is_public: bool,
+    pub likes: i64,
+    pub nickname: String,
+}
+#[derive(Debug, FromRow)]
 pub struct ClosetTextureRecord {
     pub tid: i64,
     pub name: String,
@@ -1085,6 +1095,146 @@ impl DatabasePool {
         }
         Ok(ClosetRemoveOutcome::Removed)
     }
+    pub async fn skinlib_items(
+        &self,
+        prefix: &str,
+        user_id: Option<i64>,
+        is_admin: bool,
+        filter: &str,
+        keyword: Option<&str>,
+        uploader: Option<i64>,
+        sort: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<SkinLibraryRecord>, i64), sqlx::Error> {
+        let is_postgres = matches!(self, Self::Postgres(_));
+        let (keyword_enabled, keyword_pattern, uploader_enabled, uploader_value) = if is_postgres {
+            ("$3", "$4", "$5", "$6")
+        } else {
+            ("?", "?", "?", "?")
+        };
+        let category = match filter {
+            "skin" => "t.type IN ('steve', 'alex')",
+            "steve" | "alex" | "cape" => match filter {
+                "steve" => "t.type = 'steve'",
+                "alex" => "t.type = 'alex'",
+                _ => "t.type = 'cape'",
+            },
+            _ => "t.type = '__no_such_texture_type__'",
+        };
+        let order_by = match sort {
+            "likes" => "t.likes",
+            "name" => "t.name",
+            _ => "t.upload_at",
+        };
+        let visibility = if is_postgres {
+            "$1 = TRUE OR t.public = TRUE OR t.uploader = $2"
+        } else {
+            "? = TRUE OR t.public = TRUE OR t.uploader = ?"
+        };
+        let where_sql = format!(
+            "({visibility}) AND {category} \
+             AND ({keyword_enabled} = FALSE OR t.name LIKE {keyword_pattern}) \
+             AND ({uploader_enabled} = FALSE OR t.uploader = {uploader_value})"
+        );
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {prefix}textures t \
+             INNER JOIN {prefix}users u ON u.uid = t.uploader \
+             WHERE {where_sql}"
+        );
+        let search_pattern = format!("%{}%", keyword.unwrap_or_default());
+        let count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        let (limit_marker, offset_marker) = if is_postgres {
+            ("$7".to_owned(), "$8".to_owned())
+        } else {
+            ("?".to_owned(), "?".to_owned())
+        };
+        let rows_sql = format!(
+            "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, \
+             CAST(t.uploader AS BIGINT) AS uploader, t.public AS is_public, \
+             CAST(t.likes AS BIGINT) AS likes, u.nickname \
+             FROM {prefix}textures t INNER JOIN {prefix}users u ON u.uid = t.uploader \
+             WHERE {where_sql} ORDER BY {order_by} DESC \
+             LIMIT {limit_marker} OFFSET {offset_marker}"
+        );
+        let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, SkinLibraryRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, SkinLibraryRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, SkinLibraryRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(is_admin)
+                    .bind(user_id)
+                    .bind(keyword.is_some())
+                    .bind(&search_pattern)
+                    .bind(uploader.is_some())
+                    .bind(uploader.unwrap_or_default())
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok((rows, count))
+    }
     pub async fn closet_items(
         &self,
         prefix: &str,
@@ -2076,7 +2226,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_users (uid, email, nickname, locale, score, avatar, permission, last_sign_at, register_at, verified, is_dark_mode) VALUES (7, 'alex@example.test', 'Alex User', 'zh_CN', 42, 11, 0, '2026-10-01 10:00:00', '2025-01-02 03:04:05', 1, 0)")
+        sqlx::query("INSERT INTO bs_users (uid, email, nickname, locale, score, avatar, permission, last_sign_at, register_at, verified, is_dark_mode) VALUES (7, 'alex@example.test', 'Alex User', 'zh_CN', 42, 11, 0, '2026-10-01 10:00:00', '2025-01-02 03:04:05', 1, 0), (8, 'admin@example.test', 'Admin', 'en', 50, 0, 1, '', '', 1, 0)")
             .execute(&pool)
             .await
             .unwrap();
@@ -2084,7 +2234,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Skin', 'alex', 'skin-hash', 8, 7, 1, '2026-10-01 10:00:00', 1), (12, 'Cape', 'cape', 'cape-hash', 9, 7, 1, '2026-10-01 10:01:00', 1), (13, 'Other skin', 'alex', 'not-in-closet', 10, 8, 1, '2026-10-01 10:02:00', 0), (14, 'Private skin', 'steve', 'private-hash', 11, 8, 0, '2026-10-01 10:03:00', 4)")
+        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Skin', 'alex', 'skin-hash', 8, 7, 1, '2026-10-01 10:00:00', 1), (12, 'Cape', 'cape', 'cape-hash', 9, 7, 1, '2026-10-01 10:01:00', 1), (13, 'Other skin', 'alex', 'not-in-closet', 10, 8, 1, '2026-10-01 10:02:00', 0), (14, 'Private skin', 'steve', 'private-hash', 11, 8, 0, '2026-10-01 10:03:00', 4), (15, 'Private Alex', 'alex', 'owner-private-hash', 12, 7, 0, '2026-10-01 10:04:00', 2)")
             .execute(&pool)
             .await
             .unwrap();
@@ -2162,7 +2312,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            vec![7]
+            vec![7, 8]
         );
         assert_eq!(
             database
@@ -2482,6 +2632,74 @@ mod tests {
             .unwrap();
         assert_eq!(cape_total, 1);
         assert_eq!(cape_items[0].texture_type, "cape");
+        let (public_skins, public_skin_total) = database
+            .skinlib_items("bs_", None, false, "skin", None, None, "time", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(public_skin_total, 2);
+        assert_eq!(public_skins.len(), 2);
+        assert_eq!(public_skins[0].tid, 13);
+        assert_eq!(public_skins[0].nickname, "Admin");
+        let (own_skins, own_skin_total) = database
+            .skinlib_items("bs_", Some(7), false, "skin", None, None, "time", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(own_skin_total, 3);
+        assert!(
+            own_skins
+                .iter()
+                .any(|item| item.tid == 15 && !item.is_public)
+        );
+        let (admin_capes, admin_cape_total) = database
+            .skinlib_items("bs_", Some(8), true, "cape", None, None, "time", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(admin_cape_total, 1);
+        assert_eq!(admin_capes[0].tid, 12);
+        let (admin_skins, admin_skin_total) = database
+            .skinlib_items("bs_", Some(8), true, "skin", None, None, "time", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(admin_skin_total, 4);
+        assert!(
+            admin_skins
+                .iter()
+                .any(|item| item.tid == 14 && !item.is_public)
+        );
+        let (searched_skins, searched_skin_total) = database
+            .skinlib_items(
+                "bs_",
+                None,
+                false,
+                "skin",
+                Some("Other"),
+                None,
+                "likes",
+                1,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(searched_skin_total, 1);
+        assert_eq!(searched_skins[0].tid, 13);
+        let (uploader_skins, uploader_skin_total) = database
+            .skinlib_items("bs_", None, false, "skin", None, Some(8), "likes", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(uploader_skin_total, 1);
+        assert_eq!(uploader_skins[0].tid, 13);
+        let (first_skin_page, first_skin_page_total) = database
+            .skinlib_items("bs_", None, false, "skin", None, None, "time", 1, 1)
+            .await
+            .unwrap();
+        let (second_skin_page, second_skin_page_total) = database
+            .skinlib_items("bs_", None, false, "skin", None, None, "time", 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(first_skin_page_total, 2);
+        assert_eq!(second_skin_page_total, 2);
+        assert_eq!(first_skin_page[0].tid, 13);
+        assert_eq!(second_skin_page[0].tid, 11);
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
