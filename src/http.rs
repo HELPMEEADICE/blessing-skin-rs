@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
+        .route("/oauth/token", post(crate::oauth::token))
         .route(
             "/oauth/clients",
             get(oauth_clients_list).post(oauth_client_create),
@@ -9874,6 +9875,7 @@ mod tests {
             plugins_dir: PathBuf::new(),
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
+            passport_private_key: None,
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
             app_key: None,
@@ -9883,6 +9885,7 @@ mod tests {
             config: Arc::new(config),
             database: None,
             passport_key: None,
+            passport_signing_key: None,
             session_key: None,
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
@@ -10056,6 +10059,7 @@ mod tests {
             plugins_dir: PathBuf::new(),
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
+            passport_private_key: None,
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
             app_key: Some(secret.clone()),
@@ -10069,6 +10073,7 @@ mod tests {
             config: Arc::new(config),
             database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
             passport_key: None,
+            passport_signing_key: None,
             session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),

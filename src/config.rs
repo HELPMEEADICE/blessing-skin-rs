@@ -13,6 +13,7 @@ pub struct Config {
     pub plugins_dir: PathBuf,
     pub app_url: String,
     pub passport_public_key: Option<Vec<u8>>,
+    pub passport_private_key: Option<Vec<u8>>,
     pub password_method: String,
     pub password_salt: String,
     pub app_key: Option<String>,
@@ -100,6 +101,11 @@ impl Config {
             plugins_dir,
             app_url: env::var("APP_URL").unwrap_or_else(|_| "http://localhost".to_owned()),
             passport_public_key,
+            passport_private_key: load_passport_key(
+                &storage,
+                "PASSPORT_PRIVATE_KEY",
+                "oauth-private.key",
+            ),
             password_method: env::var("PWD_METHOD").unwrap_or_else(|_| "BCRYPT".to_owned()),
             password_salt: env::var("SALT").unwrap_or_default(),
             app_key: env::var("APP_KEY").ok().filter(|value| !value.is_empty()),
@@ -202,12 +208,20 @@ mod tests {
     }
 }
 fn load_passport_public_key(storage: &std::path::Path) -> Option<Vec<u8>> {
-    if let Ok(configured) = env::var("PASSPORT_PUBLIC_KEY") {
+    load_passport_key(storage, "PASSPORT_PUBLIC_KEY", "oauth-public.key")
+}
+
+fn load_passport_key(
+    storage: &std::path::Path,
+    environment_variable: &str,
+    default_filename: &str,
+) -> Option<Vec<u8>> {
+    if let Ok(configured) = env::var(environment_variable) {
         if let Some(path) = configured.strip_prefix("file://") {
             return std::fs::read(path).ok();
         }
-        return Some(configured.into_bytes());
+        return Some(configured.replace("\\n", "\n").into_bytes());
     }
 
-    std::fs::read(storage.join("oauth-public.key")).ok()
+    std::fs::read(storage.join(default_filename)).ok()
 }

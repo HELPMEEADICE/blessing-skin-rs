@@ -409,6 +409,21 @@ pub struct OAuthClientRecord {
     pub secret: String,
     pub redirect: String,
 }
+#[derive(Debug, FromRow)]
+pub struct OAuthGrantClientRecord {
+    pub id: i64,
+    pub secret: Option<String>,
+    pub password_client: bool,
+    pub revoked: bool,
+}
+
+#[derive(Debug, FromRow)]
+pub struct OAuthRefreshRecord {
+    pub user_id: Option<i64>,
+    pub client_id: i64,
+    pub scopes: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum OAuthClientDeleteOutcome {
     NotFound,
@@ -3341,6 +3356,195 @@ impl DatabasePool {
             .fetch_optional(pool)
             .await?),
         }
+    }
+
+    pub async fn oauth_scopes(&self, prefix: &str) -> Result<Vec<String>, sqlx::Error> {
+        let sql = format!("SELECT name FROM {prefix}scopes ORDER BY name");
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                .fetch_all(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                .fetch_all(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                .fetch_all(pool)
+                .await?),
+        }
+    }
+
+    pub async fn oauth_grant_client(
+        &self,
+        prefix: &str,
+        client_id: i64,
+    ) -> Result<Option<OAuthGrantClientRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, secret, password_client, revoked \
+                 FROM {prefix}oauth_clients WHERE id = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(id AS SIGNED) AS id, secret, password_client, revoked \
+                 FROM {prefix}oauth_clients WHERE id = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, secret, password_client, revoked \
+                 FROM {prefix}oauth_clients WHERE id = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthGrantClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthGrantClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthGrantClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn oauth_refresh_token(
+        &self,
+        prefix: &str,
+        refresh_token_id: &str,
+    ) -> Result<Option<OAuthRefreshRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT a.user_id, CAST(a.client_id AS BIGINT) AS client_id, a.scopes \
+                 FROM {prefix}oauth_refresh_tokens r \
+                 INNER JOIN {prefix}oauth_access_tokens a ON a.id = r.access_token_id \
+                 WHERE r.id = ? AND r.revoked = FALSE AND r.expires_at > CURRENT_TIMESTAMP LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT a.user_id, CAST(a.client_id AS SIGNED) AS client_id, a.scopes \
+                 FROM {prefix}oauth_refresh_tokens r \
+                 INNER JOIN {prefix}oauth_access_tokens a ON a.id = r.access_token_id \
+                 WHERE r.id = ? AND r.revoked = FALSE AND r.expires_at > CURRENT_TIMESTAMP LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT a.user_id, CAST(a.client_id AS BIGINT) AS client_id, a.scopes \
+                 FROM {prefix}oauth_refresh_tokens r \
+                 INNER JOIN {prefix}oauth_access_tokens a ON a.id = r.access_token_id \
+                 WHERE r.id = $1 AND r.revoked = FALSE AND r.expires_at > CURRENT_TIMESTAMP LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthRefreshRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(refresh_token_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthRefreshRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(refresh_token_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthRefreshRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(refresh_token_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn issue_oauth_token_pair(
+        &self,
+        prefix: &str,
+        access_token_id: &str,
+        user_id: i64,
+        client_id: i64,
+        scopes: &str,
+        access_expires_at: &str,
+        refresh_token_id: &str,
+        refresh_expires_at: &str,
+        rotate_refresh_token_id: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let access_sql = if postgres {
+            format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES ($1,$2,$3,$4,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$5::TIMESTAMP)"
+            )
+        } else {
+            format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES (?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?)"
+            )
+        };
+        let refresh_sql = if postgres {
+            format!(
+                "INSERT INTO {prefix}oauth_refresh_tokens (id,access_token_id,revoked,expires_at) \
+                 VALUES ($1,$2,FALSE,$3::TIMESTAMP)"
+            )
+        } else {
+            format!(
+                "INSERT INTO {prefix}oauth_refresh_tokens (id,access_token_id,revoked,expires_at) \
+                 VALUES (?,?,FALSE,?)"
+            )
+        };
+        let revoke_sql = if postgres {
+            format!(
+                "UPDATE {prefix}oauth_refresh_tokens SET revoked = TRUE \
+                 WHERE id = $1 AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP"
+            )
+        } else {
+            format!(
+                "UPDATE {prefix}oauth_refresh_tokens SET revoked = TRUE \
+                 WHERE id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP"
+            )
+        };
+        macro_rules! issue_in_transaction {
+            ($pool:expr) => {{
+                let mut transaction = $pool.begin().await?;
+                if let Some(old_id) = rotate_refresh_token_id {
+                    let result = sqlx::query(sqlx::AssertSqlSafe(revoke_sql))
+                        .bind(old_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    if result.rows_affected() == 0 {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    }
+                }
+                sqlx::query(sqlx::AssertSqlSafe(access_sql))
+                    .bind(access_token_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .bind(access_expires_at)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(refresh_sql))
+                    .bind(refresh_token_id)
+                    .bind(access_token_id)
+                    .bind(refresh_expires_at)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => issue_in_transaction!(pool),
+            Self::MySql(pool) => issue_in_transaction!(pool),
+            Self::Postgres(pool) => issue_in_transaction!(pool),
+        }
+        Ok(true)
     }
 
     pub async fn registered_user_count_by_ip(

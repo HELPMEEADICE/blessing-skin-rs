@@ -278,6 +278,7 @@ dependencies = [
  "argon2",
  "askama",
  "axum",
+ "base64 0.22.1",
  "bcrypt",
  "chrono",
  "dotenvy",

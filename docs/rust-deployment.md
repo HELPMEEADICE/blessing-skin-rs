@@ -41,10 +41,11 @@ cargo build --locked --release
 | `APP_LOCALE` | 默认 `zh_CN` |
 | `APP_KEY` | 可选；设置后用于签发网页登录 session。切换时用户需要重新登录 |
 | `PASSPORT_PUBLIC_KEY` | 可选；公钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-public.key` |
+| `PASSPORT_PRIVATE_KEY` | 签发 OAuth 令牌所需；私钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-private.key`。勿公开或更换旧私钥 |
 | `PWD_METHOD`, `SALT` | 兼容旧密码格式所需设置；保留旧站的原值 |
 | `MAIL_MAILER` | `smtp`、`log` 或 `array`；其余 SMTP 参数沿用 `MAIL_*` |
 
-Rust 直接读取旧数据库表和纹理文件，不会自动迁移 schema 或创建初始管理员。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；不要更换 Passport 密钥。Rust 当前没有 PHP 插件兼容层。
+Rust 直接读取旧数据库表和纹理文件，不会自动迁移 schema 或创建初始管理员。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 当前没有 PHP 插件兼容层。
 
 ## 本地启动
 

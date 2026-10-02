@@ -4,6 +4,7 @@ mod config;
 mod database;
 mod http;
 mod mailer;
+mod oauth;
 mod plugin_runtime;
 
 use std::{
@@ -24,6 +25,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub database: Option<DatabasePool>,
     pub passport_key: Option<DecodingKey>,
+    pub passport_signing_key: Option<EncodingKey>,
     pub session_key: Option<EncodingKey>,
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
@@ -63,10 +65,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    let passport_signing_key = config.passport_private_key.as_deref().and_then(|key| {
+        match EncodingKey::from_rsa_pem(key) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::error!(%error, "configured Passport private key is invalid");
+                None
+            }
+        }
+    });
     let app = http::router(AppState {
         config,
         database,
         passport_key,
+        passport_signing_key,
         session_key,
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
