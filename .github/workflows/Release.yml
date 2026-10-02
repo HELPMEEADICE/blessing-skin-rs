@@ -45,7 +45,7 @@ jobs:
           name="blessing-skin-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/blessing-skin-rs" "$name/"
-          cp LICENSE rust.env.example docs/rust-deployment.md "$name/"
+          cp LICENSE rust.env.example docs/rust-deployment.md docs/rust-install.md docs/plugin-migration.md "$name/"
           tar -czf "${name}.tar.gz" "$name"
           echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Package Windows release
@@ -56,7 +56,7 @@ jobs:
           $name = "blessing-skin-server-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/blessing-skin-rs.exe" "$name/"
-          Copy-Item LICENSE, rust.env.example, docs/rust-deployment.md $name/
+          Copy-Item LICENSE, rust.env.example, docs/rust-deployment.md, docs/rust-install.md, docs/plugin-migration.md $name/
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
           "archive=$name.zip" >> $env:GITHUB_OUTPUT
       - name: Upload release archive
