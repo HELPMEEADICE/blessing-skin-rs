@@ -2584,6 +2584,11 @@ struct TextureUploadPage {
     upload_award: i64,
     max_upload_kb: i64,
     content_policy: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Deserialize)]
@@ -7588,8 +7593,51 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
             return unavailable();
         }
     };
+    let texture_name_regexp = match database.option(prefix, "texture_name_regexp").await {
+        Ok(value) => value.filter(|value| !value.is_empty()),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture name rule");
+            return unavailable();
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let rule = match texture_name_regexp {
+        Some(regexp) if chinese => format!("本站已应用特殊的名称规则：{regexp}"),
+        Some(regexp) => format!("Custom name rules are applied as {regexp}"),
+        None if chinese => "材质名称应该小于 32 个字节且不能包含奇怪的符号".to_owned(),
+        None => "Less than 32 characters and must not contain any special one.".to_owned(),
+    };
+    let privacy_notice = if chinese {
+        format!("私密材质将会消耗更多的积分：每 KB 存储空间 {private_rate} 积分")
+    } else {
+        format!(
+            "It will spend you more scores for setting it as private. You will be charged {private_rate} scores for per KB storage."
+        )
+    };
+    let rendered_content_policy = render_notification_markdown(&content_policy);
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "skinlib/upload",
+        serde_json::json!({
+            "rule": rule,
+            "privacyNotice": privacy_notice,
+            "score": user.score,
+            "scorePublic": public_rate,
+            "scorePrivate": private_rate,
+            "closetItemCost": closet_cost,
+            "award": upload_award,
+            "contentPolicy": rendered_content_policy,
+        }),
+        i18n,
+    );
     let page = TextureUploadPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         user,
         public_rate,
@@ -7598,6 +7646,11 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
         upload_award,
         max_upload_kb,
         content_policy,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14544,9 +14597,42 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(upload_page.contains("/texture"));
-        assert!(upload_page.contains("Current score"));
+        assert!(upload_page.contains(r#"id="file-input""#));
+        assert!(upload_page.contains(r#"id="previewer""#));
+        assert!(upload_page.contains("http://localhost/app/style.012abcd.css"));
+        assert!(upload_page.contains("http://localhost/app/app.012abcd.js"));
         assert!(upload_page.contains("</title><style>"));
+        let encoded_upload_globals = upload_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let upload_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_upload_globals)
+            .unwrap();
+        let upload_globals: serde_json::Value =
+            serde_json::from_slice(&upload_globals_bytes).unwrap();
+        assert_eq!(upload_globals["route"], "skinlib/upload");
+        assert!(!upload_globals["extra"]["rule"].as_str().unwrap().is_empty());
+        assert!(upload_globals["extra"]["score"].as_i64().is_some());
+        assert_eq!(
+            upload_globals["extra"]["scorePublic"].as_i64().is_some(),
+            true
+        );
+        assert_eq!(
+            upload_globals["extra"]["scorePrivate"].as_i64().is_some(),
+            true
+        );
+        assert_eq!(
+            upload_globals["extra"]["closetItemCost"].as_i64().is_some(),
+            true
+        );
+        assert!(upload_globals["extra"]["award"].as_i64().is_some());
+        assert!(upload_globals["extra"]["privacyNotice"].is_string());
+        assert!(upload_globals["extra"]["contentPolicy"].is_string());
+        assert_eq!(upload_globals["i18n"]["auth"]["login"], "Log In");
 
         sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (21,'Private texture','steve','private-hash',8,8,0,'2026-10-02 15:00:00',0)")
             .execute(&pool)
