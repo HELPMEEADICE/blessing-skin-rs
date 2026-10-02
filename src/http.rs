@@ -21,12 +21,13 @@ use axum::{
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
+use pulldown_cmark::{Options, Parser, html as markdown_html};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
-    database::{DatabasePool, PlayerProfile, PlayerRecord, UserProfile},
+    database::{DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, UserProfile},
 };
 
 pub fn router(state: AppState) -> Router {
@@ -40,6 +41,8 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/api/user", get(api_user))
+        .route("/api/user/notifications", get(api_user_notifications))
+        .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players))
         .route("/{profile}", get(player_json))
         .route("/csl/{profile}", get(player_json))
@@ -474,6 +477,104 @@ async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response
             unavailable()
         }
     }
+}
+
+async fn api_user_notifications(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Notification.Read") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .unread_notifications(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(notifications) => Json(notification_summaries(notifications)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list unread notifications");
+            unavailable()
+        }
+    }
+}
+
+async fn api_read_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Notification.Read") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .read_notification(&state.config.database.table_prefix, identity.user_id, &id)
+        .await
+    {
+        Ok(Some(notification)) => notification_detail(notification),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Notification not found." })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read notification");
+            unavailable()
+        }
+    }
+}
+
+fn notification_summaries(notifications: Vec<NotificationRecord>) -> Vec<serde_json::Value> {
+    notifications
+        .into_iter()
+        .map(|notification| {
+            let data = serde_json::from_str::<serde_json::Value>(&notification.data)
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "id": notification.id,
+                "title": data.get("title").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn notification_detail(notification: NotificationRecord) -> Response {
+    let data = serde_json::from_str::<serde_json::Value>(&notification.data)
+        .unwrap_or(serde_json::Value::Null);
+    let title = data
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let content = data
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "title": title,
+        "content": render_notification_markdown(content),
+        "time": notification.created_at,
+    }))
+    .into_response()
+}
+
+fn render_notification_markdown(markdown: &str) -> String {
+    let parser = Parser::new_ext(
+        markdown,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    );
+    let mut html = String::with_capacity(markdown.len().saturating_mul(2));
+    markdown_html::push_html(&mut html, parser);
+    ammonia::clean(&html)
 }
 
 async fn api_players(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1119,6 +1220,52 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("Max-Age=0")
+        );
+    }
+
+    #[test]
+    fn renders_github_flavored_notification_markdown_without_unsafe_html() {
+        use super::render_notification_markdown;
+
+        let html = render_notification_markdown(
+            "## Notice
+
+~~old~~ **new**
+
+|a|b|
+|-|-|
+|1|2|
+
+<script>alert(1)</script>
+
+[bad](javascript:alert(1))",
+        );
+        assert!(html.contains("<h2>Notice</h2>"));
+        assert!(html.contains("<del>old</del>"));
+        assert!(html.contains("<strong>new</strong>"));
+        assert!(html.contains("<table>"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("alert(1)"));
+    }
+
+    #[tokio::test]
+    async fn notification_detail_keeps_the_legacy_json_fields() {
+        use axum::body::to_bytes;
+
+        let response = super::notification_detail(crate::database::NotificationRecord {
+            id: "notice-id".to_owned(),
+            data: r#"{"title":"Site notice","content":"Hello **skin**"}"#.to_owned(),
+            created_at: "2026-10-01 10:00:00".to_owned(),
+        });
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["title"], "Site notice");
+        assert_eq!(value["time"], "2026-10-01 10:00:00");
+        assert!(
+            value["content"]
+                .as_str()
+                .unwrap()
+                .contains("<strong>skin</strong>")
         );
     }
 }

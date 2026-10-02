@@ -65,6 +65,12 @@ pub struct PasswordCredential {
     pub password: String,
     pub permission: i32,
 }
+#[derive(Debug, FromRow)]
+pub struct NotificationRecord {
+    pub id: String,
+    pub data: String,
+    pub created_at: String,
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -325,6 +331,142 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn unread_notifications(
+        &self,
+        prefix: &str,
+        user_id: i64,
+    ) -> Result<Vec<NotificationRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT id, data, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at \
+                 FROM {prefix}notifications WHERE notifiable_type = $1 AND notifiable_id = $2 \
+                 AND read_at IS NULL ORDER BY created_at DESC"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT id, data, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at \
+                 FROM {prefix}notifications WHERE notifiable_type = ? AND notifiable_id = ? \
+                 AND read_at IS NULL ORDER BY created_at DESC"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT id, data, CAST(created_at AS TEXT) AS created_at \
+                 FROM {prefix}notifications WHERE notifiable_type = ? AND notifiable_id = ? \
+                 AND read_at IS NULL ORDER BY created_at DESC"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
+    pub async fn read_notification(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        id: &str,
+    ) -> Result<Option<NotificationRecord>, sqlx::Error> {
+        let select_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT id, data, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at \
+                 FROM {prefix}notifications WHERE id = $1 AND notifiable_type = $2 \
+                 AND notifiable_id = $3 AND read_at IS NULL LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT id, data, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at \
+                 FROM {prefix}notifications WHERE id = ? AND notifiable_type = ? \
+                 AND notifiable_id = ? AND read_at IS NULL LIMIT 1"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT id, data, CAST(created_at AS TEXT) AS created_at \
+                 FROM {prefix}notifications WHERE id = ? AND notifiable_type = ? \
+                 AND notifiable_id = ? AND read_at IS NULL LIMIT 1"
+            ),
+        };
+        let notification = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, NotificationRecord>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(id)
+                    .bind("App\\Models\\User")
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some(notification) = notification else {
+            return Ok(None);
+        };
+
+        let update_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}notifications SET read_at = CURRENT_TIMESTAMP \
+                 WHERE id = $1 AND notifiable_type = $2 AND notifiable_id = $3 AND read_at IS NULL"
+            ),
+            _ => format!(
+                "UPDATE {prefix}notifications SET read_at = CURRENT_TIMESTAMP \
+                 WHERE id = ? AND notifiable_type = ? AND notifiable_id = ? AND read_at IS NULL"
+            ),
+        };
+        let updated_rows = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(id)
+                .bind("App\\Models\\User")
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(id)
+                .bind("App\\Models\\User")
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(id)
+                .bind("App\\Models\\User")
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        Ok((updated_rows > 0).then_some(notification))
+    }
+
     pub async fn credentials_by_email(
         &self,
         prefix: &str,
@@ -411,6 +553,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE bs_notifications (id TEXT PRIMARY KEY, type TEXT NOT NULL, notifiable_type TEXT NOT NULL, notifiable_id INTEGER NOT NULL, data TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE bs_oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
             .execute(&pool)
             .await
@@ -436,6 +582,24 @@ mod tests {
             .await
             .unwrap();
 
+        let notice_type = "App\\Models\\Notifications\\SiteMessage";
+        let notifiable_type = "App\\Models\\User";
+        for (id, uid, read_at) in [
+            ("notice-unread", 7_i64, None),
+            ("notice-other-user", 8_i64, None),
+            ("notice-read", 7_i64, Some("2026-10-01 11:00:00")),
+        ] {
+            sqlx::query("INSERT INTO bs_notifications (id,type,notifiable_type,notifiable_id,data,read_at,created_at,updated_at) VALUES (?,?,?, ?, ?, ?, '2026-10-01 10:00:00', '2026-10-01 10:00:00')")
+                .bind(id)
+                .bind(notice_type)
+                .bind(notifiable_type)
+                .bind(uid)
+                .bind(r#"{"title":"Site notice","content":"Hello **skin**"}"#)
+                .bind(read_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let database = DatabasePool::Sqlite(pool);
         let profile = database
             .player_profile("bs_", "Alex")
@@ -451,6 +615,32 @@ mod tests {
         assert_eq!(players[0].tid_skin, 11);
         assert_eq!(players[0].tid_cape, 12);
         assert_eq!(players[0].last_modified, "2026-10-02 12:00:00");
+        let unread = database.unread_notifications("bs_", 7).await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, "notice-unread");
+        let marked_read = database
+            .read_notification("bs_", 7, "notice-unread")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            marked_read.data,
+            r#"{"title":"Site notice","content":"Hello **skin**"}"#
+        );
+        assert!(
+            database
+                .unread_notifications("bs_", 7)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .read_notification("bs_", 8, "notice-unread")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let email_credential = database
             .credentials_by_email("bs_", "alex@example.test")
             .await
