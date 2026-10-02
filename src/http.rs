@@ -66,6 +66,7 @@ pub fn router(state: AppState) -> Router {
             put(oauth_client_update).delete(oauth_client_delete),
         )
         .route("/user", get(web_dashboard))
+        .route("/user/notifications/{id}", post(web_read_notification))
         .route("/user/player", get(web_player_page).post(web_add_player))
         .route("/user/player/list", get(web_player_list))
         .route("/user/player/{pid}/name", put(web_rename_player))
@@ -1037,7 +1038,13 @@ struct DashboardPage {
     site_name: String,
     user: UserProfile,
     players: Vec<PlayerRecord>,
+    notifications: Vec<DashboardNotification>,
     locale: String,
+}
+
+struct DashboardNotification {
+    id: String,
+    title: String,
 }
 
 #[derive(Template)]
@@ -1329,10 +1336,35 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let notifications = match database
+        .unread_notifications(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(notifications) => notifications
+            .into_iter()
+            .map(|notification| {
+                let data = serde_json::from_str::<serde_json::Value>(&notification.data)
+                    .unwrap_or(serde_json::Value::Null);
+                DashboardNotification {
+                    id: notification.id,
+                    title: data
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            })
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to load dashboard notifications");
+            return unavailable();
+        }
+    };
     let page = DashboardPage {
         site_name: site_name(&state).await,
         user,
         players,
+        notifications,
         locale: state.config.locale.clone(),
     };
     match page.render() {
@@ -1353,6 +1385,34 @@ async fn site_name(state: &AppState) -> String {
             .flatten()
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
+    }
+}
+
+async fn web_read_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return unauthenticated();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .read_notification(&state.config.database.table_prefix, user_id, &id)
+        .await
+    {
+        Ok(Some(notification)) => notification_detail(notification),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Notification not found." })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id, notification_id = %id, "failed to mark web notification as read");
+            unavailable()
+        }
     }
 }
 
@@ -8269,6 +8329,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE notifications (id TEXT PRIMARY KEY, type TEXT NOT NULL, notifiable_type TEXT NOT NULL, notifiable_id INTEGER NOT NULL, data TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE oauth_auth_codes (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
             .execute(&pool)
             .await
@@ -8440,6 +8504,13 @@ mod tests {
             "BCRYPT",
             ""
         ));
+        sqlx::query("INSERT INTO notifications (id,type,notifiable_type,notifiable_id,data,read_at,created_at,updated_at) VALUES (?,'App\\Notifications\\SiteMessage','App\\Models\\User',?,?,NULL,'2026-10-02 14:00:00','2026-10-02 14:00:00')")
+            .bind("welcome-1")
+            .bind(registered_user.0)
+            .bind(r#"{"title":"Welcome note","content":"**Hello**"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
         let registered_dashboard = app
             .clone()
             .oneshot(
@@ -8452,6 +8523,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registered_dashboard.status(), StatusCode::OK);
+        let registered_dashboard = String::from_utf8(
+            to_bytes(registered_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(registered_dashboard.contains("Welcome note"));
+        let read_notification = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/notifications/welcome-1",
+            None,
+        )
+        .await;
+        assert_eq!(read_notification.status(), StatusCode::OK);
+        let read_notification: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_notification.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_notification["title"], "Welcome note");
+        assert!(
+            read_notification["content"]
+                .as_str()
+                .unwrap()
+                .contains("<strong>Hello</strong>")
+        );
+        let reread_notification = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/notifications/welcome-1",
+            None,
+        )
+        .await;
+        assert_eq!(reread_notification.status(), StatusCode::NOT_FOUND);
 
         sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('require_verification','true'), ('score_per_player','10'), ('return_score','true')")
             .execute(&pool)
