@@ -72,6 +72,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/oauth/token", post(crate::oauth::token))
         .route(
+            "/oauth/tokens/{token_id}",
+            delete(crate::oauth::revoke_access_token),
+        )
+        .route(
             "/oauth/clients",
             get(oauth_clients_list).post(oauth_client_create),
         )

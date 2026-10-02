@@ -3461,6 +3461,62 @@ impl DatabasePool {
         }
     }
 
+    pub async fn revoke_oauth_access_token(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        token_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let access_sql = if postgres {
+            format!(
+                "UPDATE {prefix}oauth_access_tokens SET revoked = TRUE \
+                 WHERE id = $1 AND user_id = $2 AND revoked = FALSE"
+            )
+        } else {
+            format!(
+                "UPDATE {prefix}oauth_access_tokens SET revoked = TRUE \
+                 WHERE id = ? AND user_id = ? AND revoked = FALSE"
+            )
+        };
+        let refresh_sql = if postgres {
+            format!(
+                "UPDATE {prefix}oauth_refresh_tokens SET revoked = TRUE \
+                 WHERE access_token_id = $1 AND revoked = FALSE"
+            )
+        } else {
+            format!(
+                "UPDATE {prefix}oauth_refresh_tokens SET revoked = TRUE \
+                 WHERE access_token_id = ? AND revoked = FALSE"
+            )
+        };
+        macro_rules! revoke_in_transaction {
+            ($pool:expr) => {{
+                let mut transaction = $pool.begin().await?;
+                let result = sqlx::query(sqlx::AssertSqlSafe(access_sql))
+                    .bind(token_id)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                if result.rows_affected() == 0 {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(refresh_sql))
+                    .bind(token_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => revoke_in_transaction!(pool),
+            Self::MySql(pool) => revoke_in_transaction!(pool),
+            Self::Postgres(pool) => revoke_in_transaction!(pool),
+        }
+        Ok(true)
+    }
+
     pub async fn issue_oauth_token_pair(
         &self,
         prefix: &str,

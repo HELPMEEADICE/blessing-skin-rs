@@ -6,7 +6,7 @@ use std::{
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, PRAGMA},
@@ -60,6 +60,39 @@ struct PassportAccessTokenClaims {
     nbf: u64,
     scopes: Vec<String>,
     sub: String,
+}
+
+pub async fn revoke_access_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+) -> Response {
+    let user = match crate::http::authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    match database
+        .revoke_oauth_access_token(&state.config.database.table_prefix, user.uid, &token_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to revoke OAuth access token");
+            oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            )
+        }
+    }
 }
 
 pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -650,7 +683,7 @@ mod integration_tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use jsonwebtoken::{DecodingKey, EncodingKey};
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
     use serde_json::Value;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::{path::PathBuf, sync::Arc};
@@ -676,6 +709,22 @@ mod integration_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn session_cookie(user_id: i64, secret: &str) -> String {
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = crate::auth::WebSessionClaims {
+            sub: user_id.to_string(),
+            iat: now,
+            exp: now + 3600,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        format!("blessing_skin_session={token}")
+    }
+
     #[tokio::test]
     async fn passport_password_and_refresh_grants_issue_compatible_tokens() {
         let pool = SqlitePoolOptions::new()
@@ -683,7 +732,9 @@ mod integration_tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL, password TEXT NOT NULL, permission INTEGER NOT NULL)")
+        sqlx::query("CREATE TABLE users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL, nickname TEXT NOT NULL DEFAULT '', locale TEXT, score INTEGER NOT NULL DEFAULT 0, avatar INTEGER NOT NULL DEFAULT 0, password TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', permission INTEGER NOT NULL, last_sign_at TEXT NOT NULL DEFAULT '', register_at TEXT NOT NULL DEFAULT '', verified BOOLEAN NOT NULL DEFAULT 1, is_dark_mode BOOLEAN NOT NULL DEFAULT 0)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE options (id INTEGER PRIMARY KEY, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
             .execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE players (pid INTEGER PRIMARY KEY, uid INTEGER NOT NULL, name TEXT NOT NULL)")
             .execute(&pool).await.unwrap();
@@ -699,7 +750,7 @@ mod integration_tests {
             .execute(&pool).await.unwrap();
         let password = bcrypt::hash("correct horse", 4).unwrap();
         sqlx::query(
-            "INSERT INTO users (uid,email,password,permission) VALUES (7,'alex@example.test',?,1)",
+            "INSERT INTO users (uid,email,nickname,password,permission) VALUES (7,'alex@example.test','Alex',?,1),(8,'other@example.test','Other','unused',0)",
         )
         .bind(password)
         .execute(&pool)
@@ -710,6 +761,7 @@ mod integration_tests {
 
         let private_key = include_bytes!("../tests/fixtures/oauth-test-private.pem");
         let public_key = include_bytes!("../tests/fixtures/oauth-test-public.pem");
+        let session_secret = "test web session signing secret";
         let config = Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
@@ -725,7 +777,7 @@ mod integration_tests {
             passport_private_key: Some(private_key.to_vec()),
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
-            app_key: None,
+            app_key: Some(session_secret.to_owned()),
             mail: MailConfig::default(),
         };
         let app = http::router(AppState {
@@ -733,7 +785,7 @@ mod integration_tests {
             database: Some(DatabasePool::Sqlite(pool.clone())),
             passport_key: Some(DecodingKey::from_rsa_pem(public_key).unwrap()),
             passport_signing_key: Some(EncodingKey::from_rsa_pem(private_key).unwrap()),
-            session_key: None,
+            session_key: Some(EncodingKey::from_secret(session_secret.as_bytes())),
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
@@ -815,11 +867,66 @@ mod integration_tests {
             true
         );
 
+        let second_access = refreshed["access_token"].as_str().unwrap();
+        let second_claims = crate::auth::decode_access_token(
+            second_access,
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        let path = format!("/oauth/tokens/{}", second_claims.jti);
+        let other_owner = app
+            .clone()
+            .oneshot(
+                Request::delete(&path)
+                    .header("cookie", session_cookie(8, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_owner.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            sqlx::query_scalar::<_, bool>("SELECT revoked FROM oauth_access_tokens WHERE id = ?")
+                .bind(&second_claims.jti)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            false
+        );
+
+        let revoked = app
+            .clone()
+            .oneshot(
+                Request::delete(&path)
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            sqlx::query_scalar::<_, bool>("SELECT revoked FROM oauth_access_tokens WHERE id = ?")
+                .bind(&second_claims.jti)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, bool>("SELECT revoked FROM oauth_refresh_tokens WHERE id = ?")
+                .bind(second_refresh)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            true
+        );
+
         let reused_body = form(&[
             ("grant_type", "refresh_token"),
             ("client_id", "2"),
             ("client_secret", "client-secret"),
-            ("refresh_token", first_refresh),
+            ("refresh_token", second_refresh),
         ]);
         let response = app
             .oneshot(
