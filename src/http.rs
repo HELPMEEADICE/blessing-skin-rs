@@ -7,7 +7,7 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path as RoutePath, State},
+    extract::{Path as RoutePath, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/user", get(web_dashboard))
         .route("/api/user", get(api_user))
+        .route("/api/closet", get(api_closet))
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players).post(api_add_player))
@@ -1096,6 +1097,90 @@ fn legacy_option_bool(value: Option<&str>) -> bool {
         Some(_) => true,
     }
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClosetListQuery {
+    category: Option<String>,
+    q: Option<String>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+
+async fn api_closet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ClosetListQuery>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["Closet.Read", "Closet.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(6).max(1);
+    let category = query.category.as_deref().unwrap_or("skin");
+    let search = query
+        .q
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "0");
+    match database
+        .closet_items(
+            &state.config.database.table_prefix,
+            identity.user_id,
+            category,
+            search,
+            page,
+            per_page,
+        )
+        .await
+    {
+        Ok((items, total)) => {
+            let data = items.into_iter().map(closet_item_json).collect::<Vec<_>>();
+            let last_page = total.saturating_add(per_page - 1) / per_page;
+            let offset = page.saturating_sub(1).saturating_mul(per_page);
+            let from = (!data.is_empty()).then_some(offset + 1);
+            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
+            Json(serde_json::json!({
+                "current_page": page,
+                "data": data,
+                "last_page": last_page.max(1),
+                "per_page": per_page,
+                "from": from,
+                "to": to,
+                "total": total
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load user's texture closet");
+            unavailable()
+        }
+    }
+}
+
+fn closet_item_json(item: crate::database::ClosetTextureRecord) -> serde_json::Value {
+    serde_json::json!({
+        "tid": item.tid,
+        "name": item.name,
+        "type": item.texture_type,
+        "hash": item.hash,
+        "size": item.size,
+        "uploader": item.uploader,
+        "public": item.is_public,
+        "upload_at": item.upload_at,
+        "likes": item.likes,
+        "pivot": {
+            "user_uid": item.user_uid,
+            "texture_tid": item.texture_tid,
+            "item_name": item.item_name
+        }
+    })
+}
 async fn api_players(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let identity = match authenticate(&state, &headers).await {
         Ok(identity) => identity,
@@ -1531,6 +1616,29 @@ mod tests {
                 .as_array()
                 .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("cape")))
         );
+    }
+    #[test]
+    fn serializes_legacy_closet_item_texture_and_pivot_fields() {
+        let item = super::closet_item_json(crate::database::ClosetTextureRecord {
+            tid: 13,
+            name: "Other skin".to_owned(),
+            texture_type: "alex".to_owned(),
+            hash: "skin-hash".to_owned(),
+            size: 10,
+            uploader: 8,
+            is_public: true,
+            upload_at: "2026-10-01 10:02:00".to_owned(),
+            likes: 2,
+            user_uid: 7,
+            texture_tid: 13,
+            item_name: Some("Saved name".to_owned()),
+        });
+        assert_eq!(item["tid"], 13);
+        assert_eq!(item["type"], "alex");
+        assert_eq!(item["public"], true);
+        assert_eq!(item["pivot"]["user_uid"], 7);
+        assert_eq!(item["pivot"]["texture_tid"], 13);
+        assert_eq!(item["pivot"]["item_name"], "Saved name");
     }
     #[test]
     fn validates_texture_hashes_before_joining_them_to_storage_paths() {

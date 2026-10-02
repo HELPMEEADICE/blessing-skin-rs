@@ -71,6 +71,21 @@ pub struct NotificationRecord {
     pub data: String,
     pub created_at: String,
 }
+#[derive(Debug, FromRow)]
+pub struct ClosetTextureRecord {
+    pub tid: i64,
+    pub name: String,
+    pub texture_type: String,
+    pub hash: String,
+    pub size: i64,
+    pub uploader: i64,
+    pub is_public: bool,
+    pub upload_at: String,
+    pub likes: i64,
+    pub user_uid: i64,
+    pub texture_tid: i64,
+    pub item_name: Option<String>,
+}
 #[derive(Debug)]
 pub enum PlayerRenameOutcome {
     NotFound,
@@ -486,6 +501,128 @@ impl DatabasePool {
         })
     }
 
+    pub async fn closet_items(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        category: &str,
+        search: Option<&str>,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<ClosetTextureRecord>, i64), sqlx::Error> {
+        let is_postgres = matches!(self, Self::Postgres(_));
+        let search_marker = if is_postgres { "$3" } else { "?" };
+        let enabled_marker = if is_postgres { "$2" } else { "?" };
+        let user_marker = if is_postgres { "$1" } else { "?" };
+        let where_sql = if category == "cape" {
+            format!(
+                "c.user_uid = {user_marker} AND t.type = 'cape' \
+                 AND ({enabled_marker} = {} OR c.item_name LIKE {search_marker})",
+                if is_postgres { "FALSE" } else { "0" }
+            )
+        } else {
+            format!(
+                "c.user_uid = {user_marker} AND t.type IN ('steve', 'alex') \
+                 AND ({enabled_marker} = {} OR c.item_name LIKE {search_marker})",
+                if is_postgres { "FALSE" } else { "0" }
+            )
+        };
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {prefix}textures t \
+             INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+             WHERE {where_sql}"
+        );
+        let total = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+
+        let mut next_marker = if is_postgres { 4 } else { 0 };
+        let limit_marker = if is_postgres {
+            let marker = format!("{}{}", "$", next_marker);
+            next_marker += 1;
+            marker
+        } else {
+            "?".to_owned()
+        };
+        let offset_marker = if is_postgres {
+            format!("{}{}", "$", next_marker)
+        } else {
+            "?".to_owned()
+        };
+        let upload_at = match self {
+            Self::MySql(_) => "DATE_FORMAT(t.upload_at, '%Y-%m-%d %H:%i:%s')",
+            Self::Postgres(_) => "CAST(t.upload_at AS TEXT)",
+            Self::Sqlite(_) => "CAST(t.upload_at AS TEXT)",
+        };
+        let rows_sql = format!(
+            "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, t.hash, \
+             CAST(t.size AS BIGINT) AS size, CAST(t.uploader AS BIGINT) AS uploader, \
+             t.public AS is_public, {upload_at} AS upload_at, CAST(t.likes AS BIGINT) AS likes, \
+             CAST(c.user_uid AS BIGINT) AS user_uid, CAST(c.texture_tid AS BIGINT) AS texture_tid, \
+             c.item_name \
+             FROM {prefix}textures t \
+             INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+             WHERE {where_sql} ORDER BY c.texture_tid DESC \
+             LIMIT {limit_marker} OFFSET {offset_marker}"
+        );
+        let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, ClosetTextureRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, ClosetTextureRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, ClosetTextureRecord>(sqlx::AssertSqlSafe(rows_sql))
+                    .bind(user_id)
+                    .bind(search.is_some())
+                    .bind(format!("%{}%", search.unwrap_or_default()))
+                    .bind(per_page)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok((rows, total))
+    }
     pub async fn add_player(
         &self,
         prefix: &str,
@@ -1177,7 +1314,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE bs_textures (tid INTEGER PRIMARY KEY, type TEXT NOT NULL, hash TEXT NOT NULL)")
+        sqlx::query("CREATE TABLE bs_textures (tid INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader INTEGER NOT NULL, public BOOLEAN NOT NULL, upload_at TEXT NOT NULL, likes INTEGER NOT NULL)")
             .execute(&pool)
             .await
             .unwrap();
@@ -1209,7 +1346,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_textures (tid, type, hash) VALUES (11, 'alex', 'skin-hash'), (12, 'cape', 'cape-hash'), (13, 'alex', 'not-in-closet')")
+        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Skin', 'alex', 'skin-hash', 8, 7, 1, '2026-10-01 10:00:00', 1), (12, 'Cape', 'cape', 'cape-hash', 9, 7, 1, '2026-10-01 10:01:00', 1), (13, 'Other skin', 'alex', 'not-in-closet', 10, 8, 1, '2026-10-01 10:02:00', 0)")
             .execute(&pool)
             .await
             .unwrap();
@@ -1240,7 +1377,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let database = DatabasePool::Sqlite(pool);
+        let database = DatabasePool::Sqlite(pool.clone());
         let profile = database
             .player_profile("bs_", "Alex")
             .await
@@ -1426,6 +1563,39 @@ mod tests {
                 .unwrap(),
             super::PlayerDeleteOutcome::NotFound
         ));
+        sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 13, 'Second skin')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (skin_page, skin_total) = database
+            .closet_items("bs_", 7, "skin", None, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(skin_total, 2);
+        assert_eq!(skin_page.len(), 1);
+        assert_eq!(skin_page[0].tid, 13);
+        assert_eq!(skin_page[0].user_uid, 7);
+        assert_eq!(skin_page[0].texture_tid, 13);
+        assert_eq!(skin_page[0].item_name.as_deref(), Some("Second skin"));
+        assert!(skin_page[0].is_public);
+        let (next_skin_page, next_skin_total) = database
+            .closet_items("bs_", 7, "skin", None, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(next_skin_total, 2);
+        assert_eq!(next_skin_page[0].tid, 11);
+        let (searched_items, searched_total) = database
+            .closet_items("bs_", 7, "skin", Some("Second"), 1, 6)
+            .await
+            .unwrap();
+        assert_eq!(searched_total, 1);
+        assert_eq!(searched_items[0].tid, 13);
+        let (cape_items, cape_total) = database
+            .closet_items("bs_", 7, "cape", None, 1, 6)
+            .await
+            .unwrap();
+        assert_eq!(cape_total, 1);
+        assert_eq!(cape_items[0].texture_type, "cape");
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
