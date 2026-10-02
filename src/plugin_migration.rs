@@ -314,7 +314,7 @@ fn write_scaffold(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"Rust/WASM port scaffold for a legacy Blessing Skin plugin\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nwit-bindgen = \"0.62\"\n\n[profile.release]\nlto = true\nopt-level = \"s\"\ncodegen-units = 1\npanic = \"abort\"\n"
     );
     let readme = format!(
-        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe host controls which WASI capabilities and versioned host interfaces are linked. Keep filesystem, network, and database access out of the component unless the host grants a specific capability.\n"
+        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports one versioned, bounded logging capability. The host does not grant filesystem, network, database, or WASI access.\n"
     );
     let source = r#"mod bindings {
     wit_bindgen::generate!({
@@ -330,6 +330,10 @@ impl bindings::exports::blessing_skin::plugin::lifecycle::Guest for Component {
         if !host_api_version.starts_with("1.") {
             return Err(format!("unsupported host API: {host_api_version}"));
         }
+        bindings::blessing_skin::plugin::host::log(
+            "info".to_owned(),
+            "plugin initialized".to_owned(),
+        )?;
         Ok(())
     }
 
@@ -340,12 +344,17 @@ bindings::export!(Component with_types_in bindings);
 "#;
     let wit = r#"package blessing-skin:plugin@1.0.0;
 
+interface host {
+    log: func(level: string, message: string) -> result<_, string>;
+}
+
 interface lifecycle {
     initialize: func(host-api-version: string) -> result<_, string>;
     shutdown: func();
 }
 
 world plugin {
+    import host;
     export lifecycle;
 }
 "#;
@@ -478,7 +487,10 @@ mod tests {
         let source = fs::read_to_string(output.join("src/lib.rs")).unwrap();
         assert!(manifest.contains("name = \"fancy-addon-plugin\""));
         assert!(wit.contains("blessing-skin:plugin@1.0.0"));
+        assert!(wit.contains("interface host"));
+        assert!(wit.contains("import host;"));
         assert!(source.contains("blessing_skin::plugin::lifecycle::Guest"));
+        assert!(source.contains("blessing_skin::plugin::host::log"));
         assert!(output.join("migration-report.json").is_file());
         assert!(write_scaffold(&output, &report, &json).is_err());
         fs::remove_dir_all(root).unwrap();

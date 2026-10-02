@@ -5,17 +5,20 @@ use std::{
 };
 
 use wasmtime::{
-    Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
+    Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
 const HOST_API_VERSION: &str = "1.0.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
+const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+const PLUGIN_LOG_MESSAGE_LIMIT: usize = 4 * 1024;
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 
 struct PluginStore {
+    name: String,
     limits: StoreLimits,
 }
 
@@ -109,6 +112,11 @@ impl PluginRuntime {
         }
         let component = Component::new(engine, bytes)?;
         let state = PluginStore {
+            name: path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("plugin")
+                .to_owned(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(COMPONENT_MEMORY_LIMIT)
                 .table_elements(10_000)
@@ -121,9 +129,19 @@ impl PluginRuntime {
         store.limiter(|state| &mut state.limits);
         store.set_fuel(COMPONENT_FUEL)?;
 
-        // The empty linker is the capability boundary: WASI, filesystem, network,
-        // database, and undocumented host imports are unavailable to components.
-        let instance = Linker::new(engine).instantiate(&mut store, &component)?;
+        // Only the versioned logger is linked. WASI, filesystem, network, database,
+        // and undocumented host imports remain unavailable to components.
+        let mut linker = Linker::new(engine);
+        linker.instance(HOST_LOG_INTERFACE)?.func_wrap(
+            "log",
+            |store: StoreContextMut<'_, PluginStore>,
+             (level, message): (String, String)|
+             -> wasmtime::Result<(Result<(), String>,)> {
+                let result = log_plugin_message(&store.data().name, &level, &message);
+                Ok((result,))
+            },
+        )?;
+        let instance = linker.instantiate(&mut store, &component)?;
         let lifecycle = instance
             .get_export_index(&mut store, None, LIFECYCLE_INTERFACE)
             .ok_or_else(|| {
@@ -189,6 +207,23 @@ impl PluginRuntime {
     }
 }
 
+fn log_plugin_message(plugin: &str, level: &str, message: &str) -> Result<(), String> {
+    if message.len() > PLUGIN_LOG_MESSAGE_LIMIT {
+        return Err(format!(
+            "plugin log message exceeds the {PLUGIN_LOG_MESSAGE_LIMIT}-byte limit"
+        ));
+    }
+    match level {
+        "trace" => tracing::trace!(plugin = %plugin, message = %message, "WASM plugin log"),
+        "debug" => tracing::debug!(plugin = %plugin, message = %message, "WASM plugin log"),
+        "info" => tracing::info!(plugin = %plugin, message = %message, "WASM plugin log"),
+        "warn" => tracing::warn!(plugin = %plugin, message = %message, "WASM plugin log"),
+        "error" => tracing::error!(plugin = %plugin, message = %message, "WASM plugin log"),
+        _ => return Err("plugin log level must be trace, debug, info, warn, or error".into()),
+    }
+    Ok(())
+}
+
 fn stop_plugin(plugin: &mut LoadedPlugin) -> Result<(), Box<dyn Error>> {
     plugin.store.set_fuel(COMPONENT_FUEL)?;
     let shutdown_export = plugin
@@ -244,7 +279,7 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::PluginRuntime;
+    use super::{PLUGIN_LOG_MESSAGE_LIMIT, PluginRuntime, log_plugin_message};
     use std::{
         fs,
         path::PathBuf,
@@ -272,6 +307,16 @@ mod tests {
         assert!(!super::valid_plugin_name("../outside"));
         assert!(!super::valid_plugin_name("folder/plugin"));
         assert!(!super::valid_plugin_name(""));
+    }
+
+    #[test]
+    fn plugin_logger_accepts_known_levels_and_bounds_messages() {
+        assert!(log_plugin_message("fixture", "info", "ready").is_ok());
+        assert!(log_plugin_message("fixture", "notice", "ready").is_err());
+        assert!(
+            log_plugin_message("fixture", "info", &"x".repeat(PLUGIN_LOG_MESSAGE_LIMIT + 1))
+                .is_err()
+        );
     }
 
     #[test]
