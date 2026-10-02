@@ -100,7 +100,10 @@ pub fn router(state: AppState) -> Router {
             "/user/closet/{tid}",
             put(web_rename_closet_item).delete(web_remove_closet_item),
         )
-        .route("/user/profile", post(user_profile_update))
+        .route(
+            "/user/profile",
+            get(user_profile_page).post(user_profile_update),
+        )
         .route("/user/profile/avatar", post(user_set_avatar))
         .route("/user/dark-mode", put(toggle_user_dark_mode))
         .route("/user/score-info", get(user_score_info))
@@ -264,6 +267,15 @@ struct UserReportView {
     reason: String,
     status: i32,
     report_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "user_profile.html")]
+struct UserProfilePage {
+    site_name: String,
+    locale: String,
+    user: UserProfile,
+    allow_delete: bool,
 }
 
 #[derive(Template)]
@@ -2273,6 +2285,26 @@ pub(crate) async fn site_name(state: &AppState) -> String {
             .flatten()
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
+    }
+}
+
+async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let page = UserProfilePage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        allow_delete: user.permission < 1,
+        user,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render user profile page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -10248,6 +10280,20 @@ mod tests {
         .unwrap();
         assert!(registered_dashboard.contains("Welcome note"));
         assert!(registered_dashboard.contains("/user/reports"));
+        assert!(registered_dashboard.contains("/user/profile"));
+        let profile_page =
+            session_request(&app, &registered_cookie, "GET", "/user/profile", None).await;
+        assert_eq!(profile_page.status(), StatusCode::OK);
+        let profile_html = String::from_utf8(
+            to_bytes(profile_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(profile_html.contains("first@example.test"));
+        assert!(profile_html.contains("data-action=\"nickname\""));
+        assert!(profile_html.contains("avatar-form"));
         let read_notification = session_request(
             &app,
             &registered_cookie,
