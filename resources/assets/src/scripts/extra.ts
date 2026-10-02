@@ -4,7 +4,7 @@ export function getExtraData(): Record<string, any> {
   if (jsonElement) {
     return JSON.parse(jsonElement.textContent ?? '{}')
   } else {
-    return {}
+    return blessing.extra ?? {}
   }
 }
 
