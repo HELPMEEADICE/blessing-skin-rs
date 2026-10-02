@@ -127,6 +127,12 @@ pub enum TexturePrivacyOutcome {
     InsufficientScore,
     Updated { is_public: bool },
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum TextureUploadOutcome {
+    AlreadyUploaded(i64),
+    InsufficientScore,
+    Uploaded(i64),
+}
 #[derive(Debug)]
 pub enum PlayerRenameOutcome {
     NotFound,
@@ -554,6 +560,214 @@ impl DatabasePool {
         }
         Ok(TexturePrivacyOutcome::Updated { is_public })
     }
+    pub async fn upload_texture(
+        &self,
+        prefix: &str,
+        name: &str,
+        texture_type: &str,
+        hash: &str,
+        size: i64,
+        uploader_id: i64,
+        is_public: bool,
+        score_cost: i64,
+    ) -> Result<TextureUploadOutcome, sqlx::Error> {
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql =
+                    format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?");
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                };
+                let duplicate_sql = format!(
+                    "SELECT tid FROM {prefix}textures WHERE hash = ? \
+                     AND (public = TRUE OR uploader = ?) LIMIT 1"
+                );
+                if let Some(duplicate_tid) =
+                    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                        .bind(hash)
+                        .bind(uploader_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::AlreadyUploaded(duplicate_tid));
+                }
+                if score < score_cost {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                }
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}textures \
+                     (name, type, hash, size, uploader, public, upload_at, likes) \
+                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)"
+                );
+                let inserted = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(name)
+                    .bind(texture_type)
+                    .bind(hash)
+                    .bind(size)
+                    .bind(uploader_id)
+                    .bind(is_public)
+                    .execute(&mut *transaction)
+                    .await?;
+                let tid = inserted.last_insert_rowid();
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score - ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_cost)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let closet_sql = format!(
+                    "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (?, ?, ?)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(uploader_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(TextureUploadOutcome::Uploaded(tid));
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ? FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                };
+                let duplicate_sql = format!(
+                    "SELECT CAST(tid AS SIGNED) FROM {prefix}textures WHERE hash = ? \
+                     AND (public = TRUE OR uploader = ?) LIMIT 1"
+                );
+                if let Some(duplicate_tid) =
+                    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                        .bind(hash)
+                        .bind(uploader_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::AlreadyUploaded(duplicate_tid));
+                }
+                if score < score_cost {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                }
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}textures \
+                     (name, type, hash, size, uploader, public, upload_at, likes) \
+                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)"
+                );
+                let inserted = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(name)
+                    .bind(texture_type)
+                    .bind(hash)
+                    .bind(size)
+                    .bind(uploader_id)
+                    .bind(is_public)
+                    .execute(&mut *transaction)
+                    .await?;
+                let tid = inserted.last_insert_id() as i64;
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score - ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_cost)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let closet_sql = format!(
+                    "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (?, ?, ?)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(uploader_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(TextureUploadOutcome::Uploaded(tid));
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1 FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                };
+                let duplicate_sql = format!(
+                    "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = $1 \
+                     AND (public = TRUE OR uploader = $2) LIMIT 1"
+                );
+                if let Some(duplicate_tid) =
+                    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                        .bind(hash)
+                        .bind(uploader_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::AlreadyUploaded(duplicate_tid));
+                }
+                if score < score_cost {
+                    transaction.rollback().await?;
+                    return Ok(TextureUploadOutcome::InsufficientScore);
+                }
+                let insert_sql = format!(
+                    "INSERT INTO {prefix}textures \
+                     (name, type, hash, size, uploader, public, upload_at, likes) \
+                     VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, 1) \
+                     RETURNING CAST(tid AS BIGINT)"
+                );
+                let tid = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(name)
+                    .bind(texture_type)
+                    .bind(hash)
+                    .bind(size)
+                    .bind(uploader_id)
+                    .bind(is_public)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score - $1 WHERE uid = $2");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_cost)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let closet_sql = format!(
+                    "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES ($1, $2, $3)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(uploader_id)
+                    .bind(tid)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(TextureUploadOutcome::Uploaded(tid));
+            }
+        }
+    }
     pub async fn delete_texture(
         &self,
         prefix: &str,
@@ -951,6 +1165,30 @@ impl DatabasePool {
             .bind(tid)
             .fetch_optional(pool)
             .await?),
+        }
+    }
+    pub async fn texture_hash_reference_count(
+        &self,
+        prefix: &str,
+        hash: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = $1"),
+            _ => format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_one(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_one(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .fetch_one(pool)
+                .await?),
         }
     }
     pub async fn access_token(
@@ -3552,6 +3790,67 @@ mod tests {
                 .unwrap();
         assert_eq!(rewarded_user_score, 42);
         assert_eq!(refunded_uploader_score, 42);
+        assert_eq!(
+            database
+                .upload_texture("bs_", "duplicate", "alex", "not-in-closet", 10, 8, true, 1)
+                .await
+                .unwrap(),
+            super::TextureUploadOutcome::AlreadyUploaded(13)
+        );
+        assert_eq!(
+            database
+                .upload_texture("bs_", "too costly", "steve", "new-hash", 2, 7, true, 100)
+                .await
+                .unwrap(),
+            super::TextureUploadOutcome::InsufficientScore
+        );
+        let uploaded_tid = match database
+            .upload_texture("bs_", "New upload", "alex", "new-hash", 2, 7, true, 5)
+            .await
+            .unwrap()
+        {
+            super::TextureUploadOutcome::Uploaded(tid) => tid,
+            other => panic!("unexpected texture upload outcome: {other:?}"),
+        };
+        let uploaded_texture = database
+            .texture_info("bs_", uploaded_tid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploaded_texture.name, "New upload");
+        assert_eq!(uploaded_texture.texture_type, "alex");
+        assert_eq!(uploaded_texture.hash, "new-hash");
+        assert_eq!(uploaded_texture.size, 2);
+        assert!(uploaded_texture.is_public);
+        assert_eq!(
+            database
+                .upload_texture(
+                    "bs_",
+                    "different uploader",
+                    "steve",
+                    "new-hash",
+                    2,
+                    8,
+                    true,
+                    0
+                )
+                .await
+                .unwrap(),
+            super::TextureUploadOutcome::AlreadyUploaded(uploaded_tid)
+        );
+        let upload_closet_item: Option<String> = sqlx::query_scalar(
+            "SELECT item_name FROM bs_user_closet WHERE user_uid = 7 AND texture_tid = ?",
+        )
+        .bind(uploaded_tid)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(upload_closet_item.as_deref(), Some("New upload"));
+        let upload_score: i64 = sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(upload_score, 37);
         let shared_texture = database.texture_info("bs_", 15).await.unwrap().unwrap();
         assert!(
             !database

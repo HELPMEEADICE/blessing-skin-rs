@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::Cursor,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -8,7 +9,7 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path as RoutePath, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path as RoutePath, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
@@ -20,11 +21,13 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use image::{ImageFormat, ImageReader};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
 use pulldown_cmark::{Options, Parser, html as markdown_html};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::{
     AppState,
@@ -48,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
+        .route(
+            "/texture",
+            post(upload_texture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/texture/{tid}", get(skinlib_info).delete(delete_texture))
         .route("/texture/{tid}/name", put(rename_texture))
         .route("/texture/{tid}/type", put(update_texture_type))
@@ -1735,6 +1742,397 @@ async fn authenticated_web_user(
     Ok(user)
 }
 
+fn parse_legacy_form_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "(true)" => Some(true),
+        "0" | "false" | "(false)" => Some(false),
+        _ => None,
+    }
+}
+
+fn upload_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("name", true) => "材质名称为必填项且必须符合本站规则。",
+        ("name", false) => "The name field is required or does not match the configured rule.",
+        ("file", true) => "必须上传有效的 PNG 文件，且不能超过大小限制。",
+        ("file", false) => "The file must be a valid PNG and within the size limit.",
+        ("type", true) => "type 字段必须为 steve、alex 或 cape。",
+        ("type", false) => "The type field must be steve, alex, or cape.",
+        ("public", true) => "public 字段必须是布尔值。",
+        ("public", false) => "The public field must be true or false.",
+        _ => "The given field is invalid.",
+    };
+    let mut errors = serde_json::Map::new();
+    errors.insert(field.to_owned(), serde_json::json!([field_error]));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    if reader.format() != Some(ImageFormat::Png) {
+        return None;
+    }
+    reader.into_dimensions().ok()
+}
+
+fn sanitize_png(bytes: &[u8]) -> Result<Vec<u8>, image::ImageError> {
+    let image = image::load_from_memory_with_format(bytes, ImageFormat::Png)?;
+    let mut sanitized = Vec::new();
+    image.write_to(&mut Cursor::new(&mut sanitized), ImageFormat::Png)?;
+    Ok(sanitized)
+}
+
+fn valid_texture_dimensions(texture_type: &str, width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width % 64 == 0
+        && height % 32 == 0
+        && match texture_type {
+            "steve" => width == height || width == height.saturating_mul(2),
+            "alex" => width == height,
+            "cape" => width == height.saturating_mul(2),
+            _ => false,
+        }
+}
+
+fn upload_size_error(locale: &str, texture_type: &str, width: u32, height: u32) -> Response {
+    let message = if locale.starts_with("zh") {
+        let label = if texture_type == "cape" {
+            "披风"
+        } else {
+            "皮肤"
+        };
+        format!("不是有效的 {label} 文件（宽 {width}，高 {height}）")
+    } else {
+        let label = if texture_type == "cape" {
+            "cape"
+        } else {
+            "skin"
+        };
+        format!("Invalid {label} file (width {width}, height {height}).")
+    };
+    login_result(1, &message, None)
+}
+async fn upload_texture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let reporter = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let mut name = None;
+    let mut texture_type = None;
+    let mut public = None;
+    let mut file_bytes = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "invalid texture upload multipart body");
+                return upload_validation_error("file", &state.config.locale);
+            }
+        };
+        let Some(field_name) = field.name().map(str::to_owned) else {
+            continue;
+        };
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, field = field_name, "failed to read texture upload field");
+                return upload_validation_error(&field_name, &state.config.locale);
+            }
+        };
+        if field_name == "file" {
+            file_bytes = Some(bytes.to_vec());
+            continue;
+        }
+        let Ok(value) = String::from_utf8(bytes.to_vec()) else {
+            return upload_validation_error(&field_name, &state.config.locale);
+        };
+        match field_name.as_str() {
+            "name" => name = Some(value),
+            "type" => texture_type = Some(value),
+            "public" => public = Some(value),
+            _ => {}
+        }
+    }
+    let Some(name) = name
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return upload_validation_error("name", &state.config.locale);
+    };
+    let Some(file_bytes) = file_bytes.filter(|bytes: &Vec<u8>| !bytes.is_empty()) else {
+        return upload_validation_error("file", &state.config.locale);
+    };
+    let Some(texture_type) = texture_type else {
+        return upload_validation_error("type", &state.config.locale);
+    };
+    if !valid_texture_type(&texture_type) {
+        return upload_validation_error("type", &state.config.locale);
+    }
+    let Some(is_public) = public.as_deref().and_then(parse_legacy_form_bool) else {
+        return upload_validation_error("public", &state.config.locale);
+    };
+    let name_rule = match database
+        .option(&state.config.database.table_prefix, "texture_name_regexp")
+        .await
+    {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture name validation rule");
+            return unavailable();
+        }
+    };
+    if !name_rule.is_empty() {
+        if RegexBuilder::new(&name_rule).build().is_err() {
+            tracing::error!("invalid legacy texture name validation regex");
+            return unavailable();
+        }
+        if !valid_texture_name(&name, &name_rule) {
+            return upload_validation_error("name", &state.config.locale);
+        }
+    }
+    let max_upload_kb = match database
+        .option(&state.config.database.table_prefix, "max_upload_file_size")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1024)
+            .max(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read maximum texture upload size");
+            return unavailable();
+        }
+    };
+    if file_bytes.len() as u64 > max_upload_kb.saturating_mul(1024) as u64 {
+        return upload_validation_error("file", &state.config.locale);
+    }
+    let Some((width, height)) = png_dimensions(&file_bytes) else {
+        return upload_validation_error("file", &state.config.locale);
+    };
+    let max_width = match database
+        .option(&state.config.database.table_prefix, "max_texture_width")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(8192),
+        Err(error) => {
+            tracing::error!(%error, "failed to read maximum texture width");
+            return unavailable();
+        }
+    };
+    if width > max_width {
+        let message = if state.config.locale.starts_with("zh") {
+            format!("材质过宽（{width}px），本站允许的最大宽度为 {max_width}px")
+        } else {
+            format!("The texture is too wide ({width}px). Maximum width allowed is {max_width}px")
+        };
+        return login_result(1, &message, None);
+    }
+    if !valid_texture_dimensions(&texture_type, width, height) {
+        return upload_size_error(&state.config.locale, &texture_type, width, height);
+    }
+    let sanitized = match sanitize_png(&file_bytes) {
+        Ok(sanitized) => sanitized,
+        Err(error) => {
+            tracing::warn!(%error, "failed to decode uploaded PNG texture");
+            return upload_validation_error("file", &state.config.locale);
+        }
+    };
+    let hash = Sha256::digest(&sanitized)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let size_kb = ((sanitized.len() as i64).saturating_add(1023) / 1024).max(1);
+    let public_cost_per_kb = match database
+        .option(&state.config.database.table_prefix, "score_per_storage")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read public texture storage score");
+            return unavailable();
+        }
+    };
+    let private_cost_per_kb = match database
+        .option(
+            &state.config.database.table_prefix,
+            "private_score_per_storage",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(10),
+        Err(error) => {
+            tracing::error!(%error, "failed to read private texture storage score");
+            return unavailable();
+        }
+    };
+    let closet_cost = match database
+        .option(&state.config.database.table_prefix, "score_per_closet_item")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read closet item score");
+            return unavailable();
+        }
+    };
+    let award = match database
+        .option(
+            &state.config.database.table_prefix,
+            "score_award_per_texture",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture upload award");
+            return unavailable();
+        }
+    };
+    let storage_cost = if is_public {
+        public_cost_per_kb
+    } else {
+        private_cost_per_kb
+    };
+    let score_cost = size_kb
+        .saturating_mul(storage_cost)
+        .saturating_add(closet_cost)
+        .saturating_sub(award);
+    if reporter.score < score_cost {
+        return login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "积分不足"
+            } else {
+                "You don't have enough score to upload this texture."
+            },
+            None,
+        );
+    }
+    let file_path = state.config.textures_dir.join(&hash);
+    let file_was_missing = match tokio::fs::metadata(&file_path).await {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::error!(%error, hash, "failed to inspect texture file");
+            return unavailable();
+        }
+    };
+    if file_was_missing {
+        if let Err(error) = tokio::fs::create_dir_all(&state.config.textures_dir).await {
+            tracing::error!(%error, "failed to create texture storage directory");
+            return unavailable();
+        }
+        if let Err(error) = tokio::fs::write(&file_path, &sanitized).await {
+            tracing::error!(%error, hash, "failed to store sanitized texture file");
+            return unavailable();
+        }
+    }
+    match database
+        .upload_texture(
+            &state.config.database.table_prefix,
+            &name,
+            &texture_type,
+            &hash,
+            size_kb,
+            reporter.uid,
+            is_public,
+            score_cost,
+        )
+        .await
+    {
+        Ok(crate::database::TextureUploadOutcome::Uploaded(tid)) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("材质 {name} 上传成功")
+            } else {
+                format!("Texture {name} was uploaded successfully.")
+            };
+            login_result(0, &message, Some(serde_json::json!({ "tid": tid })))
+        }
+        Ok(crate::database::TextureUploadOutcome::AlreadyUploaded(tid)) => login_result(
+            2,
+            if state.config.locale.starts_with("zh") {
+                "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
+            } else {
+                "The texture is already uploaded by someone else. You can add it to your closet directly."
+            },
+            Some(serde_json::json!({ "tid": tid })),
+        ),
+        Ok(crate::database::TextureUploadOutcome::InsufficientScore) => {
+            cleanup_unreferenced_upload(&state, database, &hash, file_was_missing).await;
+            login_result(
+                1,
+                if state.config.locale.starts_with("zh") {
+                    "积分不足"
+                } else {
+                    "You don't have enough score to upload this texture."
+                },
+                None,
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, hash, "failed to create uploaded texture record");
+            cleanup_unreferenced_upload(&state, database, &hash, file_was_missing).await;
+            unavailable()
+        }
+    }
+}
+
+async fn cleanup_unreferenced_upload(
+    state: &AppState,
+    database: &DatabasePool,
+    hash: &str,
+    file_was_missing: bool,
+) {
+    if !file_was_missing {
+        return;
+    }
+    match database
+        .texture_hash_reference_count(&state.config.database.table_prefix, hash)
+        .await
+    {
+        Ok(0) => {
+            if let Err(error) = tokio::fs::remove_file(state.config.textures_dir.join(hash)).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, hash, "failed to clean an unreferenced upload file");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, hash, "failed to check uploaded texture references"),
+    }
+}
+
 async fn texture_mutation_context(
     state: &AppState,
     headers: &HeaderMap,
@@ -3016,6 +3414,35 @@ mod tests {
         assert!(value["errors"]["reason"][0].as_str().is_some());
         assert!(value["errors"]["field"].is_null());
     }
+    #[test]
+    fn sanitizes_png_uploads_and_checks_skin_dimensions() {
+        use image::ImageFormat;
+        use std::io::Cursor;
+
+        let mut encoded = Vec::new();
+        image::DynamicImage::new_rgba8(64, 32)
+            .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Png)
+            .unwrap();
+        assert_eq!(super::png_dimensions(&encoded), Some((64, 32)));
+        assert!(super::valid_texture_dimensions("steve", 64, 32));
+        assert!(!super::valid_texture_dimensions("alex", 64, 32));
+        assert!(super::valid_texture_dimensions("alex", 64, 64));
+        assert!(super::valid_texture_dimensions("cape", 64, 32));
+        assert!(!super::valid_texture_dimensions("steve", 63, 32));
+        let sanitized = super::sanitize_png(&encoded).unwrap();
+        assert_eq!(super::png_dimensions(&sanitized), Some((64, 32)));
+        assert!(super::png_dimensions(b"not an image").is_none());
+    }
+
+    #[test]
+    fn parses_legacy_multipart_boolean_values() {
+        assert_eq!(super::parse_legacy_form_bool("1"), Some(true));
+        assert_eq!(super::parse_legacy_form_bool("true"), Some(true));
+        assert_eq!(super::parse_legacy_form_bool("0"), Some(false));
+        assert_eq!(super::parse_legacy_form_bool("false"), Some(false));
+        assert_eq!(super::parse_legacy_form_bool("maybe"), None);
+    }
+
     #[test]
     fn calculates_legacy_texture_deletion_score_refunds() {
         let texture = crate::database::TextureInfoRecord {
