@@ -152,6 +152,7 @@ pub fn router(state: AppState) -> Router {
             put(web_admin_user_permission),
         )
         .route("/admin/users/{uid}", delete(web_admin_user_delete))
+        .route("/admin/players", get(web_admin_players_page))
         .route("/admin/players/list", get(admin_player_list))
         .route("/admin/players/{pid}/name", put(web_admin_player_name))
         .route("/admin/players/{pid}/owner", put(web_admin_player_owner))
@@ -2180,6 +2181,15 @@ struct AdminStatusPage {
 #[derive(Template)]
 #[template(path = "admin_users.html")]
 struct AdminUsersPage {
+    site_name: String,
+    locale: String,
+    current_uid: i64,
+    current_permission: i32,
+}
+
+#[derive(Template)]
+#[template(path = "admin_players.html")]
+struct AdminPlayersPage {
     site_name: String,
     locale: String,
     current_uid: i64,
@@ -7726,6 +7736,29 @@ fn parse_report_search(query: Option<&str>) -> ParsedReportSearch {
     parsed
 }
 
+async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let page = AdminPlayersPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        current_uid: user.uid,
+        current_permission: user.permission,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator players page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn admin_player_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -11406,6 +11439,21 @@ mod tests {
         assert!(users_html.contains("User management"));
         assert!(users_html.contains("/admin/users/list"));
         assert!(users_html.contains("data-current-permission=\"1\""));
+        let denied_players_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/players", None).await;
+        assert_eq!(denied_players_page.status(), StatusCode::FORBIDDEN);
+        let players_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/players", None).await;
+        assert_eq!(players_page.status(), StatusCode::OK);
+        let players_html = String::from_utf8(
+            to_bytes(players_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(players_html.contains("Player management"));
+        assert!(players_html.contains("/admin/players/list"));
 
         let status_page = session_request(&app, &admin_cookie, "GET", "/admin/status", None).await;
         assert_eq!(status_page.status(), StatusCode::OK);

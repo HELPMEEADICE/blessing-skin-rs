@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}角色管理{% else %}Player management{% endif %} - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:1200px;margin:3rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
+    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+    form{display:flex;gap:.5rem;margin:1.25rem 0}
+    input{flex:1;min-width:0;padding:.65rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}
+    button{padding:.55rem .75rem;border:0;border-radius:4px;background:#007bff;color:white;font:inherit;cursor:pointer}
+    button.danger{background:#c82333}button.secondary{background:#59636e}
+    .table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:.92rem}
+    th,td{text-align:left;vertical-align:middle;padding:.6rem;border:1px solid #d9dee5;white-space:nowrap}
+    th{background:#f4f6f9}.actions{display:flex;flex-wrap:wrap;gap:.35rem;max-width:320px}
+    .preview{display:inline-block;margin-right:.4rem}.preview img{width:48px;height:48px;object-fit:contain;background:#e8ebef;border-radius:4px}
+    .status{min-height:1.4rem;color:#59636e}.pagination{display:flex;justify-content:center;align-items:center;gap:1rem;margin-top:1rem}
+    @media(max-width:700px){main{margin:1rem;padding:1rem}th,td{padding:.45rem}}
+  </style>
+</head>
+<body>
+<main id="admin-players" data-current-uid="{{ current_uid }}" data-current-permission="{{ current_permission }}">
+  <header>
+    <h1>{% if locale.starts_with("zh") %}角色管理{% else %}Player management{% endif %}</h1>
+    <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a>
+  </header>
+  <form id="search-form">
+    <input id="search-query" type="search" aria-label="{% if locale.starts_with("zh") %}搜索角色{% else %}Search players{% endif %}" placeholder="{% if locale.starts_with("zh") %}按角色名、PID 或 UID 搜索{% else %}Search by player name, PID or UID{% endif %}">
+    <button type="submit">{% if locale.starts_with("zh") %}搜索{% else %}Search{% endif %}</button>
+  </form>
+  <p id="status" class="status" role="status"></p>
+  <div class="table-wrap"><table>
+    <thead><tr>
+      <th>PID</th><th>{% if locale.starts_with("zh") %}角色名{% else %}Name{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}所有者 UID{% else %}Owner UID{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}皮肤 / 披风{% else %}Skin / Cape{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}最近修改{% else %}Last modified{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}操作{% else %}Actions{% endif %}</th>
+    </tr></thead><tbody id="players"></tbody>
+  </table></div>
+  <div class="pagination"><button id="previous" class="secondary" type="button">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</button><span id="page-label"></span><button id="next" class="secondary" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button></div>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('admin-players');
+  const zh = document.documentElement.lang.startsWith('zh');
+  const currentUid = Number(root.dataset.currentUid), currentPermission = Number(root.dataset.currentPermission);
+  const players = document.getElementById('players'), status = document.getElementById('status'), pageLabel = document.getElementById('page-label');
+  let page = 1, lastPage = 1, query = '';
+  const say = (english, chinese) => zh ? chinese : english;
+  const cell = value => { const node = document.createElement('td'); node.textContent = value == null ? '' : String(value); return node; };
+  const button = (label, work, danger = false) => { const node = document.createElement('button'); node.type = 'button'; node.textContent = label; if (danger) node.className = 'danger'; node.addEventListener('click', () => act(work)); return node; };
+  const request = async (url, method = 'GET', payload) => {
+    const response = await fetch(url, { method, headers: payload === undefined ? { Accept: 'application/json' } : { Accept: 'application/json', 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || (result.code !== undefined && result.code !== 0)) throw new Error(result.message || say('Request failed.', '请求失败。'));
+    return result;
+  };
+  async function act(work) { try { await work(); } catch (error) { status.textContent = error.message; } }
+  const addTexturePreview = (container, tid, name, type) => {
+    if (Number(tid) <= 0) return;
+    const link = document.createElement('a'); link.className = 'preview'; link.href = `/skinlib/show/${tid}`; link.target = '_blank'; link.rel = 'noreferrer';
+    const image = document.createElement('img'); image.src = `/preview/${tid}`; image.alt = `${name} - ${type}`; image.loading = 'lazy'; link.append(image); container.append(link);
+  };
+  const renderPlayer = player => {
+    const row = document.createElement('tr'); row.append(cell(player.pid), cell(player.name), cell(player.uid));
+    const textures = document.createElement('td'); addTexturePreview(textures, player.tid_skin, player.name, say('skin', '皮肤')); addTexturePreview(textures, player.tid_cape, player.name, say('cape', '披风'));
+    if (Number(player.tid_skin) <= 0 && Number(player.tid_cape) <= 0) textures.textContent = say('None', '无');
+    row.append(textures, cell(player.last_modified));
+    const actions = document.createElement('td'), group = document.createElement('div'); group.className = 'actions';
+    const canModify = Number(player.uid) === currentUid || currentPermission > Number(player.owner_permission);
+    if (canModify) {
+      group.append(button(say('Name', '角色名'), async () => {
+        const name = prompt(say('New player name', '新的角色名'), player.name); if (name === null) return;
+        const result = await request(`/admin/players/${player.pid}/name`, 'PUT', { player_name: name }); status.textContent = result.message || say('Name updated.', '角色名已更新。'); await load(page);
+      }));
+      group.append(button(say('Owner', '所有者'), async () => {
+        const value = prompt(say('New owner UID', '新所有者 UID'), String(player.uid)); if (value === null) return;
+        const uid = Number(value); if (!Number.isInteger(uid) || uid < 1) throw new Error(say('Enter a valid UID.', '请输入有效 UID。'));
+        const result = await request(`/admin/players/${player.pid}/owner`, 'PUT', { uid }); status.textContent = result.message || say('Owner updated.', '所有者已更新。'); await load(page);
+      }));
+      group.append(button(say('Textures', '皮肤 / 披风'), async () => {
+        const type = prompt(say('Set texture type: skin or cape', '纹理类型：skin 或 cape'), 'skin'); if (type === null) return;
+        if (!['skin', 'cape'].includes(type)) throw new Error(say('Choose skin or cape.', '请输入 skin 或 cape。'));
+        const current = type === 'skin' ? player.tid_skin : player.tid_cape;
+        const value = prompt(say('Texture ID (0 clears it)', '纹理编号（0 表示清除）'), String(current)); if (value === null) return;
+        const tid = Number(value); if (!Number.isInteger(tid) || tid < 0) throw new Error(say('Enter a valid texture ID.', '请输入有效纹理编号。'));
+        const result = await request(`/admin/players/${player.pid}/textures`, 'PUT', { type, tid }); status.textContent = result.message || say('Texture updated.', '纹理已更新。'); await load(page);
+      }));
+      group.append(button(say('Delete', '删除'), async () => {
+        if (!confirm(say('Delete this player?', '确定删除该角色吗？'))) return;
+        const result = await request(`/admin/players/${player.pid}`, 'DELETE'); status.textContent = result.message || say('Player deleted.', '角色已删除。'); await load(page);
+      }, true));
+    }
+    actions.append(group); row.append(actions); players.append(row);
+  };
+  async function load(targetPage) {
+    page = targetPage; status.textContent = say('Loading…', '正在加载…'); players.replaceChildren();
+    try {
+      const params = new URLSearchParams({ q: query, page: String(page) });
+      const data = await request(`/admin/players/list?${params}`); lastPage = Math.max(1, Number(data.last_page) || 1);
+      for (const player of data.data || []) renderPlayer(player);
+      if (!data.data || data.data.length === 0) { const row = document.createElement('tr'), empty = document.createElement('td'); empty.colSpan = 6; empty.textContent = say('No players found.', '没有找到角色。'); row.append(empty); players.append(row); }
+      pageLabel.textContent = `${data.current_page} / ${lastPage} · ${data.total} ${say('players', '个角色')}`;
+      document.getElementById('previous').disabled = page <= 1; document.getElementById('next').disabled = page >= lastPage; status.textContent = '';
+    } catch (error) { status.textContent = error.message; }
+  }
+  document.getElementById('search-form').addEventListener('submit', event => { event.preventDefault(); query = document.getElementById('search-query').value; load(1); });
+  document.getElementById('previous').addEventListener('click', () => { if (page > 1) load(page - 1); });
+  document.getElementById('next').addEventListener('click', () => { if (page < lastPage) load(page + 1); });
+  load(1);
+})();
+</script>
+</body>
+</html>
