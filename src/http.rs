@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             put(oauth_client_update).delete(oauth_client_delete),
         )
         .route("/user", get(web_dashboard))
+        .route("/user/reports", get(web_user_reports))
         .route("/user/notifications/{id}", post(web_read_notification))
         .route("/user/email-verification", post(send_verification_email))
         .route("/user/player", get(web_player_page).post(web_add_player))
@@ -244,6 +245,25 @@ struct LoginPage {
     submit_label: String,
     registration_link: String,
     forgot_link: String,
+}
+
+#[derive(Template)]
+#[template(path = "user_reports.html")]
+struct UserReportsPage {
+    site_name: String,
+    locale: String,
+    reports: Vec<UserReportView>,
+    current_page: i64,
+    last_page: i64,
+}
+
+struct UserReportView {
+    id: i64,
+    tid: i64,
+    texture_name: Option<String>,
+    reason: String,
+    status: i32,
+    report_at: String,
 }
 
 #[derive(Template)]
@@ -2253,6 +2273,71 @@ pub(crate) async fn site_name(state: &AppState) -> String {
             .flatten()
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
+    }
+}
+
+async fn web_user_reports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminReportListQuery>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    const PER_PAGE: i64 = 10;
+    let current_page = query.page.unwrap_or(1).max(1);
+    let filters = ReportSearchFilters {
+        reporter: Some(user.uid),
+        ..Default::default()
+    };
+    let (items, total) = match database
+        .report_management_items(
+            &state.config.database.table_prefix,
+            &filters,
+            "report_at",
+            true,
+            current_page,
+            PER_PAGE,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to load user report history");
+            return unavailable();
+        }
+    };
+    let reports = items
+        .into_iter()
+        .map(|report| UserReportView {
+            id: report.id,
+            tid: report.tid,
+            texture_name: report.texture_name,
+            reason: report.reason,
+            status: report.status,
+            report_at: report.report_at,
+        })
+        .collect();
+    let page = UserReportsPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        reports,
+        current_page,
+        last_page: total
+            .saturating_add(PER_PAGE - 1)
+            .div_euclid(PER_PAGE)
+            .max(1),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render user report history");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -10162,6 +10247,7 @@ mod tests {
         )
         .unwrap();
         assert!(registered_dashboard.contains("Welcome note"));
+        assert!(registered_dashboard.contains("/user/reports"));
         let read_notification = session_request(
             &app,
             &registered_cookie,
@@ -10333,6 +10419,30 @@ mod tests {
             .await
             .unwrap();
         assert!(verified_state);
+        sqlx::query("INSERT INTO reports (tid,uploader,reporter,reason,status,report_at) VALUES (999,?,?, 'my tracked report',0,'2026-10-02 16:00:00'), (999,?,9999,'another user private report',2,'2026-10-02 15:00:00')")
+            .bind(registered_user.0)
+            .bind(registered_user.0)
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let tracked_reports =
+            session_request(&app, &registered_cookie, "GET", "/user/reports", None).await;
+        assert_eq!(tracked_reports.status(), StatusCode::OK);
+        let tracked_reports = String::from_utf8(
+            to_bytes(tracked_reports.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(tracked_reports.contains("my tracked report"));
+        assert!(!tracked_reports.contains("another user private report"));
+        assert!(tracked_reports.contains("Pending"));
+        sqlx::query("DELETE FROM reports WHERE reason IN ('my tracked report','another user private report')")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let non_admin_settings =
             session_request(&app, &registered_cookie, "GET", "/admin/options", None).await;
