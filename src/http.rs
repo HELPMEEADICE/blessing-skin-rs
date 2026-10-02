@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/closet/{uid}",
             post(web_admin_closet_add).delete(web_admin_closet_remove),
         )
+        .route("/admin/reports", get(web_admin_reports_page))
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route(
@@ -2194,6 +2195,13 @@ struct AdminPlayersPage {
     locale: String,
     current_uid: i64,
     current_permission: i32,
+}
+
+#[derive(Template)]
+#[template(path = "admin_reports.html")]
+struct AdminReportsPage {
+    site_name: String,
+    locale: String,
 }
 
 struct AdminStatusGroup {
@@ -8717,6 +8725,27 @@ fn admin_closet_texture_json(item: ClosetTextureRecord) -> serde_json::Value {
     })
 }
 
+async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let page = AdminReportsPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator reports page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn admin_report_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -11454,6 +11483,21 @@ mod tests {
         .unwrap();
         assert!(players_html.contains("Player management"));
         assert!(players_html.contains("/admin/players/list"));
+        let denied_reports_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/reports", None).await;
+        assert_eq!(denied_reports_page.status(), StatusCode::FORBIDDEN);
+        let reports_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/reports", None).await;
+        assert_eq!(reports_page.status(), StatusCode::OK);
+        let reports_html = String::from_utf8(
+            to_bytes(reports_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(reports_html.contains("Report management"));
+        assert!(reports_html.contains("/admin/reports/list"));
 
         let status_page = session_request(&app, &admin_cookie, "GET", "/admin/status", None).await;
         assert_eq!(status_page.status(), StatusCode::OK);

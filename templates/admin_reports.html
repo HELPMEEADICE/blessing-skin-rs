@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}举报管理{% else %}Report management{% endif %} - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:1200px;margin:3rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
+    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+    form{display:flex;gap:.5rem;margin:1.25rem 0}
+    input{flex:1;min-width:0;padding:.65rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}
+    button{padding:.55rem .75rem;border:0;border-radius:4px;background:#007bff;color:white;font:inherit;cursor:pointer}
+    button.danger{background:#c82333}button.warning{background:#bd7300}button.secondary{background:#59636e}
+    .reports{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:1rem}
+    .report{border:1px solid #d9dee5;border-radius:6px;overflow:hidden;background:#fff;min-width:0}
+    .report-head,.report-body{padding:.85rem}.report-head{background:#f4f6f9}
+    .preview{display:flex;justify-content:center;align-items:center;min-height:190px;padding:.75rem;background:#eef1f5;cursor:zoom-in}
+    .preview img{max-width:100%;width:180px;height:180px;object-fit:contain}
+    .badge{display:inline-block;padding:.2rem .45rem;border-radius:10px;background:#e4e7eb;margin-right:.35rem;font-size:.82rem}
+    .badge.pending{background:#fff0c2}.badge.resolved{background:#d1f1df}.badge.rejected{background:#fad8dc}
+    details{margin-top:.6rem}summary{cursor:pointer;overflow-wrap:anywhere}.reason{white-space:pre-wrap;overflow-wrap:anywhere}
+    .actions{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.75rem}
+    .status{min-height:1.4rem;color:#59636e}.pagination{display:flex;justify-content:center;align-items:center;gap:1rem;margin-top:1rem}
+    dialog{max-width:min(90vw,720px);max-height:90vh;border:0;border-radius:8px;padding:1rem;box-shadow:0 8px 40px #0005}dialog img{max-width:80vw;max-height:75vh;object-fit:contain}dialog::backdrop{background:#0009}
+    @media(max-width:700px){main{margin:1rem;padding:1rem}}
+  </style>
+</head>
+<body>
+<main id="admin-reports">
+  <header><h1>{% if locale.starts_with("zh") %}举报管理{% else %}Report management{% endif %}</h1><a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a></header>
+  <form id="search-form">
+    <input id="search-query" type="search" value="status:0 sort:-report_at" aria-label="{% if locale.starts_with("zh") %}搜索举报{% else %}Search reports{% endif %}" placeholder="{% if locale.starts_with("zh") %}可按 status、tid、uploader、reporter 或 reason 搜索{% else %}Search by status, tid, uploader, reporter or reason{% endif %}">
+    <button type="submit">{% if locale.starts_with("zh") %}搜索{% else %}Search{% endif %}</button>
+  </form>
+  <p id="status" class="status" role="status"></p>
+  <section id="reports" class="reports" aria-live="polite"></section>
+  <div class="pagination"><button id="previous" class="secondary" type="button">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</button><span id="page-label"></span><button id="next" class="secondary" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button></div>
+</main>
+<dialog id="preview-dialog"><button id="close-preview" class="secondary" type="button">{% if locale.starts_with("zh") %}关闭{% else %}Close{% endif %}</button><img id="preview-large" alt=""></dialog>
+<script>
+(() => {
+  const zh = document.documentElement.lang.startsWith('zh');
+  const reports = document.getElementById('reports'), status = document.getElementById('status'), pageLabel = document.getElementById('page-label');
+  const dialog = document.getElementById('preview-dialog'), largePreview = document.getElementById('preview-large');
+  let page = 1, lastPage = 1, query = document.getElementById('search-query').value;
+  const say = (english, chinese) => zh ? chinese : english;
+  const request = async (url, method = 'GET', payload) => {
+    const response = await fetch(url, { method, headers: payload === undefined ? { Accept: 'application/json' } : { Accept: 'application/json', 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || (result.code !== undefined && result.code !== 0)) throw new Error(result.message || say('Request failed.', '请求失败。'));
+    return result;
+  };
+  const element = (tag, text, className) => { const node = document.createElement(tag); if (text != null) node.textContent = String(text); if (className) node.className = className; return node; };
+  const button = (label, work, className) => { const node = element('button', label, className); node.type = 'button'; node.addEventListener('click', () => act(work)); return node; };
+  async function act(work) { try { await work(); } catch (error) { status.textContent = error.message; } }
+  const statusInfo = value => ({ 0: [say('Pending', '待处理'), 'pending'], 1: [say('Resolved', '已处理'), 'resolved'], 2: [say('Rejected', '已驳回'), 'rejected'] })[Number(value)] || [String(value), ''];
+  const review = async (report, action) => {
+    const result = await request(`/admin/reports/${report.id}`, 'PUT', { action });
+    status.textContent = result.message || say('Report updated.', '举报已更新。'); await load(page);
+  };
+  const renderReport = report => {
+    const card = element('article', null, 'report'), head = element('div', null, 'report-head');
+    const uploader = report.texture_uploader?.nickname || `UID ${report.uploader}`;
+    head.append(element('strong', say('Uploader: ', '上传者：')), element('span', `${uploader} (UID: ${report.uploader})`));
+    card.append(head);
+    if (report.texture) {
+      const preview = element('button', null, 'preview'); preview.type = 'button'; preview.setAttribute('aria-label', say('Open texture preview', '查看材质预览'));
+      const image = document.createElement('img'); image.src = `/preview/${report.tid}?height=180&png`; image.alt = `${say('Texture', '材质')} ${report.tid}`; image.loading = 'lazy'; preview.append(image);
+      preview.addEventListener('click', () => { largePreview.src = `/preview/${report.tid}?height=480&png`; largePreview.alt = image.alt; dialog.showModal(); }); card.append(preview);
+    } else card.append(element('div', say('Texture no longer exists.', '该材质已不存在。'), 'preview'));
+    const body = element('div', null, 'report-body'), [statusText, statusClass] = statusInfo(report.status);
+    body.append(element('span', statusText, `badge ${statusClass}`), element('span', `TID: ${report.tid}`, 'badge'));
+    const reporter = report.informer?.nickname || `UID ${report.reporter}`;
+    body.append(element('p', `${say('Reporter: ', '举报者：')}${reporter} (UID: ${report.reporter})`));
+    const details = document.createElement('details'), summary = element('summary', `${say('Reason: ', '理由：')}${report.reason}`);
+    details.append(summary, element('div', report.reason, 'reason'), element('small', `${say('Reported at: ', '举报时间：')}${report.report_at}`)); body.append(details);
+    const skinlib = element('a', say('View in skin library', '在材质库中查看')); skinlib.href = `/skinlib/show/${report.tid}`; skinlib.target = '_blank'; skinlib.rel = 'noreferrer'; body.append(skinlib);
+    const actions = element('div', null, 'actions');
+    actions.append(button(say('Ban uploader', '封禁上传者'), () => review(report, 'ban'), 'warning'));
+    actions.append(button(say('Delete texture', '删除材质'), async () => { if (confirm(say('Delete this texture?', '确定删除该材质吗？'))) await review(report, 'delete'); }, 'danger'));
+    actions.append(button(say('Reject report', '驳回举报'), () => review(report, 'reject'), 'secondary'));
+    body.append(actions); card.append(body); reports.append(card);
+  };
+  async function load(targetPage) {
+    page = targetPage; status.textContent = say('Loading…', '正在加载…'); reports.replaceChildren();
+    try {
+      const params = new URLSearchParams({ q: query, page: String(page) }); const data = await request(`/admin/reports/list?${params}`);
+      lastPage = Math.max(1, Number(data.last_page) || 1); for (const report of data.data || []) renderReport(report);
+      if (!data.data || data.data.length === 0) reports.append(element('p', say('No reports found.', '没有找到举报。')));
+      pageLabel.textContent = `${data.current_page} / ${lastPage} · ${data.total} ${say('reports', '条举报')}`;
+      document.getElementById('previous').disabled = page <= 1; document.getElementById('next').disabled = page >= lastPage; status.textContent = '';
+    } catch (error) { status.textContent = error.message; }
+  }
+  document.getElementById('search-form').addEventListener('submit', event => { event.preventDefault(); query = document.getElementById('search-query').value; load(1); });
+  document.getElementById('previous').addEventListener('click', () => { if (page > 1) load(page - 1); });
+  document.getElementById('next').addEventListener('click', () => { if (page < lastPage) load(page + 1); });
+  document.getElementById('close-preview').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+  load(1);
+})();
+</script>
+</body>
+</html>
