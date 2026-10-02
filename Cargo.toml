@@ -9,6 +9,7 @@ license = "MIT"
 askama = "0.16"
 ammonia = "4"
 pulldown-cmark = "0.13"
+rand = "0.8.8"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 axum = { version = "0.8", features = ["multipart"] }

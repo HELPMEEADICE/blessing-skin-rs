@@ -254,6 +254,7 @@ dependencies = [
  "jsonwebtoken",
  "md-5 0.10.6",
  "pulldown-cmark",
+ "rand 0.8.8",
  "regex",
  "serde",
  "serde_json",

@@ -48,6 +48,14 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(home))
         .route("/auth/login", get(login_page).post(handle_login))
         .route("/auth/logout", post(logout))
+        .route(
+            "/oauth/clients",
+            get(oauth_clients_list).post(oauth_client_create),
+        )
+        .route(
+            "/oauth/clients/{id}",
+            put(oauth_client_update).delete(oauth_client_delete),
+        )
         .route("/user", get(web_dashboard))
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
@@ -327,6 +335,205 @@ struct DashboardPage {
     user: UserProfile,
     players: Vec<PlayerRecord>,
     locale: String,
+}
+
+#[derive(Deserialize)]
+struct OAuthClientRequest {
+    name: Option<String>,
+    redirect: Option<String>,
+}
+
+async fn oauth_clients_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .oauth_clients_for_user(&state.config.database.table_prefix, user.uid)
+        .await
+    {
+        Ok(clients) => Json(clients).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to list Passport clients");
+            unavailable()
+        }
+    }
+}
+
+async fn oauth_client_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<OAuthClientRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return oauth_client_validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request
+        .name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && name.chars().count() <= 255)
+    else {
+        return oauth_client_validation_error("name", &state.config.locale);
+    };
+    let Some(redirect) = request
+        .redirect
+        .map(|redirect| redirect.trim().to_owned())
+        .filter(|redirect| valid_oauth_redirect(redirect))
+    else {
+        return oauth_client_validation_error("redirect", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    use rand::distributions::{Alphanumeric, DistString};
+    let secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 40);
+    match database
+        .create_oauth_client(
+            &state.config.database.table_prefix,
+            user.uid,
+            &name,
+            &secret,
+            &redirect,
+        )
+        .await
+    {
+        Ok(client) => Json(client).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to create Passport client");
+            unavailable()
+        }
+    }
+}
+
+async fn oauth_client_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<OAuthClientRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return oauth_client_validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request
+        .name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && name.chars().count() <= 255)
+    else {
+        return oauth_client_validation_error("name", &state.config.locale);
+    };
+    let Some(redirect) = request
+        .redirect
+        .map(|redirect| redirect.trim().to_owned())
+        .filter(|redirect| valid_oauth_redirect(redirect))
+    else {
+        return oauth_client_validation_error("redirect", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .update_oauth_client(
+            &state.config.database.table_prefix,
+            user.uid,
+            id,
+            &name,
+            &redirect,
+        )
+        .await
+    {
+        Ok(true) => match database
+            .oauth_clients_for_user(&state.config.database.table_prefix, user.uid)
+            .await
+        {
+            Ok(clients) => clients
+                .into_iter()
+                .find(|client| client.id == id)
+                .map(|client| Json(client).into_response())
+                .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()),
+            Err(error) => {
+                tracing::error!(%error, client_id = id, "failed to reload updated Passport client");
+                unavailable()
+            }
+        },
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, client_id = id, "failed to update Passport client");
+            unavailable()
+        }
+    }
+}
+
+async fn oauth_client_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<i64>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .revoke_oauth_client(&state.config.database.table_prefix, user.uid, id)
+        .await
+    {
+        Ok(crate::database::OAuthClientDeleteOutcome::Revoked) => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(crate::database::OAuthClientDeleteOutcome::NotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, client_id = id, "failed to revoke Passport client");
+            unavailable()
+        }
+    }
+}
+
+fn valid_oauth_redirect(redirect: &str) -> bool {
+    let Ok(uri) = redirect.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    matches!(uri.scheme_str(), Some("http" | "https")) && uri.host().is_some()
+}
+
+fn oauth_client_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("name", true) => "应用名称为必填项且不能超过 255 个字符。",
+        ("name", false) => "The name field is required and may not exceed 255 characters.",
+        ("redirect", true) => "重定向地址必须是有效的 HTTP 或 HTTPS URL。",
+        ("redirect", false) => "The redirect field must be a valid HTTP or HTTPS URL.",
+        _ => "The given field is invalid.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "message": message,
+            "errors": { field: [field_error] }
+        })),
+    )
+        .into_response()
 }
 
 async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -4370,6 +4577,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE oauth_clients (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT NOT NULL, secret TEXT NOT NULL, provider TEXT, redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_refresh_tokens (id TEXT PRIMARY KEY, access_token_id TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_auth_codes (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let password_hash = bcrypt::hash("correct horse", 4).unwrap();
         sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (7,'alex@example.test','Alex User','en',5,0,?,1,'','',1,0)")
             .bind(password_hash)
@@ -4509,6 +4732,145 @@ mod tests {
         let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
         assert!(dashboard_html.contains("alex@example.test"));
         assert!(dashboard_html.contains("Alex"));
+
+        let clients_before = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/clients")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clients_before.status(), StatusCode::OK);
+        let clients_before: serde_json::Value = serde_json::from_slice(
+            &to_bytes(clients_before.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(clients_before, serde_json::json!([]));
+
+        let created_client = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/clients")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Desktop app","redirect":"https://client.test/callback"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_client.status(), StatusCode::OK);
+        let created_client: serde_json::Value = serde_json::from_slice(
+            &to_bytes(created_client.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let client_id = created_client["id"].as_i64().unwrap();
+        let client_secret = created_client["secret"].as_str().unwrap();
+        assert_eq!(client_secret.len(), 40);
+        assert!(client_secret.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert_eq!(created_client["name"], "Desktop app");
+        assert_eq!(created_client["redirect"], "https://client.test/callback");
+
+        let updated_client = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/oauth/clients/{client_id}"))
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Updated app","redirect":"https://client.test/return"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated_client.status(), StatusCode::OK);
+        let updated_client: serde_json::Value = serde_json::from_slice(
+            &to_bytes(updated_client.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated_client["name"], "Updated app");
+        assert_eq!(updated_client["secret"], client_secret);
+        assert_eq!(updated_client["redirect"], "https://client.test/return");
+
+        sqlx::query("INSERT INTO oauth_access_tokens (id,user_id,client_id,scopes,revoked) VALUES ('issued-access',7,?,'User.Read',0)")
+            .bind(client_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_refresh_tokens (id,access_token_id,revoked) VALUES ('issued-refresh','issued-access',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_auth_codes (id,user_id,client_id,scopes,revoked) VALUES ('issued-code',7,?,'User.Read',0)")
+            .bind(client_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted_client = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/oauth/clients/{client_id}"))
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted_client.status(), StatusCode::NO_CONTENT);
+        for query in [
+            "SELECT revoked FROM oauth_clients WHERE id = ?",
+            "SELECT revoked FROM oauth_access_tokens WHERE id = 'issued-access'",
+            "SELECT revoked FROM oauth_refresh_tokens WHERE id = 'issued-refresh'",
+            "SELECT revoked FROM oauth_auth_codes WHERE id = 'issued-code'",
+        ] {
+            let revoked: bool = if query.contains("id = ?") {
+                sqlx::query_scalar(query)
+                    .bind(client_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            } else {
+                sqlx::query_scalar(query).fetch_one(&pool).await.unwrap()
+            };
+            assert!(revoked, "expected revocation for {query}");
+        }
+        let clients_after = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/clients")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clients_after.status(), StatusCode::OK);
+        let clients_after: serde_json::Value = serde_json::from_slice(
+            &to_bytes(clients_after.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(clients_after, serde_json::json!([]));
 
         let reports = app
             .clone()

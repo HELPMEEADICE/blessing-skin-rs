@@ -35,6 +35,18 @@ pub struct AccessTokenRecord {
     pub client_id: i64,
     pub revoked: bool,
 }
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct OAuthClientRecord {
+    pub id: i64,
+    pub name: String,
+    pub secret: String,
+    pub redirect: String,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum OAuthClientDeleteOutcome {
+    NotFound,
+    Revoked,
+}
 
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct UserProfile {
@@ -2066,6 +2078,313 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn oauth_clients_for_user(
+        &self,
+        prefix: &str,
+        user_id: i64,
+    ) -> Result<Vec<OAuthClientRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, name, secret, redirect FROM {prefix}oauth_clients \
+                 WHERE user_id = ? AND personal_access_client = FALSE \
+                 AND password_client = FALSE AND revoked = FALSE ORDER BY id"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(id AS SIGNED) AS id, name, secret, redirect FROM {prefix}oauth_clients \
+                 WHERE user_id = ? AND personal_access_client = FALSE \
+                 AND password_client = FALSE AND revoked = FALSE ORDER BY id"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(id AS BIGINT) AS id, name, secret, redirect FROM {prefix}oauth_clients \
+                 WHERE user_id = $1 AND personal_access_client = FALSE \
+                 AND password_client = FALSE AND revoked = FALSE ORDER BY id"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthClientRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthClientRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthClientRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+        }
+    }
+
+    pub async fn create_oauth_client(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        name: &str,
+        secret: &str,
+        redirect: &str,
+    ) -> Result<OAuthClientRecord, sqlx::Error> {
+        let record = match self {
+            Self::Sqlite(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}oauth_clients \
+                     (user_id, name, secret, provider, redirect, personal_access_client, \
+                      password_client, revoked, created_at, updated_at) \
+                     VALUES (?, ?, ?, NULL, ?, FALSE, FALSE, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                );
+                let inserted = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .bind(name)
+                    .bind(secret)
+                    .bind(redirect)
+                    .execute(pool)
+                    .await?;
+                OAuthClientRecord {
+                    id: inserted.last_insert_rowid(),
+                    name: name.to_owned(),
+                    secret: secret.to_owned(),
+                    redirect: redirect.to_owned(),
+                }
+            }
+            Self::MySql(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}oauth_clients \
+                     (user_id, name, secret, provider, redirect, personal_access_client, \
+                      password_client, revoked, created_at, updated_at) \
+                     VALUES (?, ?, ?, NULL, ?, FALSE, FALSE, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                );
+                let inserted = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .bind(name)
+                    .bind(secret)
+                    .bind(redirect)
+                    .execute(pool)
+                    .await?;
+                OAuthClientRecord {
+                    id: inserted.last_insert_id() as i64,
+                    name: name.to_owned(),
+                    secret: secret.to_owned(),
+                    redirect: redirect.to_owned(),
+                }
+            }
+            Self::Postgres(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}oauth_clients \
+                     (user_id, name, secret, provider, redirect, personal_access_client, \
+                      password_client, revoked, created_at, updated_at) \
+                     VALUES ($1, $2, $3, NULL, $4, FALSE, FALSE, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+                     RETURNING CAST(id AS BIGINT)"
+                );
+                let id = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .bind(name)
+                    .bind(secret)
+                    .bind(redirect)
+                    .fetch_one(pool)
+                    .await?;
+                OAuthClientRecord {
+                    id,
+                    name: name.to_owned(),
+                    secret: secret.to_owned(),
+                    redirect: redirect.to_owned(),
+                }
+            }
+        };
+        Ok(record)
+    }
+
+    pub async fn update_oauth_client(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        client_id: i64,
+        name: &str,
+        redirect: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}oauth_clients SET name = $1, redirect = $2, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $3 AND user_id = $4 AND personal_access_client = FALSE AND revoked = FALSE"
+            ),
+            _ => format!(
+                "UPDATE {prefix}oauth_clients SET name = ?, redirect = ?, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = ? AND user_id = ? AND personal_access_client = FALSE AND revoked = FALSE"
+            ),
+        };
+        let rows_affected = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(name)
+                .bind(redirect)
+                .bind(client_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(name)
+                .bind(redirect)
+                .bind(client_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(name)
+                .bind(redirect)
+                .bind(client_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn revoke_oauth_client(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        client_id: i64,
+    ) -> Result<OAuthClientDeleteOutcome, sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let marker = |index: usize| {
+            if postgres {
+                format!("${index}")
+            } else {
+                "?".to_owned()
+            }
+        };
+        let lock_clause = if matches!(self, Self::Sqlite(_)) {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let client_sql = format!(
+            "SELECT id FROM {prefix}oauth_clients WHERE id = {} AND user_id = {} \
+             AND personal_access_client = FALSE AND revoked = FALSE LIMIT 1{lock_clause}",
+            marker(1),
+            marker(2)
+        );
+        let access_token_sql = format!(
+            "UPDATE {prefix}oauth_access_tokens SET revoked = TRUE WHERE client_id = {}",
+            marker(1)
+        );
+        let refresh_token_sql = format!(
+            "UPDATE {prefix}oauth_refresh_tokens SET revoked = TRUE WHERE access_token_id \
+             IN (SELECT id FROM {prefix}oauth_access_tokens WHERE client_id = {})",
+            marker(1)
+        );
+        let auth_code_sql = format!(
+            "UPDATE {prefix}oauth_auth_codes SET revoked = TRUE WHERE client_id = {}",
+            marker(1)
+        );
+        let revoke_client_sql = format!(
+            "UPDATE {prefix}oauth_clients SET revoked = TRUE, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = {} AND user_id = {} AND personal_access_client = FALSE",
+            marker(1),
+            marker(2)
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let owned = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if owned.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(OAuthClientDeleteOutcome::NotFound);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(access_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(refresh_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(auth_code_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(revoke_client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let owned = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if owned.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(OAuthClientDeleteOutcome::NotFound);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(access_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(refresh_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(auth_code_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(revoke_client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let owned = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if owned.is_none() {
+                    transaction.rollback().await?;
+                    return Ok(OAuthClientDeleteOutcome::NotFound);
+                }
+                sqlx::query(sqlx::AssertSqlSafe(access_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(refresh_token_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(auth_code_sql))
+                    .bind(client_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(revoke_client_sql))
+                    .bind(client_id)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(OAuthClientDeleteOutcome::Revoked)
+    }
+
     pub async fn access_token(
         &self,
         prefix: &str,
@@ -4843,5 +5162,121 @@ mod tests {
                 .unwrap(),
             super::ReportReviewOutcome::UploaderPermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_client_management_is_owner_scoped_and_revokes_credentials() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_clients (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT NOT NULL, secret TEXT NOT NULL, provider TEXT, redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_refresh_tokens (id TEXT PRIMARY KEY, access_token_id TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE oauth_auth_codes (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_clients (id,user_id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (1,7,'Legacy app','legacy-secret',NULL,'https://legacy.test/callback',0,0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),(2,8,'Another user app','other-secret',NULL,'https://other.test/callback',0,0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),(3,7,'Personal client','personal-secret',NULL,'http://localhost',1,0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_access_tokens (id,user_id,client_id,scopes,revoked) VALUES ('legacy-access',7,1,'User.Read',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_refresh_tokens (id,access_token_id,revoked) VALUES ('legacy-refresh','legacy-access',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oauth_auth_codes (id,user_id,client_id,scopes,revoked) VALUES ('legacy-code',7,1,'User.Read',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let database = super::DatabasePool::Sqlite(pool.clone());
+        let clients = database.oauth_clients_for_user("", 7).await.unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, 1);
+        assert_eq!(clients[0].secret, "legacy-secret");
+        assert!(database.oauth_clients_for_user("", 8).await.unwrap().len() == 1);
+
+        let created = database
+            .create_oauth_client("", 7, "New app", "new-secret", "https://new.test/callback")
+            .await
+            .unwrap();
+        assert_eq!(created.name, "New app");
+        assert!(
+            database
+                .update_oauth_client("", 7, created.id, "Renamed app", "https://new.test/return")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .update_oauth_client("", 8, created.id, "Stolen", "https://evil.test/")
+                .await
+                .unwrap()
+        );
+        let updated = database.oauth_clients_for_user("", 7).await.unwrap();
+        assert_eq!(
+            updated
+                .iter()
+                .find(|client| client.id == created.id)
+                .unwrap()
+                .name,
+            "Renamed app"
+        );
+        assert_eq!(
+            updated
+                .iter()
+                .find(|client| client.id == created.id)
+                .unwrap()
+                .redirect,
+            "https://new.test/return"
+        );
+
+        assert_eq!(
+            database.revoke_oauth_client("", 8, 1).await.unwrap(),
+            super::OAuthClientDeleteOutcome::NotFound
+        );
+        assert_eq!(
+            database.revoke_oauth_client("", 7, 1).await.unwrap(),
+            super::OAuthClientDeleteOutcome::Revoked
+        );
+        assert_eq!(
+            database.revoke_oauth_client("", 7, 1).await.unwrap(),
+            super::OAuthClientDeleteOutcome::NotFound
+        );
+        let revoked_access: bool = sqlx::query_scalar(
+            "SELECT revoked FROM oauth_access_tokens WHERE id = 'legacy-access'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let revoked_refresh: bool = sqlx::query_scalar(
+            "SELECT revoked FROM oauth_refresh_tokens WHERE id = 'legacy-refresh'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let revoked_code: bool =
+            sqlx::query_scalar("SELECT revoked FROM oauth_auth_codes WHERE id = 'legacy-code'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(revoked_access && revoked_refresh && revoked_code);
     }
 }
