@@ -117,6 +117,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
+        .route("/skinlib", get(skinlib_page))
+        .route("/skinlib/upload", get(texture_upload_page))
+        .route("/skinlib/show/{tid}", get(skinlib_show_page))
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
@@ -1055,6 +1058,47 @@ struct ClosetManagementPage {
     site_name: String,
     locale: String,
     user: UserProfile,
+}
+
+#[derive(Template)]
+#[template(path = "skinlib.html")]
+struct SkinLibraryPage {
+    site_name: String,
+    locale: String,
+    logged_in: bool,
+    current_uid: i64,
+}
+
+#[derive(Template)]
+#[template(path = "skinlib_show.html")]
+struct SkinLibraryShowPage {
+    site_name: String,
+    locale: String,
+    tid: i64,
+    name: String,
+    texture_type: String,
+    hash: String,
+    size: i64,
+    uploader: i64,
+    is_public: bool,
+    upload_at: String,
+    likes: i64,
+    logged_in: bool,
+    can_manage: bool,
+}
+
+#[derive(Template)]
+#[template(path = "texture_upload.html")]
+struct TextureUploadPage {
+    site_name: String,
+    locale: String,
+    user: UserProfile,
+    public_rate: i64,
+    private_rate: i64,
+    closet_cost: i64,
+    upload_award: i64,
+    max_upload_kb: i64,
+    content_policy: String,
 }
 
 #[derive(Deserialize)]
@@ -3786,6 +3830,194 @@ struct ClosetListQuery {
     q: Option<String>,
     page: Option<i64>,
     per_page: Option<i64>,
+}
+
+async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let current_uid = session_user_id(&state, &headers).unwrap_or_default();
+    let page = SkinLibraryPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        logged_in: current_uid > 0,
+        current_uid,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render skin library page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn skinlib_show_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_tid): RoutePath<String>,
+) -> Response {
+    let Ok(tid) = raw_tid.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let texture = match database
+        .texture_info(&state.config.database.table_prefix, tid)
+        .await
+    {
+        Ok(Some(texture)) => texture,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to load texture for skin library page");
+            return unavailable();
+        }
+    };
+    let current_uid = session_user_id(&state, &headers);
+    let (viewer_uid, is_admin) = match current_uid {
+        Some(uid) => match database
+            .user_profile(&state.config.database.table_prefix, uid)
+            .await
+        {
+            Ok(Some(user)) => (Some(uid), user.permission >= 1),
+            Ok(None) => (None, false),
+            Err(error) => {
+                tracing::error!(%error, "failed to load texture page viewer");
+                return unavailable();
+            }
+        },
+        None => (None, false),
+    };
+    if !texture.is_public && viewer_uid != Some(texture.uploader) && !is_admin {
+        let code = match database
+            .option(
+                &state.config.database.table_prefix,
+                "status_code_for_private",
+            )
+            .await
+        {
+            Ok(value) => value
+                .and_then(|value| value.parse::<u16>().ok())
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .unwrap_or(StatusCode::FORBIDDEN),
+            Err(error) => {
+                tracing::error!(%error, "failed to read private texture status option");
+                return unavailable();
+            }
+        };
+        return code.into_response();
+    }
+    if !valid_texture_hash(&texture.hash) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let page = SkinLibraryShowPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        tid: texture.tid,
+        name: texture.name,
+        texture_type: texture.texture_type,
+        hash: texture.hash,
+        size: texture.size,
+        uploader: texture.uploader,
+        is_public: texture.is_public,
+        upload_at: texture.upload_at,
+        likes: texture.likes,
+        logged_in: viewer_uid.is_some(),
+        can_manage: viewer_uid == Some(texture.uploader) || is_admin,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to render skin library detail page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if session_user_id(&state, &headers).is_none() {
+        return Redirect::to("/auth/login").into_response();
+    }
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let read_number = async |name: &str, default: i64| match database.option(prefix, name).await {
+        Ok(value) => Ok(value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default)),
+        Err(error) => Err(error),
+    };
+    let public_rate = match read_number("score_per_storage", 1).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read public upload cost");
+            return unavailable();
+        }
+    };
+    let private_rate = match read_number("private_score_per_storage", 10).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read private upload cost");
+            return unavailable();
+        }
+    };
+    let closet_cost = match read_number("score_per_closet_item", 0).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read closet upload cost");
+            return unavailable();
+        }
+    };
+    let upload_award = match read_number("score_award_per_texture", 0).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read upload award");
+            return unavailable();
+        }
+    };
+    let max_upload_kb = match read_number("max_upload_file_size", 1024).await {
+        Ok(value) => value.max(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read maximum upload size");
+            return unavailable();
+        }
+    };
+    let localized_policy_key = format!("content_policy_{}", state.config.locale);
+    let content_policy = match database.option(prefix, &localized_policy_key).await {
+        Ok(Some(value)) if !value.is_empty() => value,
+        Ok(_) => match database.option(prefix, "content_policy").await {
+            Ok(value) => value.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to read texture content policy");
+                return unavailable();
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "failed to read localized texture content policy");
+            return unavailable();
+        }
+    };
+    let page = TextureUploadPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        user,
+        public_rate,
+        private_rate,
+        closet_cost,
+        upload_award,
+        max_upload_kb,
+        content_policy,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render texture upload page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn skinlib_info(
@@ -8103,11 +8335,9 @@ mod tests {
             .unwrap();
         assert_eq!(homepage.status(), StatusCode::OK);
         let homepage_html = to_bytes(homepage.into_body(), usize::MAX).await.unwrap();
-        assert!(
-            String::from_utf8(homepage_html.to_vec())
-                .unwrap()
-                .contains("Skin Server")
-        );
+        let homepage_html = String::from_utf8(homepage_html.to_vec()).unwrap();
+        assert!(homepage_html.contains("Skin Server"));
+        assert!(homepage_html.contains("/skinlib"));
 
         let login_page = app
             .clone()
@@ -8230,6 +8460,9 @@ mod tests {
         let unverified_player_page =
             session_request(&app, &registered_cookie, "GET", "/user/player", None).await;
         assert_eq!(unverified_player_page.status(), StatusCode::FORBIDDEN);
+        let unverified_upload_page =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/upload", None).await;
+        assert_eq!(unverified_upload_page.status(), StatusCode::FORBIDDEN);
         sqlx::query("UPDATE users SET verified = 1 WHERE uid = ?")
             .bind(registered_user.0)
             .execute(&pool)
@@ -8389,7 +8622,7 @@ mod tests {
         .unwrap();
         assert!(closet_page.contains("Closet"));
         assert!(closet_page.contains("/user/closet/list"));
-        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (20,'Closet texture','steve','closet-hash',8,?,1,'2026-10-02 14:00:00',0)")
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (20,'Closet texture','steve','0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',8,?,1,'2026-10-02 14:00:00',0)")
             .bind(registered_user.0)
             .execute(&pool)
             .await
@@ -8443,7 +8676,10 @@ mod tests {
                 .unwrap();
         assert_eq!(closet_list["total"], 1);
         assert_eq!(closet_list["data"][0]["pivot"]["item_name"], "Closet item");
-        assert_eq!(closet_list["data"][0]["hash"], "closet-hash");
+        assert_eq!(
+            closet_list["data"][0]["hash"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
 
         let all_closet_ids =
             session_request(&app, &registered_cookie, "GET", "/user/closet/ids", None).await;
@@ -8497,6 +8733,88 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        let skinlib_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/skinlib")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skinlib_page.status(), StatusCode::OK);
+        let skinlib_page = String::from_utf8(
+            to_bytes(skinlib_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(skinlib_page.contains("/skinlib/list"));
+        assert!(skinlib_page.contains("</title><style>"));
+
+        let skinlib_list = session_request(
+            &app,
+            &registered_cookie,
+            "GET",
+            "/skinlib/list?filter=skin&sort=time&page=1",
+            None,
+        )
+        .await;
+        assert_eq!(skinlib_list.status(), StatusCode::OK);
+        let skinlib_list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(skinlib_list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            skinlib_list["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["tid"] == 20 && item["nickname"] == "NewGuy")
+        );
+
+        let skinlib_show =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/show/20", None).await;
+        assert_eq!(skinlib_show.status(), StatusCode::OK);
+        let skinlib_show = String::from_utf8(
+            to_bytes(skinlib_show.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            skinlib_show
+                .contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(skinlib_show.contains("Add to closet"));
+
+        let upload_page =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/upload", None).await;
+        assert_eq!(upload_page.status(), StatusCode::OK);
+        let upload_page = String::from_utf8(
+            to_bytes(upload_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(upload_page.contains("/texture"));
+        assert!(upload_page.contains("Current score"));
+        assert!(upload_page.contains("</title><style>"));
+
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (21,'Private texture','steve','private-hash',8,8,0,'2026-10-02 15:00:00',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let hidden_texture =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/show/21", None).await;
+        assert_eq!(hidden_texture.status(), StatusCode::FORBIDDEN);
 
         sqlx::query(
             "UPDATE options SET option_value = '100' WHERE option_name = 'score_per_player'",
