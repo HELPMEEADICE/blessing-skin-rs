@@ -309,6 +309,41 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn set_texture_type(
+        &self,
+        prefix: &str,
+        tid: i64,
+        texture_type: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("UPDATE {prefix}textures SET type = $1 WHERE tid = $2"),
+            _ => format!("UPDATE {prefix}textures SET type = ? WHERE tid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(texture_type)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(texture_type)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(texture_type)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn rename_texture(
         &self,
         prefix: &str,
@@ -2812,6 +2847,9 @@ mod tests {
             .unwrap();
         let renamed_texture = database.texture_info("bs_", 13).await.unwrap().unwrap();
         assert_eq!(renamed_texture.name, "Renamed texture");
+        database.set_texture_type("bs_", 13, "steve").await.unwrap();
+        let retyped_texture = database.texture_info("bs_", 13).await.unwrap().unwrap();
+        assert_eq!(retyped_texture.texture_type, "steve");
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
