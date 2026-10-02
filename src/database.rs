@@ -13,6 +13,232 @@ pub enum DatabasePool {
     Postgres(PgPool),
 }
 
+#[derive(Debug)]
+enum AdminUserSearchBind {
+    Text(String),
+    Integer(i64),
+    Boolean(bool),
+}
+
+#[derive(Debug)]
+enum AdminUserSearchFilter {
+    Text {
+        column: &'static str,
+        value: String,
+        contains: bool,
+        negated: bool,
+    },
+    Global {
+        value: String,
+        negated: bool,
+    },
+    Integer {
+        column: &'static str,
+        value: i64,
+        negated: bool,
+    },
+    Boolean {
+        column: &'static str,
+        value: bool,
+        negated: bool,
+    },
+}
+
+fn admin_user_where(query: Option<&str>, postgres: bool) -> (String, Vec<AdminUserSearchBind>) {
+    let mut groups: Vec<Vec<AdminUserSearchFilter>> = Vec::new();
+    let mut current = Vec::new();
+    let mut negate_next = false;
+    for token in split_user_search(query.unwrap_or_default()) {
+        if token.eq_ignore_ascii_case("and") {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("or") {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+            negate_next = false;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("not") {
+            negate_next = true;
+            continue;
+        }
+        let negated = std::mem::take(&mut negate_next);
+        let filter = if let Some((field, value)) = token.split_once(':') {
+            let value = value.trim_matches('"');
+            match field {
+                "uid" | "avatar" | "score" | "permission" => {
+                    value.parse::<i64>().ok().map(|value| {
+                        let column = match field {
+                            "uid" => "uid",
+                            "avatar" => "avatar",
+                            "score" => "score",
+                            _ => "permission",
+                        };
+                        AdminUserSearchFilter::Integer {
+                            column,
+                            value,
+                            negated,
+                        }
+                    })
+                }
+                "verified" | "is_dark_mode" => {
+                    parse_legacy_bool(value).map(|value| AdminUserSearchFilter::Boolean {
+                        column: if field == "verified" {
+                            "verified"
+                        } else {
+                            "is_dark_mode"
+                        },
+                        value,
+                        negated,
+                    })
+                }
+                "email" | "nickname" | "ip" | "last_sign_at" | "register_at" => {
+                    Some(AdminUserSearchFilter::Text {
+                        column: match field {
+                            "email" => "email",
+                            "nickname" => "nickname",
+                            "ip" => "ip",
+                            "last_sign_at" => "last_sign_at",
+                            _ => "register_at",
+                        },
+                        value: value.to_owned(),
+                        contains: matches!(field, "last_sign_at" | "register_at"),
+                        negated,
+                    })
+                }
+                _ => None,
+            }
+        } else if matches!(token.as_str(), "verified" | "is_dark_mode") {
+            Some(AdminUserSearchFilter::Boolean {
+                column: if token == "verified" {
+                    "verified"
+                } else {
+                    "is_dark_mode"
+                },
+                value: !negated,
+                negated: false,
+            })
+        } else {
+            Some(AdminUserSearchFilter::Global {
+                value: token,
+                negated,
+            })
+        };
+        if let Some(filter) = filter {
+            current.push(filter);
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    let mut binds = Vec::new();
+    let mut group_sql = Vec::new();
+    for group in groups {
+        let mut conditions = Vec::new();
+        for filter in group {
+            let marker = |index: usize| {
+                if postgres {
+                    format!("${index}")
+                } else {
+                    "?".to_owned()
+                }
+            };
+            let idx = binds.len() + 1;
+            match filter {
+                AdminUserSearchFilter::Text {
+                    column,
+                    value,
+                    contains,
+                    negated,
+                } => {
+                    let operator = if negated {
+                        if contains { "NOT LIKE" } else { "<>" }
+                    } else if contains {
+                        "LIKE"
+                    } else {
+                        "="
+                    };
+                    let value = if contains {
+                        format!("%{value}%")
+                    } else {
+                        value
+                    };
+                    conditions.push(format!("LOWER({column}) {operator} LOWER({})", marker(idx)));
+                    binds.push(AdminUserSearchBind::Text(value));
+                }
+                AdminUserSearchFilter::Global { value, negated } => {
+                    let operator = if negated { "NOT LIKE" } else { "LIKE" };
+                    let join = if negated { "AND" } else { "OR" };
+                    conditions.push(format!(
+                        "(LOWER(email) {operator} LOWER({}) {join} LOWER(nickname) {operator} LOWER({}))",
+                        marker(idx), marker(idx + 1)
+                    ));
+                    let value = format!("%{value}%");
+                    binds.push(AdminUserSearchBind::Text(value.clone()));
+                    binds.push(AdminUserSearchBind::Text(value));
+                }
+                AdminUserSearchFilter::Integer {
+                    column,
+                    value,
+                    negated,
+                } => {
+                    let operator = if negated { "<>" } else { "=" };
+                    conditions.push(format!("{column} {operator} {}", marker(idx)));
+                    binds.push(AdminUserSearchBind::Integer(value));
+                }
+                AdminUserSearchFilter::Boolean {
+                    column,
+                    value,
+                    negated,
+                } => {
+                    let operator = if negated { "<>" } else { "=" };
+                    conditions.push(format!("{column} {operator} {}", marker(idx)));
+                    binds.push(AdminUserSearchBind::Boolean(value));
+                }
+            }
+        }
+        if !conditions.is_empty() {
+            group_sql.push(format!("({})", conditions.join(" AND ")));
+        }
+    }
+    if group_sql.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!(" WHERE {}", group_sql.join(" OR ")), binds)
+    }
+}
+
+fn split_user_search(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for ch in query.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ch if ch.is_whitespace() && !quoted => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            _ => token.push(ch),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn parse_legacy_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error(transparent)]
@@ -35,6 +261,22 @@ pub struct AccessTokenRecord {
     pub client_id: i64,
     pub revoked: bool,
 }
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct AdminUserRecord {
+    pub uid: i64,
+    pub email: String,
+    pub nickname: String,
+    pub locale: Option<String>,
+    pub score: i64,
+    pub avatar: i64,
+    pub permission: i32,
+    pub ip: String,
+    pub is_dark_mode: bool,
+    pub last_sign_at: String,
+    pub register_at: String,
+    pub verified: bool,
+}
+
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct OAuthClientRecord {
     pub id: i64,
@@ -2078,6 +2320,115 @@ impl DatabasePool {
                 .await?),
         }
     }
+
+    pub async fn admin_users(
+        &self,
+        prefix: &str,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminUserRecord>, i64), sqlx::Error> {
+        let sqlite = matches!(self, Self::Sqlite(_));
+        let mysql = matches!(self, Self::MySql(_));
+        let postgres = matches!(self, Self::Postgres(_));
+        let (where_sql, binds) = admin_user_where(search, postgres);
+        let (uid_cast, int_cast) = if sqlite {
+            ("BIGINT", "INTEGER")
+        } else if mysql {
+            ("SIGNED", "SIGNED")
+        } else {
+            ("BIGINT", "INTEGER")
+        };
+        let page_sql = if postgres {
+            format!(
+                "SELECT CAST(uid AS {uid_cast}) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, \
+                 CAST(avatar AS BIGINT) AS avatar, CAST(permission AS {int_cast}) AS permission, ip, is_dark_mode, \
+                 last_sign_at, register_at, verified FROM {prefix}users{where_sql} ORDER BY uid ASC LIMIT ${} OFFSET ${}",
+                binds.len() + 1,
+                binds.len() + 2
+            )
+        } else {
+            format!(
+                "SELECT CAST(uid AS {uid_cast}) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, \
+                 CAST(avatar AS BIGINT) AS avatar, CAST(permission AS {int_cast}) AS permission, ip, is_dark_mode, \
+                 last_sign_at, register_at, verified FROM {prefix}users{where_sql} ORDER BY uid ASC LIMIT ? OFFSET ?"
+            )
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM {prefix}users{where_sql}");
+        let (users, total) = match self {
+            Self::Sqlite(pool) => {
+                let mut page = sqlx::query_as::<_, AdminUserRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminUserSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminUserSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                        AdminUserSearchBind::Boolean(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let users = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (users, total)
+            }
+            Self::MySql(pool) => {
+                let mut page = sqlx::query_as::<_, AdminUserRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminUserSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminUserSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                        AdminUserSearchBind::Boolean(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let users = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (users, total)
+            }
+            Self::Postgres(pool) => {
+                let mut page = sqlx::query_as::<_, AdminUserRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminUserSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminUserSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                        AdminUserSearchBind::Boolean(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let users = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (users, total)
+            }
+        };
+        Ok((users, total))
+    }
+
     pub async fn oauth_clients_for_user(
         &self,
         prefix: &str,

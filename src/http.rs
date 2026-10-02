@@ -33,9 +33,9 @@ use crate::{
     AppState,
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
     database::{
-        DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
-        PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters, TextureInfoRecord,
-        UserProfile,
+        AdminUserRecord, DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord,
+        PlayerRenameOutcome, PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters,
+        TextureInfoRecord, UserProfile,
     },
 };
 
@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
             put(oauth_client_update).delete(oauth_client_delete),
         )
         .route("/user", get(web_dashboard))
+        .route("/admin/users/list", get(admin_user_list))
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route("/skinlib/list", get(skinlib_list))
@@ -77,6 +78,7 @@ pub fn router(state: AppState) -> Router {
             put(api_rename_closet_item).delete(api_remove_closet_item),
         )
         .route("/api/user/notifications", get(api_user_notifications))
+        .route("/api/admin/users", get(api_admin_user_list))
         .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/admin/reports", get(api_admin_report_list))
         .route("/api/admin/reports/{id}", put(api_review_report))
@@ -3048,6 +3050,12 @@ fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_jso
 }
 
 #[derive(Deserialize)]
+struct AdminUserListQuery {
+    q: Option<String>,
+    page: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct AdminReportListQuery {
     q: Option<String>,
     page: Option<i64>,
@@ -3097,6 +3105,151 @@ fn parse_report_search(query: Option<&str>) -> ParsedReportSearch {
         parsed.filters.reason = Some(free_text.join(" "));
     }
     parsed
+}
+
+async fn admin_user_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminUserListQuery>,
+) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_users_response(&state, query, "/admin/users/list").await
+        }
+        Ok(Some(_)) => forbidden_action(),
+        Ok(None) => Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load user administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_user_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminUserListQuery>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["UsersManagement.Read", "UsersManagement.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_users_response(&state, query, "/api/admin/users").await
+        }
+        Ok(Some(_)) | Ok(None) => forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API user administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn admin_users_response(state: &AppState, query: AdminUserListQuery, path: &str) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = 10_i64;
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let (users, total): (Vec<AdminUserRecord>, i64) = match database
+        .admin_users(
+            &state.config.database.table_prefix,
+            query.q.as_deref(),
+            per_page,
+            offset,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "failed to list users");
+            return unavailable();
+        }
+    };
+    let last_page = (total.saturating_add(per_page - 1) / per_page).max(1);
+    let first_page_url = admin_users_page_url(path, query.q.as_deref(), 1);
+    let last_page_url = admin_users_page_url(path, query.q.as_deref(), last_page);
+    let prev_page_url =
+        (page > 1).then(|| admin_users_page_url(path, query.q.as_deref(), page - 1));
+    let next_page_url =
+        (page < last_page).then(|| admin_users_page_url(path, query.q.as_deref(), page + 1));
+    let from = (!users.is_empty()).then_some(offset + 1);
+    let to = (!users.is_empty()).then_some(offset + users.len() as i64);
+    let mut links = vec![
+        serde_json::json!({"url": prev_page_url, "label": "&laquo; Previous", "active": false}),
+    ];
+    for number in 1..=last_page.min(100) {
+        links.push(serde_json::json!({
+            "url": admin_users_page_url(path, query.q.as_deref(), number),
+            "label": number.to_string(),
+            "active": number == page
+        }));
+    }
+    links.push(serde_json::json!({"url": next_page_url, "label": "Next &raquo;", "active": false}));
+    Json(serde_json::json!({
+        "current_page": page,
+        "data": users,
+        "first_page_url": first_page_url,
+        "from": from,
+        "last_page": last_page,
+        "last_page_url": last_page_url,
+        "links": links,
+        "next_page_url": next_page_url,
+        "path": path,
+        "per_page": per_page,
+        "prev_page_url": prev_page_url,
+        "to": to,
+        "total": total
+    }))
+    .into_response()
+}
+
+fn admin_users_page_url(path: &str, query: Option<&str>, page: i64) -> String {
+    let mut params = vec![format!("page={page}")];
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        params.push(format!("q={}", encode_query_value(query)));
+    }
+    format!("{path}?{}", params.join("&"))
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn forbidden_action() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "message": "This action is unauthorized." })),
+    )
+        .into_response()
 }
 
 async fn admin_report_list(
@@ -4525,6 +4678,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let users_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users_response.status(), StatusCode::UNAUTHORIZED);
         let report_response = app
             .oneshot(
                 Request::builder()
@@ -4871,6 +5035,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clients_after, serde_json::json!([]));
+
+        let users = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users/list?q=alex&page=1")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.status(), StatusCode::OK);
+        let users: serde_json::Value =
+            serde_json::from_slice(&to_bytes(users.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(users["current_page"], 1);
+        assert_eq!(users["last_page"], 1);
+        assert_eq!(users["total"], 1);
+        assert_eq!(users["data"][0]["uid"], 7);
+        assert_eq!(users["data"][0]["email"], "alex@example.test");
+        assert_eq!(users["data"][0]["ip"], "");
+        assert!(users["data"][0].get("password").is_none());
+
+        let combined_user_filter = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users/list?q=email%3Aalex%40example.test%20or%20uid%3A8&page=1")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(combined_user_filter.status(), StatusCode::OK);
+        let combined_user_filter: serde_json::Value = serde_json::from_slice(
+            &to_bytes(combined_user_filter.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(combined_user_filter["total"], 2);
+        assert_eq!(combined_user_filter["data"][0]["uid"], 7);
+        assert_eq!(combined_user_filter["data"][1]["uid"], 8);
 
         let reports = app
             .clone()
