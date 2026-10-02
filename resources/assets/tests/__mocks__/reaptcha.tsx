@@ -1,5 +1,9 @@
 import React from 'react'
-import type { ReaptchaProps } from 'reaptcha'
+type ReaptchaProps = {
+  sitekey: string
+  size?: 'normal' | 'invisible'
+  onVerify(value: string): void
+}
 
 class Reaptcha extends React.Component<ReaptchaProps, {}> {
   execute() {
