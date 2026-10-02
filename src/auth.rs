@@ -1,7 +1,12 @@
+use argon2::password_hash::PasswordHash;
+use argon2::{Algorithm as ArgonAlgorithm, Argon2, Params, PasswordVerifier, Version};
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use md5::{Digest, Md5};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Sha256, Sha512};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Deserialize)]
 pub struct PassportClaims {
@@ -46,6 +51,82 @@ pub fn audience_matches(audience: Option<&Value>, client_id: i64) -> bool {
     }
 }
 
+pub fn verify_legacy_password(password: &str, encoded: &str, method: &str, salt: &str) -> bool {
+    match method.to_ascii_uppercase().as_str() {
+        "BCRYPT" => verify_bcrypt(password, encoded),
+        "ARGON2I" => verify_argon2(password, encoded),
+        "PHP_PASSWORD_HASH" => {
+            if encoded.starts_with("$2") {
+                verify_bcrypt(password, encoded)
+            } else if encoded.starts_with("$argon2") {
+                verify_argon2(password, encoded)
+            } else {
+                false
+            }
+        }
+        "MD5" => constant_time_equal(encoded, &format!("{:x}", Md5::digest(password.as_bytes()))),
+        "SALTED2MD5" => {
+            let first = format!("{:x}", Md5::digest(password.as_bytes()));
+            constant_time_equal(
+                encoded,
+                &format!("{:x}", Md5::digest(format!("{first}{salt}"))),
+            )
+        }
+        "SHA256" => constant_time_equal(
+            encoded,
+            &format!("{:x}", Sha256::digest(password.as_bytes())),
+        ),
+        "SALTED2SHA256" => {
+            let first = format!("{:x}", Sha256::digest(password.as_bytes()));
+            constant_time_equal(
+                encoded,
+                &format!("{:x}", Sha256::digest(format!("{first}{salt}"))),
+            )
+        }
+        "SHA512" => constant_time_equal(
+            encoded,
+            &format!("{:x}", Sha512::digest(password.as_bytes())),
+        ),
+        "SALTED2SHA512" => {
+            let first = format!("{:x}", Sha512::digest(password.as_bytes()));
+            constant_time_equal(
+                encoded,
+                &format!("{:x}", Sha512::digest(format!("{first}{salt}"))),
+            )
+        }
+        _ => false,
+    }
+}
+
+fn verify_bcrypt(password: &str, encoded: &str) -> bool {
+    let normalized;
+    let encoded = if let Some(rest) = encoded.strip_prefix("$2y$") {
+        normalized = format!("$2b${rest}");
+        normalized.as_str()
+    } else {
+        encoded
+    };
+    bcrypt::verify(password, encoded).unwrap_or(false)
+}
+
+fn verify_argon2(password: &str, encoded: &str) -> bool {
+    let Ok(hash) = PasswordHash::new(encoded) else {
+        return false;
+    };
+    let algorithm = match hash.algorithm.as_str() {
+        "argon2i" => ArgonAlgorithm::Argon2i,
+        "argon2id" => ArgonAlgorithm::Argon2id,
+        "argon2d" => ArgonAlgorithm::Argon2d,
+        _ => return false,
+    };
+    Argon2::new(algorithm, Version::V0x13, Params::default())
+        .verify_password(password.as_bytes(), &hash)
+        .is_ok()
+}
+
+fn constant_time_equal(actual: &str, expected: &str) -> bool {
+    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+}
 #[cfg(test)]
 mod tests {
     use super::{PassportClaims, audience_matches, bearer_token, has_scope};
@@ -87,5 +168,79 @@ mod tests {
         };
         assert!(has_scope(&claims, "User.Read"));
         assert!(!has_scope(&claims, "Player.Read"));
+    }
+
+    #[test]
+    fn verifies_php_bcrypt_2y_hashes() {
+        let hash = bcrypt::hash("password", 4)
+            .unwrap()
+            .replacen("$2b$", "$2y$", 1);
+        assert!(super::verify_legacy_password(
+            "password", &hash, "BCRYPT", ""
+        ));
+        assert!(!super::verify_legacy_password("wrong", &hash, "BCRYPT", ""));
+    }
+
+    #[test]
+    fn verifies_legacy_digest_and_salted_digest_formats() {
+        assert!(super::verify_legacy_password(
+            "password",
+            "5f4dcc3b5aa765d61d8327deb882cf99",
+            "MD5",
+            ""
+        ));
+        assert!(super::verify_legacy_password(
+            "password",
+            "1931a728dc5e84865a8b465882510799",
+            "SALTED2MD5",
+            "pepper"
+        ));
+        assert!(super::verify_legacy_password(
+            "password",
+            "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
+            "SHA256",
+            ""
+        ));
+        assert!(super::verify_legacy_password(
+            "password",
+            "af9c6750ff1ee6fcf123a7962108d4819701976528db91faf65821af04148ee3",
+            "SALTED2SHA256",
+            "pepper"
+        ));
+    }
+
+    #[test]
+    fn verifies_php_password_hash_argon2i_phc_strings() {
+        use argon2::password_hash::SaltString;
+        use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
+
+        let salt = SaltString::from_b64("c2FsdHlzYWx0").unwrap();
+        let hasher = Argon2::new(Algorithm::Argon2i, Version::V0x13, Params::default());
+        let hash = hasher
+            .hash_password(b"password", &salt)
+            .unwrap()
+            .to_string();
+        assert!(super::verify_legacy_password(
+            "password", &hash, "ARGON2I", ""
+        ));
+        assert!(!super::verify_legacy_password(
+            "wrong", &hash, "ARGON2I", ""
+        ));
+    }
+
+    #[test]
+    fn verifies_sha512_and_salted_sha512_legacy_hashes() {
+        assert!(super::verify_legacy_password(
+            "password",
+            "b109f3bbbc244eb82441917ed06d618b9008dd09b3befd1b5e07394c706a8bb980b1d7785e5976ec049b46df5f1326af5a2ea6d103fd07c95385ffab0cacbc86",
+            "SHA512",
+            ""
+        ));
+        assert!(super::verify_legacy_password(
+            "password",
+            "7ab78923e29b98e49adc97c3885cc8d8b1c3baefd4521b81da6704fed4f4822d8f449bf1c9862a144a34472046c702bd1a18c4ea81987cd4d8575cef58851e5c",
+            "SALTED2SHA512",
+            "pepper"
+        ));
     }
 }
