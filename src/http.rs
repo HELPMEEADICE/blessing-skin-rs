@@ -74,6 +74,14 @@ pub fn router(state: AppState) -> Router {
             put(web_admin_user_permission),
         )
         .route("/admin/users/{uid}", delete(web_admin_user_delete))
+        .route("/admin/players/list", get(admin_player_list))
+        .route("/admin/players/{pid}/name", put(web_admin_player_name))
+        .route("/admin/players/{pid}/owner", put(web_admin_player_owner))
+        .route(
+            "/admin/players/{pid}/textures",
+            put(web_admin_player_texture),
+        )
+        .route("/admin/players/{pid}", delete(web_admin_player_delete))
         .route("/admin/reports/list", get(admin_report_list))
         .route("/admin/reports/{id}", put(web_review_report))
         .route("/skinlib/list", get(skinlib_list))
@@ -114,6 +122,17 @@ pub fn router(state: AppState) -> Router {
             put(api_admin_user_permission),
         )
         .route("/api/admin/users/{uid}", delete(api_admin_user_delete))
+        .route("/api/admin/players", get(api_admin_player_list))
+        .route("/api/admin/players/{pid}/name", put(api_admin_player_name))
+        .route(
+            "/api/admin/players/{pid}/owner",
+            put(api_admin_player_owner),
+        )
+        .route(
+            "/api/admin/players/{pid}/textures",
+            put(api_admin_player_texture),
+        )
+        .route("/api/admin/players/{pid}", delete(api_admin_player_delete))
         .route("/api/admin/notifications", post(api_send_notification))
         .route("/api/admin/reports", get(api_admin_report_list))
         .route("/api/admin/reports/{id}", put(api_review_report))
@@ -3491,6 +3510,12 @@ fn admin_user_validation_error(field: &str, rule: &str, locale: &str) -> Respons
 }
 
 #[derive(Deserialize)]
+struct AdminPlayerListQuery {
+    q: Option<String>,
+    page: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct AdminUserListQuery {
     q: Option<String>,
     page: Option<i64>,
@@ -3546,6 +3571,489 @@ fn parse_report_search(query: Option<&str>) -> ParsedReportSearch {
         parsed.filters.reason = Some(free_text.join(" "));
     }
     parsed
+}
+
+async fn admin_player_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminPlayerListQuery>,
+) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_players_response(&state, query, "/admin/players/list").await
+        }
+        Ok(Some(_)) => forbidden_action(),
+        Ok(None) => Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn api_admin_player_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminPlayerListQuery>,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_any_scope(&["PlayersManagement.Read", "PlayersManagement.ReadWrite"]) {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_players_response(&state, query, "/api/admin/players").await
+        }
+        Ok(Some(_)) | Ok(None) => forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API player administrator");
+            unavailable()
+        }
+    }
+}
+
+async fn admin_players_response(
+    state: &AppState,
+    query: AdminPlayerListQuery,
+    path: &str,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = 10_i64;
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let (players, total) = match database
+        .admin_players(
+            &state.config.database.table_prefix,
+            query.q.as_deref(),
+            per_page,
+            offset,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "failed to list managed players");
+            return unavailable();
+        }
+    };
+    let last_page = (total.saturating_add(per_page - 1) / per_page).max(1);
+    let first_page_url = admin_users_page_url(path, query.q.as_deref(), 1);
+    let last_page_url = admin_users_page_url(path, query.q.as_deref(), last_page);
+    let prev_page_url =
+        (page > 1).then(|| admin_users_page_url(path, query.q.as_deref(), page - 1));
+    let next_page_url =
+        (page < last_page).then(|| admin_users_page_url(path, query.q.as_deref(), page + 1));
+    let from = (!players.is_empty()).then_some(offset + 1);
+    let to = (!players.is_empty()).then_some(offset + players.len() as i64);
+    let mut links = vec![
+        serde_json::json!({"url": prev_page_url, "label": "&laquo; Previous", "active": false}),
+    ];
+    for number in 1..=last_page.min(100) {
+        links.push(serde_json::json!({
+            "url": admin_users_page_url(path, query.q.as_deref(), number),
+            "label": number.to_string(),
+            "active": number == page
+        }));
+    }
+    links.push(serde_json::json!({"url": next_page_url, "label": "Next &raquo;", "active": false}));
+    Json(serde_json::json!({
+        "current_page": page,
+        "data": players,
+        "first_page_url": first_page_url,
+        "from": from,
+        "last_page": last_page,
+        "last_page_url": last_page_url,
+        "links": links,
+        "next_page_url": next_page_url,
+        "path": path,
+        "per_page": per_page,
+        "prev_page_url": prev_page_url,
+        "to": to,
+        "total": total
+    }))
+    .into_response()
+}
+
+#[derive(Clone, Copy)]
+enum AdminPlayerMutation {
+    Name,
+    Owner,
+    Texture,
+    Delete,
+}
+
+macro_rules! define_admin_player_mutation_handlers {
+    ($(($web:ident, $api:ident, $kind:ident)),+ $(,)?) => {
+        $(
+            async fn $web(
+                State(state): State<AppState>,
+                headers: HeaderMap,
+                RoutePath(pid): RoutePath<i64>,
+                body: Bytes,
+            ) -> Response {
+                web_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
+            }
+
+            async fn $api(
+                State(state): State<AppState>,
+                headers: HeaderMap,
+                RoutePath(pid): RoutePath<i64>,
+                body: Bytes,
+            ) -> Response {
+                api_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
+            }
+        )+
+    };
+}
+
+define_admin_player_mutation_handlers!(
+    (web_admin_player_name, api_admin_player_name, Name),
+    (web_admin_player_owner, api_admin_player_owner, Owner),
+    (web_admin_player_texture, api_admin_player_texture, Texture),
+    (web_admin_player_delete, api_admin_player_delete, Delete),
+);
+
+async fn web_admin_player_mutation(
+    state: AppState,
+    headers: HeaderMap,
+    pid: i64,
+    body: Bytes,
+    mutation: AdminPlayerMutation,
+) -> Response {
+    let Some(actor_uid) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let actor = match database
+        .user_profile(&state.config.database.table_prefix, actor_uid)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => user,
+        Ok(Some(_)) => return forbidden_action(),
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player administrator");
+            return unavailable();
+        }
+    };
+    apply_admin_player_mutation(&state, actor.uid, actor.permission, pid, &body, mutation).await
+}
+
+async fn api_admin_player_mutation(
+    state: AppState,
+    headers: HeaderMap,
+    pid: i64,
+    body: Bytes,
+    mutation: AdminPlayerMutation,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("PlayersManagement.ReadWrite") {
+        return missing_scope();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let actor = match database
+        .user_profile(&state.config.database.table_prefix, identity.user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission >= 1 => user,
+        Ok(Some(_)) | Ok(None) => return forbidden_action(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load API player administrator");
+            return unavailable();
+        }
+    };
+    apply_admin_player_mutation(&state, actor.uid, actor.permission, pid, &body, mutation).await
+}
+
+async fn apply_admin_player_mutation(
+    state: &AppState,
+    actor_uid: i64,
+    actor_permission: i32,
+    pid: i64,
+    body: &[u8],
+    mutation: AdminPlayerMutation,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let player = match database.admin_player_for_update(prefix, pid).await {
+        Ok(Some(player)) => player,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, pid, "failed to load managed player");
+            return unavailable();
+        }
+    };
+    if player.uid != actor_uid && player.owner_permission >= actor_permission {
+        return admin_player_permission_error(&state.config.locale);
+    }
+    match mutation {
+        AdminPlayerMutation::Name => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(name) = request
+                .as_ref()
+                .and_then(|value| value.get("player_name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return admin_player_validation_error("player_name", &state.config.locale);
+            };
+            let min_length = database
+                .option(prefix, "player_name_length_min")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(3);
+            let max_length = database
+                .option(prefix, "player_name_length_max")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16);
+            let rule = database
+                .option(prefix, "player_name_rule")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "official".to_owned());
+            let custom_rule = database
+                .option(prefix, "custom_player_name_regexp")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if !valid_player_name(name, &rule, &custom_rule, min_length, max_length) {
+                return admin_player_validation_error("player_name", &state.config.locale);
+            }
+            match database.admin_player_name_exists(prefix, name).await {
+                Ok(true) => {
+                    return admin_player_validation_error("player_name", &state.config.locale);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, pid, "failed to check player-name uniqueness");
+                    return unavailable();
+                }
+            }
+            if let Err(error) = database
+                .update_admin_player_text(prefix, pid, "name", name)
+                .await
+            {
+                tracing::error!(%error, pid, "failed to rename managed player");
+                return unavailable();
+            }
+            admin_player_success(AdminPlayerMutation::Name, &state.config.locale, name, None)
+        }
+        AdminPlayerMutation::Owner => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(uid) = request
+                .as_ref()
+                .and_then(|value| value.get("uid"))
+                .and_then(|value| request_i64(Some(value)))
+            else {
+                return admin_player_validation_error("uid", &state.config.locale);
+            };
+            let owner = match database.user_profile(prefix, uid).await {
+                Ok(Some(owner)) => owner,
+                Ok(None) => {
+                    return login_result(1, admin_user_missing_message(&state.config.locale), None);
+                }
+                Err(error) => {
+                    tracing::error!(%error, uid, "failed to load new player owner");
+                    return unavailable();
+                }
+            };
+            if let Err(error) = database
+                .update_admin_player_integer(prefix, pid, "uid", uid)
+                .await
+            {
+                tracing::error!(%error, pid, "failed to transfer player ownership");
+                return unavailable();
+            }
+            admin_player_success(
+                AdminPlayerMutation::Owner,
+                &state.config.locale,
+                &player.name,
+                Some(&owner.nickname),
+            )
+        }
+        AdminPlayerMutation::Texture => {
+            let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let Some(tid) = request
+                .as_ref()
+                .and_then(|value| value.get("tid"))
+                .and_then(|value| request_i64(Some(value)))
+            else {
+                return admin_player_validation_error("tid", &state.config.locale);
+            };
+            let Some(texture_type) = request
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| matches!(*value, "skin" | "cape"))
+            else {
+                return admin_player_validation_error("type", &state.config.locale);
+            };
+            if tid != 0 {
+                match database.texture_info(prefix, tid).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let message = admin_texture_missing_message(tid, &state.config.locale);
+                        return login_result(1, &message, None);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, tid, "failed to check managed texture");
+                        return unavailable();
+                    }
+                }
+            }
+            let column = if texture_type == "skin" {
+                "tid_skin"
+            } else {
+                "tid_cape"
+            };
+            if let Err(error) = database
+                .update_admin_player_integer(prefix, pid, column, tid)
+                .await
+            {
+                tracing::error!(%error, pid, "failed to update managed player texture");
+                return unavailable();
+            }
+            admin_player_success(
+                AdminPlayerMutation::Texture,
+                &state.config.locale,
+                &player.name,
+                None,
+            )
+        }
+        AdminPlayerMutation::Delete => match database.delete_admin_player(prefix, pid).await {
+            Ok(true) => admin_player_success(
+                AdminPlayerMutation::Delete,
+                &state.config.locale,
+                &player.name,
+                None,
+            ),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::error!(%error, pid, "failed to delete managed player");
+                unavailable()
+            }
+        },
+    }
+}
+
+fn admin_user_missing_message(locale: &str) -> &'static str {
+    if locale.starts_with("zh") {
+        "用户不存在"
+    } else {
+        "No such user."
+    }
+}
+
+fn admin_texture_missing_message(tid: i64, locale: &str) -> String {
+    if locale.starts_with("zh") {
+        format!("材质 tid.{tid} 不存在")
+    } else {
+        format!("No such texture tid.{tid}")
+    }
+}
+
+fn admin_player_permission_error(locale: &str) -> Response {
+    let message = if locale.starts_with("zh") {
+        "你无权操作此角色"
+    } else {
+        "You have no permission to operate this player."
+    };
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"code": 1, "message": message})),
+    )
+        .into_response()
+}
+
+fn admin_player_validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("player_name", true) => "角色名格式或长度无效。",
+        ("player_name", false) => "The player name format or length is invalid.",
+        ("uid", true) => "UID 必须是整数。",
+        ("uid", false) => "The uid field must be an integer.",
+        ("tid", true) => "材质 tid 必须是整数。",
+        ("tid", false) => "The tid field must be an integer.",
+        ("type", true) => "材质类型必须是 skin 或 cape。",
+        ("type", false) => "The type field must be skin or cape.",
+        _ => "The given field is invalid.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({"message": message, "errors": {field: [field_error]}})),
+    )
+        .into_response()
+}
+
+fn admin_player_success(
+    mutation: AdminPlayerMutation,
+    locale: &str,
+    player: &str,
+    owner: Option<&str>,
+) -> Response {
+    let message = match (mutation, locale.starts_with("zh")) {
+        (AdminPlayerMutation::Name, true) => format!("角色名成功更改为 {player}"),
+        (AdminPlayerMutation::Name, false) => format!("Player name has been updated to {player}"),
+        (AdminPlayerMutation::Owner, true) => format!(
+            "角色 {player} 已被转给用户 {} 。",
+            owner.unwrap_or_default()
+        ),
+        (AdminPlayerMutation::Owner, false) => format!(
+            "The player {player} was transferred to user {}.",
+            owner.unwrap_or_default()
+        ),
+        (AdminPlayerMutation::Texture, true) => format!("角色 {player} 的材质修改成功"),
+        (AdminPlayerMutation::Texture, false) => {
+            format!("The textures of {player} has been updated.")
+        }
+        (AdminPlayerMutation::Delete, true) => "角色已删除".to_owned(),
+        (AdminPlayerMutation::Delete, false) => {
+            "The player has been deleted successfully.".to_owned()
+        }
+    };
+    login_result(0, &message, None)
 }
 
 async fn admin_user_list(
@@ -5476,6 +5984,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clients_after, serde_json::json!([]));
+
+        let managed_players = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/players/list?q=name%3AAlex&page=1")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(managed_players.status(), StatusCode::OK);
+        let managed_players: serde_json::Value = serde_json::from_slice(
+            &to_bytes(managed_players.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(managed_players["total"], 1);
+        assert_eq!(managed_players["data"][0]["pid"], 3);
+        assert_eq!(managed_players["data"][0]["uid"], 7);
+
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (13,'Admin texture','alex','admin-hash',8,7,1,'2026-10-01 10:05:00',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (uri, body) in [
+            ("/admin/players/3/name", r#"{"player_name":"AlexRenamed"}"#),
+            ("/admin/players/3/owner", r#"{"uid":8}"#),
+            ("/admin/players/3/textures", r#"{"type":"skin","tid":13}"#),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("cookie", cookie.clone())
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let response: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(response["code"], 0, "{uri}");
+        }
+        let managed_player: (i64, String, i64, i64) =
+            sqlx::query_as("SELECT uid,name,tid_skin,tid_cape FROM players WHERE pid = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(managed_player, (8, "AlexRenamed".to_owned(), 13, 0));
+        let removed_player = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/players/3")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed_player.status(), StatusCode::OK);
+        let player_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM players WHERE pid = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(player_count, 0);
 
         let users = app
             .clone()

@@ -239,6 +239,120 @@ fn parse_legacy_bool(value: &str) -> Option<bool> {
     }
 }
 
+#[derive(Debug)]
+enum AdminPlayerSearchBind {
+    Text(String),
+    Integer(i64),
+}
+
+#[derive(Debug)]
+enum AdminPlayerSearchFilter {
+    Text {
+        column: &'static str,
+        value: String,
+        contains: bool,
+    },
+    Global(String),
+    Integer {
+        column: &'static str,
+        value: i64,
+    },
+}
+
+fn admin_player_where(query: Option<&str>, postgres: bool) -> (String, Vec<AdminPlayerSearchBind>) {
+    let mut groups: Vec<Vec<AdminPlayerSearchFilter>> = Vec::new();
+    let mut current = Vec::new();
+    for token in split_user_search(query.unwrap_or_default()) {
+        if token.eq_ignore_ascii_case("and") {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("or") {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let filter = if let Some((field, value)) = token.split_once(':') {
+            let value = value.trim_matches('"');
+            match field {
+                "pid" | "uid" | "skin" | "tid_skin" | "cape" | "tid_cape" => value
+                    .parse::<i64>()
+                    .ok()
+                    .map(|value| AdminPlayerSearchFilter::Integer {
+                        column: match field {
+                            "pid" => "pid",
+                            "uid" => "uid",
+                            "skin" | "tid_skin" => "tid_skin",
+                            _ => "tid_cape",
+                        },
+                        value,
+                    }),
+                "name" => Some(AdminPlayerSearchFilter::Text {
+                    column: "name",
+                    value: value.to_owned(),
+                    contains: false,
+                }),
+                "last_modified" => Some(AdminPlayerSearchFilter::Text {
+                    column: "last_modified",
+                    value: format!("%{value}%"),
+                    contains: true,
+                }),
+                _ => None,
+            }
+        } else {
+            Some(AdminPlayerSearchFilter::Global(token))
+        };
+        if let Some(filter) = filter {
+            current.push(filter);
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    let mut binds = Vec::new();
+    let mut group_sql = Vec::new();
+    for group in groups {
+        let mut conditions = Vec::new();
+        for filter in group {
+            let marker = |index: usize| {
+                if postgres {
+                    format!("${index}")
+                } else {
+                    "?".to_owned()
+                }
+            };
+            let index = binds.len() + 1;
+            match filter {
+                AdminPlayerSearchFilter::Text {
+                    column,
+                    value,
+                    contains,
+                } => {
+                    let operator = if contains { "LIKE" } else { "=" };
+                    conditions.push(format!("{column} {operator} {}", marker(index)));
+                    binds.push(AdminPlayerSearchBind::Text(value));
+                }
+                AdminPlayerSearchFilter::Global(value) => {
+                    conditions.push(format!("LOWER(name) LIKE LOWER({})", marker(index)));
+                    binds.push(AdminPlayerSearchBind::Text(format!("%{value}%")));
+                }
+                AdminPlayerSearchFilter::Integer { column, value } => {
+                    conditions.push(format!("{column} = {}", marker(index)));
+                    binds.push(AdminPlayerSearchBind::Integer(value));
+                }
+            }
+        }
+        if !conditions.is_empty() {
+            group_sql.push(format!("({})", conditions.join(" AND ")));
+        }
+    }
+    if group_sql.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!(" WHERE {}", group_sql.join(" OR ")), binds)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error(transparent)]
@@ -261,6 +375,17 @@ pub struct AccessTokenRecord {
     pub client_id: i64,
     pub revoked: bool,
 }
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct AdminPlayerManagementRecord {
+    pub pid: i64,
+    pub uid: i64,
+    pub name: String,
+    pub tid_skin: i64,
+    pub tid_cape: i64,
+    pub last_modified: String,
+    pub owner_permission: i32,
+}
+
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct AdminUserRecord {
     pub uid: i64,
@@ -2319,6 +2444,283 @@ impl DatabasePool {
                 .fetch_one(pool)
                 .await?),
         }
+    }
+
+    pub async fn admin_players(
+        &self,
+        prefix: &str,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlayerRecord>, i64), sqlx::Error> {
+        let postgres = matches!(self, Self::Postgres(_));
+        let (where_sql, binds) = admin_player_where(search, postgres);
+        let page_sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, CAST(tid_skin AS BIGINT) AS tid_skin, \
+                 CAST(tid_cape AS BIGINT) AS tid_cape, CAST(last_modified AS TEXT) AS last_modified \
+                 FROM {prefix}players{where_sql} ORDER BY pid ASC LIMIT ? OFFSET ?"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(pid AS SIGNED) AS pid, CAST(uid AS SIGNED) AS uid, name, CAST(tid_skin AS SIGNED) AS tid_skin, \
+                 CAST(tid_cape AS SIGNED) AS tid_cape, DATE_FORMAT(last_modified, '%Y-%m-%d %H:%i:%s') AS last_modified \
+                 FROM {prefix}players{where_sql} ORDER BY pid ASC LIMIT ? OFFSET ?"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, CAST(tid_skin AS BIGINT) AS tid_skin, \
+                 CAST(tid_cape AS BIGINT) AS tid_cape, to_char(last_modified, 'YYYY-MM-DD HH24:MI:SS') AS last_modified \
+                 FROM {prefix}players{where_sql} ORDER BY pid ASC LIMIT ${} OFFSET ${}",
+                binds.len() + 1,
+                binds.len() + 2
+            ),
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM {prefix}players{where_sql}");
+        let (players, total) = match self {
+            Self::Sqlite(pool) => {
+                let mut page = sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminPlayerSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminPlayerSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let players = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (players, total)
+            }
+            Self::MySql(pool) => {
+                let mut page = sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminPlayerSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminPlayerSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let players = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (players, total)
+            }
+            Self::Postgres(pool) => {
+                let mut page = sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(page_sql));
+                let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+                for bind in &binds {
+                    match bind {
+                        AdminPlayerSearchBind::Text(value) => {
+                            page = page.bind(value.clone());
+                            count = count.bind(value.clone());
+                        }
+                        AdminPlayerSearchBind::Integer(value) => {
+                            page = page.bind(*value);
+                            count = count.bind(*value);
+                        }
+                    }
+                }
+                let players = page.bind(limit).bind(offset).fetch_all(pool).await?;
+                let total = count.fetch_one(pool).await?;
+                (players, total)
+            }
+        };
+        Ok((players, total))
+    }
+
+    pub async fn admin_player_for_update(
+        &self,
+        prefix: &str,
+        pid: i64,
+    ) -> Result<Option<AdminPlayerManagementRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(p.pid AS BIGINT) AS pid, CAST(p.uid AS BIGINT) AS uid, p.name, \
+                 CAST(p.tid_skin AS BIGINT) AS tid_skin, CAST(p.tid_cape AS BIGINT) AS tid_cape, \
+                 CAST(p.last_modified AS TEXT) AS last_modified, u.permission AS owner_permission \
+                 FROM {prefix}players p JOIN {prefix}users u ON u.uid = p.uid WHERE p.pid = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(p.pid AS SIGNED) AS pid, CAST(p.uid AS SIGNED) AS uid, p.name, \
+                 CAST(p.tid_skin AS SIGNED) AS tid_skin, CAST(p.tid_cape AS SIGNED) AS tid_cape, \
+                 DATE_FORMAT(p.last_modified, '%Y-%m-%d %H:%i:%s') AS last_modified, u.permission AS owner_permission \
+                 FROM {prefix}players p JOIN {prefix}users u ON u.uid = p.uid WHERE p.pid = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(p.pid AS BIGINT) AS pid, CAST(p.uid AS BIGINT) AS uid, p.name, \
+                 CAST(p.tid_skin AS BIGINT) AS tid_skin, CAST(p.tid_cape AS BIGINT) AS tid_cape, \
+                 to_char(p.last_modified, 'YYYY-MM-DD HH24:MI:SS') AS last_modified, u.permission AS owner_permission \
+                 FROM {prefix}players p JOIN {prefix}users u ON u.uid = p.uid WHERE p.pid = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, AdminPlayerManagementRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(pid)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, AdminPlayerManagementRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(pid)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, AdminPlayerManagementRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(pid)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn admin_player_name_exists(
+        &self,
+        prefix: &str,
+        name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("SELECT COUNT(*) FROM {prefix}players WHERE name = $1"),
+            _ => format!("SELECT COUNT(*) FROM {prefix}players WHERE name = ?"),
+        };
+        let count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(count > 0)
+    }
+
+    pub async fn update_admin_player_text(
+        &self,
+        prefix: &str,
+        pid: i64,
+        column: &'static str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}players SET {column} = $1, last_modified = CURRENT_TIMESTAMP WHERE pid = $2"
+            ),
+            _ => format!(
+                "UPDATE {prefix}players SET {column} = ?, last_modified = CURRENT_TIMESTAMP WHERE pid = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn update_admin_player_integer(
+        &self,
+        prefix: &str,
+        pid: i64,
+        column: &'static str,
+        value: i64,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}players SET {column} = $1, last_modified = CURRENT_TIMESTAMP WHERE pid = $2"
+            ),
+            _ => format!(
+                "UPDATE {prefix}players SET {column} = ?, last_modified = CURRENT_TIMESTAMP WHERE pid = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .bind(pid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_admin_player(&self, prefix: &str, pid: i64) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("DELETE FROM {prefix}players WHERE pid = $1"),
+            _ => format!("DELETE FROM {prefix}players WHERE pid = ?"),
+        };
+        let affected = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(pid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(pid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(pid)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        Ok(affected > 0)
     }
 
     pub async fn admin_users(
