@@ -2515,6 +2515,11 @@ struct PlayerManagementPage {
     rule_label: String,
     min_length: usize,
     max_length: usize,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -4081,6 +4086,13 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
             return unavailable();
         }
     };
+    let player_count = match database.players_for_user(prefix, user.uid).await {
+        Ok(players) => players.len(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to load player count for management page");
+            return unavailable();
+        }
+    };
     let chinese = state.config.locale.starts_with("zh");
     let rule_label = match (chinese, rule.as_str()) {
         (true, "official") => "仅允许官方角色名字符".to_owned(),
@@ -4094,14 +4106,44 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
         (true, _) => "站点自定义角色名规则".to_owned(),
         (false, _) => "Site-defined player-name rule".to_owned(),
     };
+    let length_label = if chinese {
+        format!("角色名长度至少为 {min_length} 个字符，最多不超过 {max_length} 个字符。")
+    } else {
+        format!(
+            "The player name should be at least {min_length} characters and not greater than {max_length} characters."
+        )
+    };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "user/player",
+        serde_json::json!({
+            "count": player_count,
+            "rule": rule_label,
+            "length": length_label,
+            "score": user.score,
+            "cost": score_per_player,
+        }),
+        i18n,
+    );
     let page = PlayerManagementPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         user,
         score_per_player,
         rule_label,
         min_length,
         max_length,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13951,8 +13993,28 @@ mod tests {
         assert_eq!(player_page.status(), StatusCode::OK);
         let player_page = to_bytes(player_page.into_body(), usize::MAX).await.unwrap();
         let player_page = String::from_utf8(player_page.to_vec()).unwrap();
-        assert!(player_page.contains("Add player"));
-        assert!(player_page.contains("/user/player/list"));
+        assert!(player_page.contains(r#"id="players-list""#));
+        assert!(player_page.contains(r#"id="previewer""#));
+        assert!(player_page.contains("http://localhost/app/style.012abcd.css"));
+        assert!(player_page.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_player_globals = player_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let player_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_player_globals)
+            .unwrap();
+        let player_globals: serde_json::Value =
+            serde_json::from_slice(&player_globals_bytes).unwrap();
+        assert_eq!(player_globals["route"], "user/player");
+        assert_eq!(player_globals["extra"]["count"], 1);
+        assert!(player_globals["extra"]["score"].is_number());
+        assert!(player_globals["extra"]["cost"].is_number());
+        assert!(player_globals["extra"]["rule"].is_string());
+        assert!(player_globals["extra"]["length"].is_string());
 
         let player_list =
             session_request(&app, &registered_cookie, "GET", "/user/player/list", None).await;

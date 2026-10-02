@@ -14,6 +14,9 @@
     #message { min-height:1.5rem; } li { align-items:center; border-bottom:1px solid #e5e7eb; display:flex; flex-wrap:wrap; gap:.6rem; justify-content:space-between; padding:.8rem 0; }
     .actions { display:flex; flex-wrap:wrap; gap:.4rem; } .muted { color:#667085; font-size:.92rem; }
   </style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
   <main>
@@ -22,8 +25,14 @@
         <h1>{{ site_name }} · {% if locale.starts_with("zh") %}角色管理{% else %}Players{% endif %}</h1>
         <div class="muted">{{ user.nickname }} · {% if locale.starts_with("zh") %}当前积分{% else %}Current score{% endif %}: {{ user.score }}</div>
       </div>
-      <nav><a href="/user">{% if locale.starts_with("zh") %}控制台{% else %}Dashboard{% endif %}</a> · <button id="logout" type="button">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></nav>
+      <nav><a href="/user">{% if locale.starts_with("zh") %}控制台{% else %}Dashboard{% endif %}</a> · <button id="{% if frontend_script_available %}logout-button{% else %}logout{% endif %}" type="button">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></nav>
     </header>
+    {% if frontend_script_available %}
+    <div class="row">
+      <div class="col-md-7"><div id="players-list"></div></div>
+      <div class="col-md-5"><div id="previewer"></div></div>
+    </div>
+    {% else %}
     <p class="muted">{{ rule_label }} · {% if locale.starts_with("zh") %}长度{% else %}Length{% endif %}: {{ min_length }}–{{ max_length }} · {% if locale.starts_with("zh") %}添加角色消耗{% else %}Cost per player{% endif %}: {{ score_per_player }}</p>
     <form id="add-player">
       <input id="new-player-name" name="name" type="text" minlength="{{ min_length }}" maxlength="{{ max_length }}" placeholder="{% if locale.starts_with("zh") %}新角色名{% else %}New player name{% endif %}" required>
@@ -31,7 +40,9 @@
     </form>
     <div id="message" role="status"></div>
     <ul id="players" aria-live="polite"></ul>
+    {% endif %}
   </main>
+  {% if frontend_script_available %}{% else %}
   <script>
     const list = document.getElementById('players');
     const message = document.getElementById('message');
@@ -124,6 +135,7 @@
       window.location.href = '/auth/login';
     });
     load();
-  </script>
+  </script>{% endif %}
+  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>
