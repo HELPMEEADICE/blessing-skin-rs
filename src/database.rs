@@ -121,6 +121,12 @@ pub enum ReportSubmissionOutcome {
     InsufficientScore,
     Submitted,
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum TexturePrivacyOutcome {
+    DuplicatePublicTexture(i64),
+    InsufficientScore,
+    Updated { is_public: bool },
+}
 #[derive(Debug)]
 pub enum PlayerRenameOutcome {
     NotFound,
@@ -393,6 +399,160 @@ impl DatabasePool {
             }
         }
         Ok(ReportSubmissionOutcome::Submitted)
+    }
+    pub async fn toggle_texture_privacy(
+        &self,
+        prefix: &str,
+        tid: i64,
+        uploader_id: i64,
+        hash: &str,
+        was_public: bool,
+        score_diff: i64,
+    ) -> Result<TexturePrivacyOutcome, sqlx::Error> {
+        let is_public = !was_public;
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql =
+                    format!("SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = ?");
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                };
+                if score.saturating_add(score_diff) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                }
+                if is_public {
+                    let duplicate_sql = format!(
+                        "SELECT tid FROM {prefix}textures WHERE hash = ? AND public = TRUE LIMIT 1"
+                    );
+                    if let Some(duplicate_tid) =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                            .bind(hash)
+                            .fetch_optional(&mut *transaction)
+                            .await?
+                    {
+                        transaction.rollback().await?;
+                        return Ok(TexturePrivacyOutcome::DuplicatePublicTexture(duplicate_tid));
+                    }
+                }
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_diff)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let update_texture_sql =
+                    format!("UPDATE {prefix}textures SET public = ? WHERE tid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_texture_sql))
+                    .bind(is_public)
+                    .bind(tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS SIGNED) FROM {prefix}users WHERE uid = ? FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                };
+                if score.saturating_add(score_diff) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                }
+                if is_public {
+                    let duplicate_sql = format!(
+                        "SELECT CAST(tid AS SIGNED) FROM {prefix}textures WHERE hash = ? AND public = TRUE LIMIT 1"
+                    );
+                    if let Some(duplicate_tid) =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                            .bind(hash)
+                            .fetch_optional(&mut *transaction)
+                            .await?
+                    {
+                        transaction.rollback().await?;
+                        return Ok(TexturePrivacyOutcome::DuplicatePublicTexture(duplicate_tid));
+                    }
+                }
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_diff)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let update_texture_sql =
+                    format!("UPDATE {prefix}textures SET public = ? WHERE tid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update_texture_sql))
+                    .bind(is_public)
+                    .bind(tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let score_sql = format!(
+                    "SELECT CAST(score AS BIGINT) FROM {prefix}users WHERE uid = $1 FOR UPDATE"
+                );
+                let score = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(score_sql))
+                    .bind(uploader_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                let Some(score) = score else {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                };
+                if score.saturating_add(score_diff) < 0 {
+                    transaction.rollback().await?;
+                    return Ok(TexturePrivacyOutcome::InsufficientScore);
+                }
+                if is_public {
+                    let duplicate_sql = format!(
+                        "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = $1 AND public = TRUE LIMIT 1"
+                    );
+                    if let Some(duplicate_tid) =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                            .bind(hash)
+                            .fetch_optional(&mut *transaction)
+                            .await?
+                    {
+                        transaction.rollback().await?;
+                        return Ok(TexturePrivacyOutcome::DuplicatePublicTexture(duplicate_tid));
+                    }
+                }
+                let update_user_sql =
+                    format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2");
+                sqlx::query(sqlx::AssertSqlSafe(update_user_sql))
+                    .bind(score_diff)
+                    .bind(uploader_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let update_texture_sql =
+                    format!("UPDATE {prefix}textures SET public = $1 WHERE tid = $2");
+                sqlx::query(sqlx::AssertSqlSafe(update_texture_sql))
+                    .bind(is_public)
+                    .bind(tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(TexturePrivacyOutcome::Updated { is_public })
     }
     pub async fn player_profile(
         &self,
@@ -3104,5 +3264,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reporter_score, 40);
+        sqlx::query("INSERT INTO bs_textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (16, 'Duplicate private', 'alex', 'owner-private-hash', 12, 8, 1, '2026-10-02 10:00:00', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", true, -4)
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::Updated { is_public: false }
+        );
+        assert_eq!(
+            database
+                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", false, -100)
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::InsufficientScore
+        );
+        assert_eq!(
+            database
+                .toggle_texture_privacy("bs_", 15, 7, "owner-private-hash", false, -1)
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::DuplicatePublicTexture(16)
+        );
+        assert_eq!(
+            database
+                .toggle_texture_privacy("bs_", 14, 8, "private-hash", false, -1)
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::Updated { is_public: true }
+        );
+        let private_score: i64 = sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(private_score, 45);
     }
 }

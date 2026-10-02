@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         .route("/texture/{tid}", get(skinlib_info))
         .route("/texture/{tid}/name", put(rename_texture))
         .route("/texture/{tid}/type", put(update_texture_type))
+        .route("/texture/{tid}/privacy", put(toggle_texture_privacy))
         .route("/api/user", get(api_user))
         .route("/api/closet", get(api_closet).post(api_add_closet_item))
         .route(
@@ -1951,6 +1952,158 @@ async fn rename_texture(
     login_result(0, &message, None)
 }
 
+fn texture_privacy_score_diff(
+    texture: &TextureInfoRecord,
+    public_cost_per_kb: i64,
+    private_cost_per_kb: i64,
+    public_award: i64,
+    take_back_public_award: bool,
+) -> i64 {
+    let cost_difference = texture
+        .size
+        .saturating_mul(private_cost_per_kb.saturating_sub(public_cost_per_kb));
+    let mut score_diff = if texture.is_public {
+        cost_difference.saturating_neg()
+    } else {
+        cost_difference
+    };
+    if texture.is_public && take_back_public_award {
+        score_diff = score_diff.saturating_sub(public_award);
+    }
+    score_diff
+}
+
+async fn toggle_texture_privacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(tid_path): RoutePath<String>,
+) -> Response {
+    let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let public_cost_per_kb = match database
+        .option(&state.config.database.table_prefix, "score_per_storage")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read public texture storage score");
+            return unavailable();
+        }
+    };
+    let private_cost_per_kb = match database
+        .option(
+            &state.config.database.table_prefix,
+            "private_score_per_storage",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(10),
+        Err(error) => {
+            tracing::error!(%error, "failed to read private texture storage score");
+            return unavailable();
+        }
+    };
+    let public_award = match database
+        .option(
+            &state.config.database.table_prefix,
+            "score_award_per_texture",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score award");
+            return unavailable();
+        }
+    };
+    let take_back_award = match database
+        .option(
+            &state.config.database.table_prefix,
+            "take_back_scores_after_deletion",
+        )
+        .await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score return option");
+            return unavailable();
+        }
+    };
+    let score_diff = texture_privacy_score_diff(
+        &texture,
+        public_cost_per_kb,
+        private_cost_per_kb,
+        public_award,
+        take_back_award,
+    );
+    match database
+        .toggle_texture_privacy(
+            &state.config.database.table_prefix,
+            tid,
+            texture.uploader,
+            &texture.hash,
+            texture.is_public,
+            score_diff,
+        )
+        .await
+    {
+        Ok(crate::database::TexturePrivacyOutcome::Updated { is_public }) => {
+            let privacy = if state.config.locale.starts_with("zh") {
+                if is_public { "公开" } else { "私密" }
+            } else if is_public {
+                "Public"
+            } else {
+                "Private"
+            };
+            let message = if state.config.locale.starts_with("zh") {
+                format!("材质已被设为 {privacy}")
+            } else {
+                format!("The texture was set to {privacy} successfully.")
+            };
+            login_result(0, &message, None)
+        }
+        Ok(crate::database::TexturePrivacyOutcome::DuplicatePublicTexture(duplicate_tid)) => {
+            let message = if state.config.locale.starts_with("zh") {
+                "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
+            } else {
+                "The texture is already uploaded by someone else. You can add it to your closet directly."
+            };
+            login_result(
+                2,
+                message,
+                Some(serde_json::json!({ "tid": duplicate_tid })),
+            )
+        }
+        Ok(crate::database::TexturePrivacyOutcome::InsufficientScore) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "积分不足"
+            } else {
+                "You don't have enough score to upload this texture."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to update texture privacy");
+            unavailable()
+        }
+    }
+}
+
 async fn update_texture_type(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2699,6 +2852,37 @@ mod tests {
         assert!(value["errors"]["reason"][0].as_str().is_some());
         assert!(value["errors"]["field"].is_null());
     }
+    #[test]
+    fn calculates_legacy_texture_privacy_score_changes() {
+        let public_texture = crate::database::TextureInfoRecord {
+            tid: 1,
+            name: "Public".to_owned(),
+            texture_type: "alex".to_owned(),
+            hash: "hash".to_owned(),
+            size: 4,
+            uploader: 7,
+            is_public: true,
+            upload_at: String::new(),
+            likes: 0,
+        };
+        assert_eq!(
+            super::texture_privacy_score_diff(&public_texture, 0, 10, 3, true),
+            -43
+        );
+        assert_eq!(
+            super::texture_privacy_score_diff(&public_texture, 0, 10, 3, false),
+            -40
+        );
+        let private_texture = crate::database::TextureInfoRecord {
+            is_public: false,
+            ..public_texture
+        };
+        assert_eq!(
+            super::texture_privacy_score_diff(&private_texture, 0, 10, 3, true),
+            40
+        );
+    }
+
     #[test]
     fn validates_legacy_texture_types() {
         assert!(super::valid_texture_type("steve"));
