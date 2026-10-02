@@ -9,7 +9,9 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Multipart, Path as RoutePath, Query, State},
+    extract::{
+        DefaultBodyLimit, Multipart, OriginalUri, Path as RoutePath, Query, RawQuery, State,
+    },
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
@@ -21,6 +23,7 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use hmac::{Hmac, Mac};
 use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage, Rgba, RgbaImage};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
@@ -32,6 +35,7 @@ use rand::{
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::{
     AppState,
@@ -55,6 +59,15 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(home))
         .route("/auth/login", get(login_page).post(handle_login))
         .route("/auth/register", get(register_page).post(handle_register))
+        .route("/auth/forgot", get(forgot_page).post(handle_forgot))
+        .route(
+            "/auth/reset/{uid}",
+            get(reset_page).post(handle_password_reset),
+        )
+        .route(
+            "/auth/verify/{uid}",
+            get(verify_email_page).post(handle_email_verification),
+        )
         .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
         .route(
@@ -67,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/user", get(web_dashboard))
         .route("/user/notifications/{id}", post(web_read_notification))
+        .route("/user/email-verification", post(send_verification_email))
         .route("/user/player", get(web_player_page).post(web_add_player))
         .route("/user/player/list", get(web_player_list))
         .route("/user/player/{pid}/name", put(web_rename_player))
@@ -213,6 +227,45 @@ struct LoginPage {
     remember_label: String,
     submit_label: String,
     registration_link: String,
+    forgot_link: String,
+}
+
+#[derive(Template)]
+#[template(path = "forgot.html")]
+struct ForgotPage {
+    site_name: String,
+    locale: String,
+    title: String,
+    prompt: String,
+    email_label: String,
+    captcha_label: String,
+    submit_label: String,
+    use_recaptcha: bool,
+    recaptcha_sitekey: String,
+}
+
+#[derive(Template)]
+#[template(path = "reset.html")]
+struct PasswordResetPage {
+    site_name: String,
+    locale: String,
+    title: String,
+    prompt: String,
+    action_url: String,
+    password_label: String,
+    submit_label: String,
+}
+
+#[derive(Template)]
+#[template(path = "verify.html")]
+struct EmailVerificationPage {
+    site_name: String,
+    locale: String,
+    title: String,
+    prompt: String,
+    action_url: String,
+    email_label: String,
+    submit_label: String,
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
@@ -254,6 +307,12 @@ async fn login_page(State(state): State<AppState>) -> Response {
             "注册新账号"
         } else {
             "Register a new account"
+        }
+        .to_owned(),
+        forgot_link: if chinese {
+            "忘记密码？"
+        } else {
+            "Forgot password?"
         }
         .to_owned(),
     };
@@ -362,6 +421,771 @@ async fn register_page(State(state): State<AppState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn forgot_page(State(state): State<AppState>) -> Response {
+    let site_name = site_name(&state).await;
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let (recaptcha_sitekey, recaptcha_secret) = match (
+        database.option(prefix, "recaptcha_sitekey").await,
+        database.option(prefix, "recaptcha_secretkey").await,
+    ) {
+        (Ok(sitekey), Ok(secret)) => (sitekey.unwrap_or_default(), secret.unwrap_or_default()),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(%error, "failed to load forgot-password CAPTCHA settings");
+            return unavailable();
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let page = ForgotPage {
+        site_name,
+        locale: state.config.locale.clone(),
+        title: if chinese { "找回密码" } else { "Forgot Password" }.to_owned(),
+        prompt: if chinese {
+            "输入账户邮箱，我们会发送一条一小时内有效的重置链接。"
+        } else {
+            "Enter your account email and we will send a password reset link that expires in one hour."
+        }
+        .to_owned(),
+        email_label: if chinese { "邮箱" } else { "Email" }.to_owned(),
+        captcha_label: if chinese { "验证码" } else { "CAPTCHA" }.to_owned(),
+        submit_label: if chinese { "发送重置邮件" } else { "Send reset email" }.to_owned(),
+        use_recaptcha: !recaptcha_secret.is_empty(),
+        recaptcha_sitekey,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render forgot-password page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    if state.config.mail.mailer.trim().is_empty() {
+        return login_result(
+            1,
+            &auth_message(
+                &state,
+                "邮件发送未配置。",
+                "Email delivery is not configured.",
+            ),
+            None,
+        );
+    }
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return login_result(
+                1,
+                &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
+                None,
+            );
+        }
+    };
+    let email = request
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !valid_email_address(email) || email.len() > 100 {
+        return login_result(
+            1,
+            &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
+            None,
+        );
+    }
+    let captcha = request
+        .get("captcha")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match verify_registration_captcha(&state, &headers, captcha).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return login_result(
+                1,
+                &auth_message(&state, "验证码无效。", "Invalid CAPTCHA."),
+                None,
+            );
+        }
+        Err(response) => return response,
+    }
+    let ip = registration_client_ip(&headers);
+    let key = format!("forgot:{ip}");
+    if reserve_mail_limit(&state, &key, Duration::from_secs(180)).is_err() {
+        return login_result(
+            2,
+            &auth_message(
+                &state,
+                "邮件发送过于频繁，请稍后再试。",
+                "You click the send button too fast. Wait for some minutes.",
+            ),
+            None,
+        );
+    }
+    let uid = match database
+        .user_id_by_email(&state.config.database.table_prefix, email)
+        .await
+    {
+        Ok(Some(uid)) => uid,
+        Ok(None) => {
+            release_mail_limit(&state, &key);
+            return login_result(
+                1,
+                &auth_message(
+                    &state,
+                    "该邮箱未注册。",
+                    "The email address is not registered.",
+                ),
+                None,
+            );
+        }
+        Err(error) => {
+            release_mail_limit(&state, &key);
+            tracing::error!(%error, "failed to find password reset recipient");
+            return unavailable();
+        }
+    };
+    let Some(path) = signed_relative_url(
+        &state,
+        &format!("/auth/reset/{uid}"),
+        Some(unix_timestamp() + 3600),
+    ) else {
+        release_mail_limit(&state, &key);
+        return unavailable();
+    };
+    let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
+    let site_name = site_name(&state).await;
+    let body = if state.config.locale.starts_with("zh") {
+        format!(
+            "你收到了这封邮件，因为有人请求重置 {site_name} 账户密码。\n\n请在一小时内访问以下链接重设密码：\n{url}\n\n如果你没有请求重置密码，请忽略此邮件。"
+        )
+    } else {
+        format!(
+            "You received this email because a password reset was requested for your {site_name} account.\n\nReset your password within one hour by visiting:\n{url}\n\nIf you did not request a password reset, you can ignore this email."
+        )
+    };
+    let subject = if state.config.locale.starts_with("zh") {
+        format!("{site_name} 密码重置")
+    } else {
+        format!("Reset your {site_name} password")
+    };
+    match crate::mailer::send_email(&state.config.mail, email, &subject, &body).await {
+        Ok(()) => login_result(
+            0,
+            &auth_message(
+                &state,
+                "重置邮件已发送，请检查收件箱。",
+                "Mail sent, please check your inbox. The link will be expired in 1 hour.",
+            ),
+            None,
+        ),
+        Err(error) => {
+            release_mail_limit(&state, &key);
+            tracing::warn!(%error, recipient = %email, "failed to send password reset email");
+            login_result(
+                2,
+                &auth_message(
+                    &state,
+                    "重置邮件发送失败。",
+                    "Failed to send password reset mail.",
+                ),
+                None,
+            )
+        }
+    }
+}
+
+async fn reset_page(
+    State(state): State<AppState>,
+    RoutePath(uid): RoutePath<String>,
+    OriginalUri(uri): OriginalUri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(uid) = uid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !valid_relative_signature(
+        &state,
+        uri.path(),
+        query.as_deref().unwrap_or_default(),
+        true,
+    ) {
+        return (StatusCode::FORBIDDEN, "Invalid or expired link.").into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load password reset user");
+            return unavailable();
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let page = PasswordResetPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        title: if chinese {
+            "重设密码"
+        } else {
+            "Reset Password"
+        }
+        .to_owned(),
+        prompt: if chinese {
+            format!("{}，请设置新密码。", user.nickname)
+        } else {
+            format!("{}, reset your password here.", user.nickname)
+        },
+        action_url: signed_action_url(&state, &uri),
+        password_label: if chinese { "新密码" } else { "New password" }.to_owned(),
+        submit_label: if chinese {
+            "重设密码"
+        } else {
+            "Reset password"
+        }
+        .to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render password reset page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn handle_password_reset(
+    State(state): State<AppState>,
+    RoutePath(uid): RoutePath<String>,
+    OriginalUri(uri): OriginalUri,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let Some(uid) = uid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !valid_relative_signature(
+        &state,
+        uri.path(),
+        query.as_deref().unwrap_or_default(),
+        true,
+    ) {
+        return (StatusCode::FORBIDDEN, "Invalid or expired link.").into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return login_result(
+                1,
+                &auth_message(&state, "密码无效。", "Invalid password."),
+                None,
+            );
+        }
+    };
+    let password = request
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let length = password.chars().count();
+    if !(8..=32).contains(&length) {
+        return login_result(
+            1,
+            &auth_message(
+                &state,
+                "密码长度必须为 8 到 32 个字符。",
+                "Password must be between 8 and 32 characters.",
+            ),
+            None,
+        );
+    }
+    match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to find password reset user");
+            return unavailable();
+        }
+    }
+    let Some(password_hash) = hash_legacy_password(
+        password,
+        &state.config.password_method,
+        &state.config.password_salt,
+    ) else {
+        tracing::error!(method = %state.config.password_method, "configured legacy password method cannot hash passwords");
+        return unavailable();
+    };
+    if let Err(error) = database
+        .update_user_text(
+            &state.config.database.table_prefix,
+            uid,
+            "password",
+            &password_hash,
+        )
+        .await
+    {
+        tracing::error!(%error, uid, "failed to update password through reset link");
+        return unavailable();
+    }
+    login_result(
+        0,
+        &auth_message(&state, "密码已重设。", "Password resetted successfully."),
+        Some(serde_json::json!({"redirectTo":"/auth/login"})),
+    )
+}
+
+async fn verify_email_page(
+    State(state): State<AppState>,
+    RoutePath(uid): RoutePath<String>,
+    OriginalUri(uri): OriginalUri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(uid) = uid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match verification_is_required(database, &state.config.database.table_prefix).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "Email verification is not available.",
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load email verification option");
+            return unavailable();
+        }
+    }
+    if !valid_relative_signature(
+        &state,
+        uri.path(),
+        query.as_deref().unwrap_or_default(),
+        false,
+    ) {
+        return (StatusCode::FORBIDDEN, "Invalid link.").into_response();
+    }
+    match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to find email verification user");
+            return unavailable();
+        }
+    }
+    let chinese = state.config.locale.starts_with("zh");
+    let page = EmailVerificationPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        title: if chinese {
+            "邮箱验证"
+        } else {
+            "Email Verification"
+        }
+        .to_owned(),
+        prompt: if chinese {
+            "请输入账户邮箱以完成验证。"
+        } else {
+            "Enter your account email address to complete verification."
+        }
+        .to_owned(),
+        action_url: signed_action_url(&state, &uri),
+        email_label: if chinese { "邮箱" } else { "Email" }.to_owned(),
+        submit_label: if chinese {
+            "验证邮箱"
+        } else {
+            "Verify email"
+        }
+        .to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render email verification page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn handle_email_verification(
+    State(state): State<AppState>,
+    RoutePath(uid): RoutePath<String>,
+    OriginalUri(uri): OriginalUri,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let Some(uid) = uid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match verification_is_required(database, &state.config.database.table_prefix).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return login_result(
+                1,
+                &auth_message(
+                    &state,
+                    "邮箱验证未启用。",
+                    "Email verification is not available.",
+                ),
+                None,
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load email verification option");
+            return unavailable();
+        }
+    }
+    if !valid_relative_signature(
+        &state,
+        uri.path(),
+        query.as_deref().unwrap_or_default(),
+        false,
+    ) {
+        return (StatusCode::FORBIDDEN, "Invalid link.").into_response();
+    }
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return login_result(
+                1,
+                &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
+                None,
+            );
+        }
+    };
+    let email = request
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !valid_email_address(email) {
+        return login_result(
+            1,
+            &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
+            None,
+        );
+    }
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load email verification user");
+            return unavailable();
+        }
+    };
+    if user.email != email {
+        return login_result(
+            1,
+            &auth_message(&state, "邮箱不匹配。", "Email doesn't match."),
+            None,
+        );
+    }
+    if let Err(error) = database
+        .set_user_verified(&state.config.database.table_prefix, uid, true)
+        .await
+    {
+        tracing::error!(%error, uid, "failed to verify user email");
+        return unavailable();
+    }
+    login_result(
+        0,
+        &auth_message(&state, "邮箱验证成功。", "Email verified successfully."),
+        Some(serde_json::json!({"redirectTo":"/user"})),
+    )
+}
+
+async fn send_verification_email(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(uid) = session_user_id(&state, &headers) else {
+        return unauthenticated();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match verification_is_required(database, &state.config.database.table_prefix).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return login_result(
+                1,
+                &auth_message(
+                    &state,
+                    "邮箱验证未启用。",
+                    "Email verification is not available.",
+                ),
+                None,
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load email verification option");
+            return unavailable();
+        }
+    }
+    if state.config.mail.mailer.trim().is_empty() {
+        return login_result(
+            1,
+            &auth_message(
+                &state,
+                "邮件发送未配置。",
+                "Email delivery is not configured.",
+            ),
+            None,
+        );
+    }
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, uid)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, uid, "failed to load email-verification recipient");
+            return unavailable();
+        }
+    };
+    if user.permission == -1 {
+        let message = if state.config.locale.starts_with("zh") {
+            "你已被本站封禁，详情请联系站点管理员"
+        } else {
+            "You are banned on this site. Please contact the admin."
+        };
+        let mut response = login_result(-1, message, None);
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    if user.verified {
+        return login_result(
+            1,
+            &auth_message(
+                &state,
+                "账户已经验证。",
+                "Your account is already verified.",
+            ),
+            None,
+        );
+    }
+    let key = format!("verify:{uid}");
+    if reserve_mail_limit(&state, &key, Duration::from_secs(60)).is_err() {
+        return login_result(
+            1,
+            &auth_message(
+                &state,
+                "请等待一分钟后再发送验证邮件。",
+                "You click the send button too fast. Wait for 60 secs.",
+            ),
+            None,
+        );
+    }
+    let Some(path) = signed_relative_url(&state, &format!("/auth/verify/{uid}"), None) else {
+        release_mail_limit(&state, &key);
+        return unavailable();
+    };
+    let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
+    let site_name = site_name(&state).await;
+    let body = if state.config.locale.starts_with("zh") {
+        format!(
+            "有人注册了 {site_name} 账户。如果这是你的账户，请访问以下链接验证邮箱：\n{url}\n\n如果你没有注册，请忽略此邮件。"
+        )
+    } else {
+        format!(
+            "Someone registered an account with this email address on {site_name}. Verify your email by visiting:\n{url}\n\nIf you did not register, you can ignore this email."
+        )
+    };
+    let subject = if state.config.locale.starts_with("zh") {
+        format!("验证你的 {site_name} 账户")
+    } else {
+        format!("Verify your account on {site_name}")
+    };
+    match crate::mailer::send_email(&state.config.mail, &user.email, &subject, &body).await {
+        Ok(()) => login_result(
+            0,
+            &auth_message(
+                &state,
+                "验证邮件已发送，请检查收件箱。",
+                "Verification link was sent, please check your inbox.",
+            ),
+            None,
+        ),
+        Err(error) => {
+            release_mail_limit(&state, &key);
+            tracing::warn!(%error, uid, "failed to send email verification mail");
+            login_result(
+                2,
+                &auth_message(
+                    &state,
+                    "验证邮件发送失败。",
+                    "We failed to send you the verification link.",
+                ),
+                None,
+            )
+        }
+    }
+}
+
+fn auth_message<'a>(state: &AppState, chinese: &'a str, english: &'a str) -> &'a str {
+    if state.config.locale.starts_with("zh") {
+        chinese
+    } else {
+        english
+    }
+}
+
+fn reserve_mail_limit(state: &AppState, key: &str, window: Duration) -> Result<(), Duration> {
+    let now = Instant::now();
+    let mut limits = state
+        .mail_limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    limits.retain(|_, sent| sent.elapsed() < Duration::from_secs(3600));
+    if let Some(sent) = limits.get(key) {
+        let elapsed = sent.elapsed();
+        if elapsed < window {
+            return Err(window - elapsed);
+        }
+    }
+    limits.insert(key.to_owned(), now);
+    Ok(())
+}
+
+fn release_mail_limit(state: &AppState, key: &str) {
+    state
+        .mail_limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(key);
+}
+
+async fn verification_is_required(
+    database: &DatabasePool,
+    prefix: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(database
+        .option(prefix, "require_verification")
+        .await?
+        .as_deref()
+        .is_some_and(|value| legacy_option_bool(Some(value))))
+}
+
+fn signed_relative_url(state: &AppState, path: &str, expires: Option<u64>) -> Option<String> {
+    let key = state.config.app_key.as_deref()?;
+    let mut params = BTreeMap::new();
+    if let Some(expires) = expires {
+        params.insert("expires", expires.to_string());
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter())
+        .finish();
+    let unsigned = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let signature = signature_hex(key, &unsigned)?;
+    let signed = if query.is_empty() {
+        format!("{path}?signature={signature}")
+    } else {
+        format!("{path}?{query}&signature={signature}")
+    };
+    Some(signed)
+}
+
+fn valid_relative_signature(
+    state: &AppState,
+    path: &str,
+    raw_query: &str,
+    require_expires: bool,
+) -> bool {
+    let Some(key) = state.config.app_key.as_deref() else {
+        return false;
+    };
+    let mut params = BTreeMap::new();
+    for (name, value) in form_urlencoded::parse(raw_query.as_bytes()) {
+        params.insert(name.into_owned(), value.into_owned());
+    }
+    let Some(signature) = params.remove("signature") else {
+        return false;
+    };
+    let expires = match params.get("expires") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(expires) => Some(expires),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    if require_expires && expires.is_none() {
+        return false;
+    }
+    if expires.is_some_and(|expires| unix_timestamp() > expires) {
+        return false;
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter())
+        .finish();
+    let unsigned = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let Some(expected) = signature_hex(key, &unsigned) else {
+        return false;
+    };
+    bool::from(expected.as_bytes().ct_eq(signature.as_bytes()))
+}
+
+fn signature_hex(key: &str, value: &str) -> Option<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(value.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let digits = b"0123456789abcdef";
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(digits[(byte >> 4) as usize] as char);
+        hex.push(digits[(byte & 0x0f) as usize] as char);
+    }
+    Some(hex)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn signed_action_url(state: &AppState, uri: &axum::http::Uri) -> String {
+    format!(
+        "{}{}",
+        state.config.app_url.trim_end_matches('/'),
+        uri.path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or(uri.path())
+    )
 }
 
 async fn captcha_image(State(state): State<AppState>) -> Response {
@@ -1045,6 +1869,7 @@ struct DashboardPage {
     user: UserProfile,
     players: Vec<PlayerRecord>,
     notifications: Vec<DashboardNotification>,
+    show_email_verification: bool,
     locale: String,
 }
 
@@ -1366,11 +2191,27 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let show_email_verification = match database
+        .option(&state.config.database.table_prefix, "require_verification")
+        .await
+    {
+        Ok(value) => {
+            !user.verified
+                && value
+                    .as_deref()
+                    .is_some_and(|value| legacy_option_bool(Some(value)))
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load dashboard verification option");
+            return unavailable();
+        }
+    };
     let page = DashboardPage {
         site_name: site_name(&state).await,
         user,
         players,
         notifications,
+        show_email_verification,
         locale: state.config.locale.clone(),
     };
     match page.render() {
@@ -8873,6 +9714,7 @@ mod tests {
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
             app_key: None,
+            mail: crate::config::MailConfig::default(),
         };
         let app = router(crate::AppState {
             config: Arc::new(config),
@@ -8881,6 +9723,7 @@ mod tests {
             session_key: None,
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
+            mail_limits: Default::default(),
         });
         let response = app
             .clone()
@@ -9053,6 +9896,10 @@ mod tests {
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
             app_key: Some(secret.clone()),
+            mail: crate::config::MailConfig {
+                mailer: "array".to_owned(),
+                ..crate::config::MailConfig::default()
+            },
         };
         let captcha_challenges = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let app = router(crate::AppState {
@@ -9062,6 +9909,7 @@ mod tests {
             session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),
+            mail_limits: Default::default(),
         });
         let homepage = app
             .clone()
@@ -9162,6 +10010,26 @@ mod tests {
                 .unwrap()
                 .contains("Email or player name")
         );
+
+        let forgot_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/forgot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forgot_page.status(), StatusCode::OK);
+        let forgot_page = String::from_utf8(
+            to_bytes(forgot_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(forgot_page.contains("/auth/forgot"));
 
         let register_page = app
             .clone()
@@ -9305,21 +10173,213 @@ mod tests {
         .await;
         assert_eq!(reread_notification.status(), StatusCode::NOT_FOUND);
 
+        let (forgot_captcha_cookie, forgot_captcha_answer) =
+            issue_test_captcha(&app, &captcha_challenges).await;
+        let forgot_request = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/forgot")
+                    .header("cookie", forgot_captcha_cookie)
+                    .header("x-real-ip", "203.0.113.41")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": "first@example.test",
+                            "captcha": forgot_captcha_answer
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forgot_request.status(), StatusCode::OK);
+        let forgot_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(forgot_request.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forgot_body["code"], 0);
+
         sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('require_verification','true'), ('score_per_player','10'), ('return_score','true')")
             .execute(&pool)
             .await
             .unwrap();
+        let verification_dashboard =
+            session_request(&app, &registered_cookie, "GET", "/user", None).await;
+        let verification_dashboard = String::from_utf8(
+            to_bytes(verification_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(verification_dashboard.contains("Send verification email"));
+        let sent_verification = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/email-verification",
+            None,
+        )
+        .await;
+        let sent_verification: serde_json::Value = serde_json::from_slice(
+            &to_bytes(sent_verification.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent_verification["code"], 0);
+        let repeated_verification = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/email-verification",
+            None,
+        )
+        .await;
+        let repeated_verification: serde_json::Value = serde_json::from_slice(
+            &to_bytes(repeated_verification.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repeated_verification["code"], 1);
+
         let unverified_player_page =
             session_request(&app, &registered_cookie, "GET", "/user/player", None).await;
         assert_eq!(unverified_player_page.status(), StatusCode::FORBIDDEN);
         let unverified_upload_page =
             session_request(&app, &registered_cookie, "GET", "/skinlib/upload", None).await;
         assert_eq!(unverified_upload_page.status(), StatusCode::FORBIDDEN);
-        sqlx::query("UPDATE users SET verified = 1 WHERE uid = ?")
-            .bind(registered_user.0)
-            .execute(&pool)
+        let verification_path = format!("/auth/verify/{}", registered_user.0);
+        let verification_signature = super::signature_hex(&secret, &verification_path).unwrap();
+        let verification_uri = format!("{verification_path}?signature={verification_signature}");
+        let verification_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&verification_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
+        assert_eq!(verification_page.status(), StatusCode::OK);
+        let verification_html = String::from_utf8(
+            to_bytes(verification_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(verification_html.contains("Verify email"));
+        let tampered_verification = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{verification_uri}&extra=changed"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tampered_verification.status(), StatusCode::FORBIDDEN);
+        let verified = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&verification_uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"email":"first@example.test"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let verified: serde_json::Value =
+            serde_json::from_slice(&to_bytes(verified.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(verified["code"], 0);
+        let verified_state: bool = sqlx::query_scalar("SELECT verified FROM users WHERE uid = ?")
+            .bind(registered_user.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(verified_state);
+
+        let reset_path = format!("/auth/reset/{}", registered_user.0);
+        let reset_expiry = super::unix_timestamp() + 3600;
+        let reset_unsigned = format!("{reset_path}?expires={reset_expiry}");
+        let reset_signature = super::signature_hex(&secret, &reset_unsigned).unwrap();
+        let reset_uri = format!("{reset_unsigned}&signature={reset_signature}");
+        let reset_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&reset_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset_page.status(), StatusCode::OK);
+        let reset_html = String::from_utf8(
+            to_bytes(reset_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(reset_html.contains("reset your password here"));
+        let reset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reset_uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"password":"new secure password"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reset: serde_json::Value =
+            serde_json::from_slice(&to_bytes(reset.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(reset["code"], 0);
+        let reset_hash: String = sqlx::query_scalar("SELECT password FROM users WHERE uid = ?")
+            .bind(registered_user.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(crate::auth::verify_legacy_password(
+            "new secure password",
+            &reset_hash,
+            "BCRYPT",
+            ""
+        ));
+        let expired = super::unix_timestamp().saturating_sub(1);
+        let expired_unsigned = format!("{reset_path}?expires={expired}");
+        let expired_signature = super::signature_hex(&secret, &expired_unsigned).unwrap();
+        let expired_reset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{expired_unsigned}&signature={expired_signature}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_reset.status(), StatusCode::FORBIDDEN);
 
         let player_page =
             session_request(&app, &registered_cookie, "GET", "/user/player", None).await;

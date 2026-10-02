@@ -3795,6 +3795,38 @@ impl DatabasePool {
         Ok(true)
     }
 
+    pub async fn user_id_by_email(
+        &self,
+        prefix: &str,
+        email: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT CAST(uid AS BIGINT) FROM {prefix}users WHERE email = $1 LIMIT 1")
+            }
+            Self::MySql(_) => {
+                format!("SELECT CAST(uid AS SIGNED) FROM {prefix}users WHERE email = ? LIMIT 1")
+            }
+            Self::Sqlite(_) => {
+                format!("SELECT CAST(uid AS BIGINT) FROM {prefix}users WHERE email = ? LIMIT 1")
+            }
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(email)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(email)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(email)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
+
     pub async fn user_profile(
         &self,
         prefix: &str,

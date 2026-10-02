@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} - {{ site_name }}</title>
+  <style>
+    body { background:#f4f6f9;color:#343a40;font:16px system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center }
+    main { background:white;border-radius:8px;box-shadow:0 8px 28px #0002;box-sizing:border-box;max-width:420px;padding:2rem;width:calc(100% - 2rem) }
+    h1 { font-size:1.6rem;margin:0 0 .4rem } p { color:#667085;margin:0 0 1.5rem } label { display:block;font-weight:600;margin:1rem 0 .4rem }
+    input { border:1px solid #c9ced6;border-radius:4px;box-sizing:border-box;font:inherit;padding:.7rem;width:100% }
+    button { background:#007bff;border:0;border-radius:4px;color:white;cursor:pointer;font:inherit;margin-top:1.3rem;padding:.75rem;width:100% } #error { color:#b42318;min-height:1.4rem }
+  </style>
+</head>
+<body><main><h1>{{ title }}</h1><p>{{ prompt }}</p>
+  <form id="verify-form" action="{{ action_url }}">
+    <label for="email">{{ email_label }}</label><input id="email" type="email" autocomplete="email" maxlength="100" required>
+    <div id="error" role="alert"></div><button type="submit">{{ submit_label }}</button>
+  </form>
+</main>
+<script>
+  document.getElementById('verify-form').addEventListener('submit',async(event)=>{
+    event.preventDefault();const form=event.currentTarget;const error=document.getElementById('error');const button=form.querySelector('button');button.disabled=true;error.textContent='';
+    try{const response=await fetch(form.action,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({email:document.getElementById('email').value})});const result=await response.json();if(response.ok&&result.code===0){window.location.href=result.data?.redirectTo||'/auth/login';return;}error.textContent=result.message||'Unable to verify email.';}catch(_){error.textContent='Unable to connect to the server.';}button.disabled=false;
+  });
+</script></body></html>

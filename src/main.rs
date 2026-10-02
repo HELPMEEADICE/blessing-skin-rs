@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod database;
 mod http;
+mod mailer;
 
 use std::{
     collections::HashMap,
@@ -24,6 +25,7 @@ pub struct AppState {
     pub session_key: Option<EncodingKey>,
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    pub mail_limits: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[tokio::main]
@@ -65,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_key,
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
+        mail_limits: Arc::new(Mutex::new(HashMap::new())),
     });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");

@@ -28,7 +28,7 @@
       <div id="error" role="alert"></div>
       <button type="submit">{{ submit_label }}</button>
     </form>
-    <p><a href="/auth/register">{{ registration_link }}</a></p>
+    <p><a href="/auth/register">{{ registration_link }}</a> · <a href="/auth/forgot">{{ forgot_link }}</a></p>
   </main>
   <script>
     document.getElementById('login-form').addEventListener('submit', async (event) => {

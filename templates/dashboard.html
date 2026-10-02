@@ -10,6 +10,7 @@
   <header><h1>{{ site_name }}</h1><button id="logout">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></header>
   <h2>{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else %}Welcome, {{ user.nickname }}{% endif %}</h2>
   <p>{{ user.email }}</p>
+  {% if show_email_verification %}<p><button id="send-verification">{% if locale.starts_with("zh") %}发送验证邮件{% else %}Send verification email{% endif %}</button> <span id="verification-status" role="status"></span></p>{% endif %}
   <section aria-labelledby="notifications-title">
     <h3 id="notifications-title">{% if locale.starts_with("zh") %}站内通知{% else %}Notifications{% endif %} <span id="notification-count">{{ notifications.len() }}</span></h3>
     <ul id="notifications">{% for notification in notifications %}<li><button type="button" data-notification-id="{{ notification.id }}">{{ notification.title }}</button></li>{% else %}<li>{% if locale.starts_with("zh") %}没有未读通知{% else %}No unread notifications{% endif %}</li>{% endfor %}</ul>
@@ -37,6 +38,12 @@ notificationList.addEventListener('click',async(event)=>{
       const empty=document.createElement('li');empty.textContent=document.documentElement.lang.startsWith('zh')?'没有未读通知':'No unread notifications';notificationList.replaceChildren(empty);
     }
   }catch(error){window.alert(error.message)}
+});
+const verificationButton=document.getElementById('send-verification');
+if(verificationButton)verificationButton.addEventListener('click',async()=>{
+  const status=document.getElementById('verification-status');verificationButton.disabled=true;
+  try{const response=await fetch('/user/email-verification',{method:'POST',headers:{'Accept':'application/json'}});const result=await response.json();status.textContent=result.message||'Unable to send email.';if(!response.ok||result.code!==0)verificationButton.disabled=false;}
+  catch(_){status.textContent='Unable to connect to the server.';verificationButton.disabled=false;}
 });
 document.getElementById('logout').addEventListener('click',async()=>{await fetch('/auth/logout',{method:'POST',headers:{'Accept':'application/json'}});window.location.href='/auth/login';});
 </script></body>

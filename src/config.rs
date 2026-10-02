@@ -16,6 +16,34 @@ pub struct Config {
     pub password_method: String,
     pub password_salt: String,
     pub app_key: Option<String>,
+    pub mail: MailConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct MailConfig {
+    pub mailer: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub encryption: String,
+    pub from_address: String,
+    pub from_name: String,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            mailer: String::new(),
+            host: String::new(),
+            port: 465,
+            username: None,
+            password: None,
+            encryption: String::new(),
+            from_address: "hello@example.com".to_owned(),
+            from_name: "Blessing Skin".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +103,28 @@ impl Config {
             password_method: env::var("PWD_METHOD").unwrap_or_else(|_| "BCRYPT".to_owned()),
             password_salt: env::var("SALT").unwrap_or_default(),
             app_key: env::var("APP_KEY").ok().filter(|value| !value.is_empty()),
+            mail: MailConfig::from_env(),
         })
+    }
+}
+
+impl MailConfig {
+    fn from_env() -> Self {
+        Self {
+            mailer: env::var("MAIL_MAILER").unwrap_or_else(|_| "smtp".to_owned()),
+            host: env::var("MAIL_HOST").unwrap_or_default(),
+            port: parse_port("MAIL_PORT", 465),
+            username: env::var("MAIL_USERNAME")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            password: env::var("MAIL_PASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            encryption: env::var("MAIL_ENCRYPTION").unwrap_or_default(),
+            from_address: env::var("MAIL_FROM_ADDRESS")
+                .unwrap_or_else(|_| "hello@example.com".to_owned()),
+            from_name: env::var("MAIL_FROM_NAME").unwrap_or_else(|_| "Blessing Skin".to_owned()),
+        }
     }
 }
 
