@@ -23,6 +23,7 @@ use serde::Serialize;
 
 use crate::{
     AppState,
+    auth::{audience_matches, bearer_token, decode_access_token, has_scope},
     database::{DatabasePool, PlayerProfile},
 };
 
@@ -32,8 +33,9 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", any(ready))
         .route("/api", any(api_root))
         .route("/api/", any(api_root))
-        .route("/{player}.json", get(player_json))
-        .route("/csl/{player}.json", get(player_json))
+        .route("/api/user", get(api_user))
+        .route("/{profile}", get(player_json))
+        .route("/csl/{profile}", get(player_json))
         .route("/textures/{hash}", get(texture))
         .route("/csl/textures/{hash}", get(texture))
         .route("/raw/{tid}", get(raw_texture))
@@ -72,6 +74,74 @@ struct ApiRoot {
     site_name: String,
 }
 
+async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(key) = &state.passport_key else {
+        return unauthenticated();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return unauthenticated();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let Some(claims) = decode_access_token(token, key) else {
+        return unauthenticated();
+    };
+    if claims.exp <= jsonwebtoken::get_current_timestamp() {
+        return unauthenticated();
+    }
+    let token_record = match database
+        .access_token(&state.config.database.table_prefix, &claims.jti)
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load Passport access token");
+            return unavailable();
+        }
+    };
+    let subject_id = match claims.sub.parse::<i64>() {
+        Ok(subject_id) => subject_id,
+        Err(_) => return unauthenticated(),
+    };
+    if token_record.revoked
+        || token_record.user_id != Some(subject_id)
+        || !audience_matches(claims.aud.as_ref(), token_record.client_id)
+    {
+        return unauthenticated();
+    }
+    if !has_scope(&claims, "User.Read") {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "code": 403,
+                "message": "The access token is missing the required scope."
+            })),
+        )
+            .into_response();
+    }
+
+    match database
+        .user_profile(&state.config.database.table_prefix, subject_id)
+        .await
+    {
+        Ok(Some(user)) => Json(user).into_response(),
+        Ok(None) => unauthenticated(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load authenticated user");
+            unavailable()
+        }
+    }
+}
+
+fn unauthenticated() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "message": "Unauthenticated." })),
+    )
+        .into_response()
+}
 async fn api_root(State(state): State<AppState>) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -123,9 +193,12 @@ struct SkinProfile {
 
 async fn player_json(
     State(state): State<AppState>,
-    RoutePath(player_name): RoutePath<String>,
+    RoutePath(profile_path): RoutePath<String>,
     request_headers: HeaderMap,
 ) -> Response {
+    let Some(player_name) = profile_path.strip_suffix(".json") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -374,7 +447,7 @@ const COPYRIGHTS: [&str; 7] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{content_etag, parse_legacy_datetime, valid_texture_hash};
+    use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
 
     #[test]
     fn validates_texture_hashes_before_joining_them_to_storage_paths() {
@@ -395,5 +468,45 @@ mod tests {
     #[test]
     fn uses_content_md5_for_legacy_texture_etags() {
         assert_eq!(content_etag(b"abc"), "\"900150983cd24fb0d6963f7d28e17f72\"");
+    }
+
+    #[tokio::test]
+    async fn api_user_rejects_requests_without_a_bearer_token() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::{path::PathBuf, sync::Arc};
+        use tower::ServiceExt;
+
+        let config = crate::config::Config {
+            bind: "127.0.0.1:3000".parse().unwrap(),
+            version: "test",
+            locale: "en".to_owned(),
+            database: crate::config::DatabaseConfig {
+                connection: crate::config::DatabaseConnection::Sqlite(SqliteConnectOptions::new()),
+                table_prefix: String::new(),
+            },
+            textures_dir: PathBuf::new(),
+            plugins_dir: PathBuf::new(),
+            app_url: "http://localhost".to_owned(),
+            passport_public_key: None,
+        };
+        let app = router(crate::AppState {
+            config: Arc::new(config),
+            database: None,
+            passport_key: None,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

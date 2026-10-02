@@ -29,6 +29,27 @@ pub struct PlayerProfile {
     pub last_modified: Option<String>,
 }
 
+#[derive(Debug, FromRow)]
+pub struct AccessTokenRecord {
+    pub user_id: Option<i64>,
+    pub client_id: i64,
+    pub revoked: bool,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct UserProfile {
+    pub uid: i64,
+    pub email: String,
+    pub nickname: String,
+    pub locale: Option<String>,
+    pub score: i64,
+    pub avatar: i64,
+    pub permission: i32,
+    pub last_sign_at: String,
+    pub register_at: String,
+    pub verified: bool,
+    pub is_dark_mode: bool,
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -175,6 +196,80 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn access_token(
+        &self,
+        prefix: &str,
+        token_id: &str,
+    ) -> Result<Option<AccessTokenRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT user_id, client_id, revoked FROM {prefix}oauth_access_tokens WHERE id = $1 LIMIT 1"
+            ),
+            _ => format!(
+                "SELECT user_id, client_id, revoked FROM {prefix}oauth_access_tokens WHERE id = ? LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, AccessTokenRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(token_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, AccessTokenRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(token_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, AccessTokenRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(token_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn user_profile(
+        &self,
+        prefix: &str,
+        uid: i64,
+    ) -> Result<Option<UserProfile>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, CAST(avatar AS BIGINT) AS avatar, permission, \
+                 CAST(last_sign_at AS TEXT) AS last_sign_at, CAST(register_at AS TEXT) AS register_at, \
+                 verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, CAST(avatar AS BIGINT) AS avatar, permission, \
+                 DATE_FORMAT(last_sign_at, '%Y-%m-%d %H:%i:%s') AS last_sign_at, \
+                 DATE_FORMAT(register_at, '%Y-%m-%d %H:%i:%s') AS register_at, \
+                 verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, CAST(avatar AS BIGINT) AS avatar, permission, \
+                 to_char(last_sign_at, 'YYYY-MM-DD HH24:MI:SS') AS last_sign_at, \
+                 to_char(register_at, 'YYYY-MM-DD HH24:MI:SS') AS register_at, \
+                 verified, is_dark_mode FROM {prefix}users WHERE uid = $1 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, UserProfile>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, UserProfile>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, UserProfile>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -188,7 +283,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE bs_users (uid INTEGER PRIMARY KEY, permission INTEGER NOT NULL)")
+        sqlx::query("CREATE TABLE bs_users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL DEFAULT '', nickname TEXT NOT NULL DEFAULT '', locale TEXT, score INTEGER NOT NULL DEFAULT 0, avatar INTEGER NOT NULL DEFAULT 0, password TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', permission INTEGER NOT NULL, last_sign_at TEXT NOT NULL DEFAULT '', register_at TEXT NOT NULL DEFAULT '', verified BOOLEAN NOT NULL DEFAULT 0, is_dark_mode BOOLEAN NOT NULL DEFAULT 0)")
             .execute(&pool)
             .await
             .unwrap();
@@ -204,7 +299,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_users (uid, permission) VALUES (7, 0)")
+        sqlx::query("CREATE TABLE bs_oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, scopes TEXT NOT NULL, revoked BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bs_oauth_access_tokens (id, user_id, client_id, scopes, revoked) VALUES ('legacy-token-id', 7, 3, 'User.Read', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bs_users (uid, email, nickname, locale, score, avatar, permission, last_sign_at, register_at, verified, is_dark_mode) VALUES (7, 'alex@example.test', 'Alex User', 'zh_CN', 42, 11, 0, '2026-10-01 10:00:00', '2025-01-02 03:04:05', 1, 0)")
             .execute(&pool)
             .await
             .unwrap();
@@ -228,6 +331,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(profile.name, "Alex");
+        let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
+        assert_eq!(user.email, "alex@example.test");
+        assert_eq!(user.nickname, "Alex User");
+        assert_eq!(user.locale.as_deref(), Some("zh_CN"));
+        assert_eq!(user.score, 42);
+        assert_eq!(user.avatar, 11);
+        assert!(user.verified);
+        assert!(!user.is_dark_mode);
+        let token = database
+            .access_token("bs_", "legacy-token-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.user_id, Some(7));
+        assert_eq!(token.client_id, 3);
+        assert!(!token.revoked);
         assert_eq!(profile.permission, 0);
         assert_eq!(profile.skin_type.as_deref(), Some("alex"));
         assert_eq!(profile.skin_hash.as_deref(), Some("skin-hash"));

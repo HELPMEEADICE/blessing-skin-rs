@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod database;
 mod http;
@@ -6,6 +7,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use config::Config;
 use database::DatabasePool;
+use jsonwebtoken::DecodingKey;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -13,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 pub struct AppState {
     pub config: Arc<Config>,
     pub database: Option<DatabasePool>,
+    pub passport_key: Option<DecodingKey>,
 }
 
 #[tokio::main]
@@ -34,7 +37,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let address: SocketAddr = config.bind;
-    let app = http::router(AppState { config, database });
+    let passport_key = config.passport_public_key.as_deref().and_then(|key| {
+        match DecodingKey::from_rsa_pem(key) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::error!(%error, "configured Passport public key is invalid");
+                None
+            }
+        }
+    });
+    let app = http::router(AppState {
+        config,
+        database,
+        passport_key,
+    });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");
 

@@ -12,6 +12,7 @@ pub struct Config {
     pub textures_dir: PathBuf,
     pub plugins_dir: PathBuf,
     pub app_url: String,
+    pub passport_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +53,8 @@ impl Config {
         let textures_dir = env::var_os("TEXTURES_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| storage.join("textures"));
+        let passport_public_key = load_passport_public_key(&storage);
+
         let plugins_dir = env::var_os("PLUGINS_DIR")
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty())
@@ -65,6 +68,7 @@ impl Config {
             textures_dir,
             plugins_dir,
             app_url: env::var("APP_URL").unwrap_or_else(|_| "http://localhost".to_owned()),
+            passport_public_key,
         })
     }
 }
@@ -141,4 +145,14 @@ mod tests {
         assert!(!valid_table_prefix("x; DROP TABLE users"));
         assert!(!valid_table_prefix("bs-skin_"));
     }
+}
+fn load_passport_public_key(storage: &std::path::Path) -> Option<Vec<u8>> {
+    if let Ok(configured) = env::var("PASSPORT_PUBLIC_KEY") {
+        if let Some(path) = configured.strip_prefix("file://") {
+            return std::fs::read(path).ok();
+        }
+        return Some(configured.into_bytes());
+    }
+
+    std::fs::read(storage.join("oauth-public.key")).ok()
 }
