@@ -80,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/user", get(web_dashboard))
         .route("/user/reports", get(web_user_reports))
+        .route("/user/oauth/manage", get(oauth_manage_page))
         .route("/user/notifications/{id}", post(web_read_notification))
         .route("/user/email-verification", post(send_verification_email))
         .route("/user/player", get(web_player_page).post(web_add_player))
@@ -267,6 +268,13 @@ struct UserReportView {
     reason: String,
     status: i32,
     report_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "oauth_manage.html")]
+struct OAuthManagePage {
+    site_name: String,
+    locale: String,
 }
 
 #[derive(Template)]
@@ -2285,6 +2293,23 @@ pub(crate) async fn site_name(state: &AppState) -> String {
             .flatten()
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
+    }
+}
+
+async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authenticated_web_user(&state, &headers).await {
+        return response;
+    }
+    let page = OAuthManagePage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render OAuth client management page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -10281,6 +10306,7 @@ mod tests {
         assert!(registered_dashboard.contains("Welcome note"));
         assert!(registered_dashboard.contains("/user/reports"));
         assert!(registered_dashboard.contains("/user/profile"));
+        assert!(registered_dashboard.contains("/user/oauth/manage"));
         let profile_page =
             session_request(&app, &registered_cookie, "GET", "/user/profile", None).await;
         assert_eq!(profile_page.status(), StatusCode::OK);
@@ -10294,6 +10320,17 @@ mod tests {
         assert!(profile_html.contains("first@example.test"));
         assert!(profile_html.contains("data-action=\"nickname\""));
         assert!(profile_html.contains("avatar-form"));
+        let oauth_page =
+            session_request(&app, &registered_cookie, "GET", "/user/oauth/manage", None).await;
+        assert_eq!(oauth_page.status(), StatusCode::OK);
+        let oauth_html = String::from_utf8(
+            to_bytes(oauth_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(oauth_html.contains("/oauth/clients"));
         let read_notification = session_request(
             &app,
             &registered_cookie,
