@@ -2528,6 +2528,11 @@ struct ClosetManagementPage {
     site_name: String,
     locale: String,
     user: UserProfile,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -4490,10 +4495,27 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
         Ok(user) => user,
         Err(response) => return response,
     };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "user/closet",
+        serde_json::json!({ "unverified": false }),
+        i18n,
+    );
     let page = ClosetManagementPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         user,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14160,7 +14182,25 @@ mod tests {
         )
         .unwrap();
         assert!(closet_page.contains("Closet"));
-        assert!(closet_page.contains("/user/closet/list"));
+        assert!(closet_page.contains(r#"id="closet-list""#));
+        assert!(closet_page.contains(r#"id="previewer""#));
+        assert!(closet_page.contains("http://localhost/app/style.012abcd.css"));
+        assert!(closet_page.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_closet_globals = closet_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let closet_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_closet_globals)
+            .unwrap();
+        let closet_globals: serde_json::Value =
+            serde_json::from_slice(&closet_globals_bytes).unwrap();
+        assert_eq!(closet_globals["route"], "user/closet");
+        assert_eq!(closet_globals["extra"]["unverified"], false);
+        assert_eq!(closet_globals["i18n"]["auth"]["login"], "Log In");
         sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (20,'Closet texture','steve','0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',8,?,1,'2026-10-02 14:00:00',0)")
             .bind(registered_user.0)
             .execute(&pool)
