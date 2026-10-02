@@ -30,7 +30,7 @@ use crate::{
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
     database::{
         DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
-        UserProfile,
+        PlayerTextureOutcome, UserProfile,
     },
 };
 
@@ -49,6 +49,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players))
         .route("/api/players/{pid}/name", put(api_rename_player))
+        .route(
+            "/api/players/{pid}/textures",
+            put(api_set_player_textures).delete(api_clear_player_textures),
+        )
         .route("/{profile}", get(player_json))
         .route("/csl/{profile}", get(player_json))
         .route("/textures/{hash}", get(texture))
@@ -694,6 +698,152 @@ async fn api_rename_player(
     }
 }
 
+async fn api_set_player_textures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Player.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let skin = texture_request_id(request.get("skin"));
+    let cape = texture_request_id(request.get("cape"));
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let result = database
+        .set_player_textures(
+            &state.config.database.table_prefix,
+            identity.user_id,
+            player_id,
+            skin,
+            cape,
+        )
+        .await;
+    player_texture_response(result, &state.config.locale, false)
+}
+
+async fn api_clear_player_textures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Player.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let clear_type = |kind: &str| {
+        request.get(kind).is_some()
+            || request
+                .get("type")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some(kind)))
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let result = database
+        .clear_player_textures(
+            &state.config.database.table_prefix,
+            identity.user_id,
+            player_id,
+            clear_type("skin"),
+            clear_type("cape"),
+        )
+        .await;
+    player_texture_response(result, &state.config.locale, true)
+}
+
+fn texture_request_id(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(false) => None,
+        serde_json::Value::Bool(true) => Some(-1),
+        serde_json::Value::Number(number) => Some(number.as_i64().unwrap_or(-1)),
+        serde_json::Value::String(value) if value.is_empty() => None,
+        serde_json::Value::String(value) => Some(value.parse::<i64>().unwrap_or(-1)),
+        _ => Some(-1),
+    }
+}
+
+fn player_texture_response(
+    result: Result<PlayerTextureOutcome, sqlx::Error>,
+    locale: &str,
+    clear: bool,
+) -> Response {
+    let chinese = locale.starts_with("zh");
+    match result {
+        Ok(PlayerTextureOutcome::Updated(player)) => {
+            let message = match (chinese, clear) {
+                (true, true) => format!("角色 {} 的材质已被成功重置", player.name),
+                (true, false) => format!("材质已成功应用至角色 {}", player.name),
+                (false, true) => format!(
+                    "The textures of player {} was resetted successfully.",
+                    player.name
+                ),
+                (false, false) => format!(
+                    "The texture was applied to player {} successfully.",
+                    player.name
+                ),
+            };
+            login_result(
+                0,
+                &message,
+                Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
+            )
+        }
+        Ok(PlayerTextureOutcome::TextureNotFound) => login_result(
+            1,
+            if chinese {
+                "材质不存在"
+            } else {
+                "No such texture."
+            },
+            None,
+        ),
+        Ok(PlayerTextureOutcome::TextureNotInCloset) => login_result(
+            1,
+            if chinese {
+                "衣柜中不存在此材质"
+            } else {
+                "The texture does not exist in your closet."
+            },
+            None,
+        ),
+        Ok(PlayerTextureOutcome::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": if chinese { "无权操作此角色" } else { "You are not allowed to modify this player." }
+            })),
+        )
+            .into_response(),
+        Ok(PlayerTextureOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to update player textures");
+            unavailable()
+        }
+    }
+}
 fn valid_player_name(
     name: &str,
     rule: &str,
@@ -1155,6 +1305,24 @@ const COPYRIGHTS: [&str; 7] = [
 mod tests {
     use super::{content_etag, parse_legacy_datetime, router, valid_texture_hash};
 
+    #[test]
+    fn parses_legacy_texture_ids_and_clear_request_shapes() {
+        use serde_json::json;
+
+        assert_eq!(super::texture_request_id(Some(&json!(0))), Some(0));
+        assert_eq!(super::texture_request_id(Some(&json!("12"))), Some(12));
+        assert_eq!(super::texture_request_id(Some(&json!(""))), None);
+        assert_eq!(super::texture_request_id(Some(&json!(null))), None);
+
+        let by_field = json!({"skin": null});
+        assert!(by_field.get("skin").is_some());
+        let by_type = json!({"type": ["cape"]});
+        assert!(
+            by_type["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("cape")))
+        );
+    }
     #[test]
     fn validates_texture_hashes_before_joining_them_to_storage_paths() {
         assert!(valid_texture_hash(&"a".repeat(64)));

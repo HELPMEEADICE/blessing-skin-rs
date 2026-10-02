@@ -81,6 +81,14 @@ pub enum PlayerRenameOutcome {
         player: PlayerRecord,
     },
 }
+#[derive(Debug)]
+pub enum PlayerTextureOutcome {
+    NotFound,
+    Forbidden,
+    TextureNotFound,
+    TextureNotInCloset,
+    Updated(PlayerRecord),
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -466,6 +474,220 @@ impl DatabasePool {
         })
     }
 
+    pub async fn set_player_textures(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        player_id: i64,
+        skin: Option<i64>,
+        cape: Option<i64>,
+    ) -> Result<PlayerTextureOutcome, sqlx::Error> {
+        let Some(player) = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|player| player.pid == player_id)
+        else {
+            return Ok(if self.player_exists(prefix, player_id).await? {
+                PlayerTextureOutcome::Forbidden
+            } else {
+                PlayerTextureOutcome::NotFound
+            });
+        };
+
+        for tid in [skin, cape].into_iter().flatten().filter(|tid| *tid != 0) {
+            if !self.texture_exists(prefix, tid).await? {
+                return Ok(PlayerTextureOutcome::TextureNotFound);
+            }
+            if !self.user_has_texture(prefix, user_id, tid).await? {
+                return Ok(PlayerTextureOutcome::TextureNotInCloset);
+            }
+        }
+        if let Some(tid) = skin.filter(|tid| *tid != 0) {
+            self.update_player_texture(prefix, player_id, user_id, "tid_skin", tid)
+                .await?;
+        }
+        if let Some(tid) = cape.filter(|tid| *tid != 0) {
+            self.update_player_texture(prefix, player_id, user_id, "tid_cape", tid)
+                .await?;
+        }
+        let updated = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|item| item.pid == player_id)
+            .unwrap_or(player);
+        Ok(PlayerTextureOutcome::Updated(updated))
+    }
+
+    pub async fn clear_player_textures(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        player_id: i64,
+        skin: bool,
+        cape: bool,
+    ) -> Result<PlayerTextureOutcome, sqlx::Error> {
+        let Some(player) = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|player| player.pid == player_id)
+        else {
+            return Ok(if self.player_exists(prefix, player_id).await? {
+                PlayerTextureOutcome::Forbidden
+            } else {
+                PlayerTextureOutcome::NotFound
+            });
+        };
+        if skin {
+            self.update_player_texture(prefix, player_id, user_id, "tid_skin", 0)
+                .await?;
+        }
+        if cape {
+            self.update_player_texture(prefix, player_id, user_id, "tid_cape", 0)
+                .await?;
+        }
+        let updated = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|item| item.pid == player_id)
+            .unwrap_or(player);
+        Ok(PlayerTextureOutcome::Updated(updated))
+    }
+
+    async fn player_exists(&self, prefix: &str, player_id: i64) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("SELECT COUNT(*) FROM {prefix}players WHERE pid = $1"),
+            _ => format!("SELECT COUNT(*) FROM {prefix}players WHERE pid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_one(pool)
+                .await?
+                > 0),
+        }
+    }
+
+    async fn texture_exists(&self, prefix: &str, tid: i64) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("SELECT COUNT(*) FROM {prefix}textures WHERE tid = $1"),
+            _ => format!("SELECT COUNT(*) FROM {prefix}textures WHERE tid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+        }
+    }
+
+    async fn user_has_texture(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        tid: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = $1 AND texture_tid = $2"
+            ),
+            _ => format!(
+                "SELECT COUNT(*) FROM {prefix}user_closet WHERE user_uid = ? AND texture_tid = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(user_id)
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(user_id)
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(user_id)
+                .bind(tid)
+                .fetch_one(pool)
+                .await?
+                > 0),
+        }
+    }
+
+    async fn update_player_texture(
+        &self,
+        prefix: &str,
+        player_id: i64,
+        user_id: i64,
+        column: &str,
+        tid: i64,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}players SET {column} = $1, last_modified = CURRENT_TIMESTAMP \
+                 WHERE pid = $2 AND uid = $3"
+            ),
+            _ => format!(
+                "UPDATE {prefix}players SET {column} = ?, last_modified = CURRENT_TIMESTAMP \
+                 WHERE pid = ? AND uid = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(tid)
+                    .bind(player_id)
+                    .bind(user_id)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(tid)
+                    .bind(player_id)
+                    .bind(user_id)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(tid)
+                    .bind(player_id)
+                    .bind(user_id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn unread_notifications(
         &self,
         prefix: &str,
@@ -684,6 +906,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE bs_user_closet (user_uid INTEGER NOT NULL, texture_tid INTEGER NOT NULL, item_name TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE bs_options (id INTEGER PRIMARY KEY, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -708,7 +934,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bs_textures (tid, type, hash) VALUES (11, 'alex', 'skin-hash'), (12, 'cape', 'cape-hash')")
+        sqlx::query("INSERT INTO bs_textures (tid, type, hash) VALUES (11, 'alex', 'skin-hash'), (12, 'cape', 'cape-hash'), (13, 'alex', 'not-in-closet')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 11, 'Alex skin'), (7, 12, 'Alex cape')")
             .execute(&pool)
             .await
             .unwrap();
@@ -815,6 +1045,56 @@ mod tests {
                 .unwrap(),
             super::PlayerRenameOutcome::Forbidden
         ));
+        let textures_set = database
+            .set_player_textures("bs_", 7, 3, Some(11), Some(12))
+            .await
+            .unwrap();
+        match textures_set {
+            super::PlayerTextureOutcome::Updated(player) => {
+                assert_eq!(player.tid_skin, 11);
+                assert_eq!(player.tid_cape, 12);
+            }
+            result => panic!("expected texture update, got {result:?}"),
+        }
+        assert!(matches!(
+            database
+                .set_player_textures("bs_", 7, 3, Some(99), None)
+                .await
+                .unwrap(),
+            super::PlayerTextureOutcome::TextureNotFound
+        ));
+        assert!(matches!(
+            database
+                .set_player_textures("bs_", 7, 3, Some(13), None)
+                .await
+                .unwrap(),
+            super::PlayerTextureOutcome::TextureNotInCloset
+        ));
+        assert!(matches!(
+            database
+                .set_player_textures("bs_", 8, 3, Some(11), None)
+                .await
+                .unwrap(),
+            super::PlayerTextureOutcome::Forbidden
+        ));
+        assert!(matches!(
+            database
+                .set_player_textures("bs_", 7, 99, Some(11), None)
+                .await
+                .unwrap(),
+            super::PlayerTextureOutcome::NotFound
+        ));
+        let textures_cleared = database
+            .clear_player_textures("bs_", 7, 3, true, false)
+            .await
+            .unwrap();
+        match textures_cleared {
+            super::PlayerTextureOutcome::Updated(player) => {
+                assert_eq!(player.tid_skin, 0);
+                assert_eq!(player.tid_cape, 12);
+            }
+            result => panic!("expected texture clear, got {result:?}"),
+        }
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
