@@ -134,6 +134,7 @@ pub fn router(state: AppState) -> Router {
         .route("/user/sign", post(user_sign))
         .route("/admin", get(web_admin_dashboard))
         .route("/admin/chart", get(web_admin_chart))
+        .route("/admin/notifications/send", post(web_send_notification))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -4174,6 +4175,121 @@ async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response
 
 static NOTIFICATION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+async fn web_send_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "message": "This action is unauthorized." })),
+        )
+            .into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    let request = if is_json {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(request) => request,
+            Err(_) => return notification_validation_error("receiver", &state.config.locale),
+        }
+    } else {
+        let fields = form_urlencoded::parse(&body).collect::<HashMap<_, _>>();
+        serde_json::json!({
+            "receiver": fields.get("receiver"),
+            "uid": fields.get("uid"),
+            "email": fields.get("email"),
+            "title": fields.get("title"),
+            "content": fields.get("content")
+        })
+    };
+    let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("receiver", &state.config.locale);
+    };
+    let receiver = receiver.trim();
+    let audience = match receiver {
+        "all" => crate::database::NotificationAudience::All,
+        "normal" => crate::database::NotificationAudience::Normal,
+        "uid" => {
+            let Some(uid) = request_i64(request.get("uid")) else {
+                return notification_validation_error("uid", &state.config.locale);
+            };
+            crate::database::NotificationAudience::User(uid)
+        }
+        "email" => {
+            let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
+                return notification_validation_error("email", &state.config.locale);
+            };
+            let email = email.trim();
+            if !valid_email_address(email) {
+                return notification_validation_error("email", &state.config.locale);
+            }
+            crate::database::NotificationAudience::Email(email.to_owned())
+        }
+        _ => return notification_validation_error("receiver", &state.config.locale),
+    };
+    let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("title", &state.config.locale);
+    };
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 20 {
+        return notification_validation_error("title", &state.config.locale);
+    }
+    let content = match request.get("content") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(content)) => Some(content.trim()),
+        _ => return notification_validation_error("content", &state.config.locale),
+    };
+    let prefix = &state.config.database.table_prefix;
+    let recipients = match database.notification_recipients(prefix, &audience).await {
+        Ok(Some(recipients)) => recipients,
+        Ok(None) => {
+            let field = match audience {
+                crate::database::NotificationAudience::User(_) => "uid",
+                crate::database::NotificationAudience::Email(_) => "email",
+                _ => "receiver",
+            };
+            return notification_validation_error(field, &state.config.locale);
+        }
+        Err(error) => {
+            tracing::error!(%error, sender_uid = user.uid, "failed to select notification recipients");
+            return unavailable();
+        }
+    };
+    let data = serde_json::json!({ "title": title, "content": content }).to_string();
+    for recipient in recipients {
+        if let Err(error) = database
+            .create_site_notification(prefix, &new_notification_id(), recipient, &data)
+            .await
+        {
+            tracing::error!(%error, recipient, sender_uid = user.uid, "failed to store admin notification");
+            return unavailable();
+        }
+    }
+    if !is_json {
+        Redirect::to("/admin").into_response()
+    } else {
+        login_result(
+            0,
+            if state.config.locale.starts_with("zh") {
+                "站内通知已发送。"
+            } else {
+                "The site notification was sent."
+            },
+            None,
+        )
+    }
+}
 async fn api_send_notification(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10765,6 +10881,7 @@ mod tests {
         assert!(admin_dashboard.contains("Textures"));
         assert!(admin_dashboard.contains("Storage"));
         assert!(admin_dashboard.contains("chart-users-registration"));
+        assert!(admin_dashboard.contains("notification-form"));
         assert!(admin_dashboard.contains("chart-textures-upload"));
         assert!(admin_dashboard.contains("fetch('/admin/chart'"));
         assert!(admin_dashboard.contains(">4<"));
@@ -12743,6 +12860,44 @@ mod tests {
         );
         std::fs::remove_dir_all(&texture_test_dir).unwrap();
 
+        let admin_notice = session_request(
+            &app,
+            &admin_cookie,
+            "POST",
+            "/admin/notifications/send",
+            Some(r#"{"receiver":"uid","uid":7,"title":"Rust notice","content":"Maintenance starts tonight."}"#),
+        )
+        .await;
+        let admin_notice_status = admin_notice.status();
+        let admin_notice_body = to_bytes(admin_notice.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_notice_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&admin_notice_body)
+        );
+        let admin_notice: serde_json::Value = serde_json::from_slice(&admin_notice_body).unwrap();
+        assert_eq!(admin_notice["code"], 0);
+        let saved_notice: String = sqlx::query_scalar(
+            "SELECT data FROM notifications WHERE notifiable_id = 7 AND data LIKE '%Rust notice%' LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let saved_notice: serde_json::Value = serde_json::from_str(&saved_notice).unwrap();
+        assert_eq!(saved_notice["title"], "Rust notice");
+        assert_eq!(saved_notice["content"], "Maintenance starts tonight.");
+        let denied_notice = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/admin/notifications/send",
+            Some(r#"{"receiver":"all","title":"Unauthorized notice"}"#),
+        )
+        .await;
+        assert_eq!(denied_notice.status(), StatusCode::FORBIDDEN);
         let logout = app
             .oneshot(
                 Request::builder()

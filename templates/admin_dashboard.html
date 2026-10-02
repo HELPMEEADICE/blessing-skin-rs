@@ -9,7 +9,7 @@
     main{max-width:960px;margin:4rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
     header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
     nav{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}
-    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}
+    .notice{margin:1.5rem 0;padding:1.25rem;background:#f4f6f9;border-radius:8px}.notice form{display:grid;grid-template-columns:1fr 2fr;gap:.7rem;align-items:center}.notice label{font-weight:600}.notice input,.notice select,.notice textarea{box-sizing:border-box;width:100%;padding:.6rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}.notice button{padding:.65rem 1rem;border:0;border-radius:4px;background:#007bff;color:white;font:inherit;cursor:pointer}.notice #notification-status{grid-column:1/-1;min-height:1rem;margin:0}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}
     .stat{padding:1.25rem;background:#f4f6f9;border-radius:8px}
     .stat h2{font-size:1rem;margin:0 0 .65rem}
     .stat p{font-size:1.6rem;font-weight:700;margin:0;overflow-wrap:anywhere}
@@ -29,6 +29,26 @@
     <a href="/admin/reports/list">{% if locale.starts_with("zh") %}举报{% else %}Reports{% endif %}</a>
     <a href="/admin/options">{% if locale.starts_with("zh") %}站点设置{% else %}Site settings{% endif %}</a>
   </nav>
+  <section class="notice">
+    <h2>{% if locale.starts_with("zh") %}发送站内通知{% else %}Send a site notification{% endif %}</h2>
+    <form id="notification-form">
+      <label for="notification-receiver">{% if locale.starts_with("zh") %}接收对象{% else %}Recipients{% endif %}</label>
+      <select id="notification-receiver" name="receiver" required>
+        <option value="all">{% if locale.starts_with("zh") %}所有用户{% else %}All users{% endif %}</option>
+        <option value="normal">{% if locale.starts_with("zh") %}普通用户{% else %}Regular users{% endif %}</option>
+        <option value="uid">{% if locale.starts_with("zh") %}指定用户编号{% else %}User ID{% endif %}</option>
+        <option value="email">{% if locale.starts_with("zh") %}指定邮箱{% else %}Email address{% endif %}</option>
+      </select>
+      <input id="notification-uid" name="uid" type="number" min="1" placeholder="UID" hidden>
+      <input id="notification-email" name="email" type="email" maxlength="100" placeholder="Email" hidden>
+      <label for="notification-title">{% if locale.starts_with("zh") %}标题（最多 20 字）{% else %}Title (up to 20 characters){% endif %}</label>
+      <input id="notification-title" name="title" maxlength="20" required>
+      <label for="notification-content">{% if locale.starts_with("zh") %}内容{% else %}Content{% endif %}</label>
+      <textarea id="notification-content" name="content" rows="3"></textarea>
+      <button type="submit">{% if locale.starts_with("zh") %}发送{% else %}Send{% endif %}</button>
+      <p id="notification-status" role="status"></p>
+    </form>
+  </section>
   <section class="stats" aria-label="{% if locale.starts_with("zh") %}站点统计{% else %}Site statistics{% endif %}">
     <article class="stat"><h2>{% if locale.starts_with("zh") %}用户{% else %}Users{% endif %}</h2><p>{{ stats.users }}</p></article>
     <article class="stat"><h2>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h2><p>{{ stats.players }}</p></article>
@@ -40,6 +60,30 @@
     <article class="chart"><h2 id="textures-chart-title">{% if locale.starts_with("zh") %}材质上传{% else %}Texture Uploads{% endif %}</h2><div id="chart-textures-upload" role="img" aria-labelledby="textures-chart-title"></div></article>
   </section>
 </main><script>
+  document.getElementById('notification-receiver').addEventListener('change', event => {
+    const target = event.currentTarget.value;
+    document.getElementById('notification-uid').hidden = target !== 'uid';
+    document.getElementById('notification-uid').required = target === 'uid';
+    document.getElementById('notification-email').hidden = target !== 'email';
+    document.getElementById('notification-email').required = target === 'email';
+  });
+  document.getElementById('notification-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget, status = document.getElementById('notification-status');
+    const values = Object.fromEntries(new FormData(form));
+    status.textContent = '';
+    try {
+      const response = await fetch('/admin/notifications/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }, body: JSON.stringify(values)
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.code !== 0) throw new Error(result.errors?.receiver?.[0] || result.errors?.uid?.[0] || result.errors?.email?.[0] || result.errors?.title?.[0] || result.message || 'Unable to send notification.');
+      status.textContent = result.message;
+      form.reset();
+      document.getElementById('notification-uid').hidden = true;
+      document.getElementById('notification-email').hidden = true;
+    } catch (error) { status.textContent = error.message; }
+  });
 async function loadAdminCharts(){
   const response=await fetch('/admin/chart',{headers:{Accept:'application/json'}});
   if(!response.ok)throw new Error('Unable to load activity charts.');
