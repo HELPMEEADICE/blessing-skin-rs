@@ -60,6 +60,7 @@ const Login: React.FC = () => {
     const response = await fetch.post<Response>(urls.auth.login(), {
       identification,
       password,
+      redirect_to: blessing.extra.redirectTo || undefined,
       keep: remember,
       captcha: hasTooManyFails ? await ref.current!.execute() : undefined,
     })

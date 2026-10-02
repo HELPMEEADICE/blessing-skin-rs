@@ -11,7 +11,7 @@
   "private": true,
   "scripts": {
     "dev": "webpack serve",
-    "build": "webpack --env production --progress",
+    "build": "node tools/buildFrontendI18n.js && webpack --env production --progress",
     "lint": "eslint --ext=ts -f=beauty .",
     "fmt": "prettier --write resources/assets tools webpack.config.ts",
     "fmt:check": "prettier --check resources/assets tools webpack.config.ts",

@@ -91,7 +91,7 @@ const routes: Route[] = [
   {
     path: 'auth/login',
     react: () => import('../views/auth/Login'),
-    el: 'main',
+    el: '#login-app',
   },
   {
     path: 'auth/register',

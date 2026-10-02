@@ -22,6 +22,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, delete, get, post, put},
 };
+use base64::Engine as _;
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use hmac::{Hmac, Mac};
 use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage, Rgba, RgbaImage};
@@ -315,6 +316,11 @@ struct LoginPage {
     submit_label: String,
     registration_link: String,
     forgot_link: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -418,6 +424,7 @@ struct EmailVerificationPage {
 #[derive(Deserialize, Default)]
 struct LoginPageQuery {
     redirect_to: Option<String>,
+    identification: Option<String>,
 }
 
 fn safe_local_redirect(target: Option<&str>) -> Option<String> {
@@ -565,6 +572,78 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
         )
     }
 }
+async fn frontend_entrypoint(
+    app_dir: &std::path::Path,
+    bundle: &str,
+    extension: &str,
+    app_url: &str,
+) -> Option<String> {
+    let mut entries = tokio::fs::read_dir(app_dir).await.ok()?;
+    let exact_name = format!("{bundle}.{extension}");
+    let prefix = format!("{bundle}.");
+    let suffix = format!(".{extension}");
+    let mut candidates = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != exact_name && !(name.starts_with(&prefix) && name.ends_with(&suffix)) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, name));
+    }
+    candidates.sort_unstable();
+    let (_, filename) = candidates.pop()?;
+    Some(format!("{}/app/{filename}", app_url.trim_end_matches('/')))
+}
+
+async fn load_frontend_translations(app_dir: &std::path::Path, locale: &str) -> serde_json::Value {
+    let valid_locale = |candidate: &str| {
+        !candidate.is_empty()
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    for candidate in [locale, "en"] {
+        if !valid_locale(candidate) {
+            continue;
+        }
+        let path = app_dir.join("i18n").join(format!("{candidate}.json"));
+        let Ok(contents) = tokio::fs::read(path).await else {
+            continue;
+        };
+        match serde_json::from_slice::<serde_json::Value>(&contents) {
+            Ok(value) if value.is_object() => return value,
+            Ok(_) => tracing::warn!(locale = candidate, "frontend translations are not a map"),
+            Err(error) => {
+                tracing::warn!(locale = candidate, %error, "failed to read frontend translations")
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn login_failure_count(state: &AppState, identification: &str) -> u32 {
+    state
+        .login_failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(identification)
+        .filter(|(_, updated)| updated.elapsed() < Duration::from_secs(3600))
+        .map(|(count, _)| *count)
+        .unwrap_or_default()
+}
+
 async fn login_page(
     State(state): State<AppState>,
     Query(query): Query<LoginPageQuery>,
@@ -584,10 +663,67 @@ async fn login_page(
         None => "Blessing Skin".to_owned(),
     };
     let chinese = state.config.locale.starts_with("zh");
+    let redirect_to = safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default();
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let frontend_script_available = frontend_script.is_some();
+    let stylesheet = stylesheet.unwrap_or_default();
+    let frontend_script = frontend_script.unwrap_or_default();
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let failures = query
+        .identification
+        .as_deref()
+        .map(|identification| login_failure_count(&state, identification) > 3)
+        .unwrap_or(false);
+    let (recaptcha_sitekey, recaptcha_invisible) = match &state.database {
+        Some(database) => {
+            let prefix = &state.config.database.table_prefix;
+            let sitekey = match database.option(prefix, "recaptcha_sitekey").await {
+                Ok(sitekey) => sitekey.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read reCAPTCHA site key for login page");
+                    String::new()
+                }
+            };
+            let invisible = match database.option(prefix, "recaptcha_invisible").await {
+                Ok(value) => value.is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read reCAPTCHA mode for login page");
+                    false
+                }
+            };
+            (sitekey, invisible)
+        }
+        None => (String::new(), false),
+    };
+    let frontend_globals = serde_json::json!({
+        "version": state.config.version,
+        "locale": state.config.locale,
+        "base_url": state.config.app_url.trim_end_matches('/'),
+        "site_name": site_name,
+        "route": "auth/login",
+        "debug": cfg!(debug_assertions),
+        "env": if cfg!(debug_assertions) { "development" } else { "production" },
+        "extra": {
+            "tooManyFails": failures,
+            "recaptcha": recaptcha_sitekey,
+            "invisible": recaptcha_invisible,
+            "redirectTo": redirect_to,
+        },
+        "i18n": i18n,
+    });
+    let frontend_globals_b64 = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&frontend_globals).expect("frontend config is serializable"));
     let page = LoginPage {
         site_name,
         locale: state.config.locale.clone(),
-        redirect_to: safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default(),
+        redirect_to,
         title: if chinese { "登录" } else { "Log In" }.to_owned(),
         prompt: if chinese {
             "登录以管理您的角色与皮肤"
@@ -621,6 +757,11 @@ async fn login_page(
             "Forgot password?"
         }
         .to_owned(),
+        frontend_style_available: !stylesheet.is_empty(),
+        frontend_stylesheet: stylesheet,
+        frontend_script_available,
+        frontend_script,
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -1999,10 +2140,11 @@ struct LoginRequest {
     identification: Option<String>,
     password: Option<String>,
     keep: Option<bool>,
+    captcha: Option<String>,
     redirect_to: Option<String>,
 }
 
-async fn handle_login(State(state): State<AppState>, body: Bytes) -> Response {
+async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request: LoginRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return validation_error("identification", &state.config.locale),
@@ -2017,6 +2159,28 @@ async fn handle_login(State(state): State<AppState>, body: Bytes) -> Response {
     let Some(password) = request.password.filter(|value| !value.is_empty()) else {
         return validation_error("password", &state.config.locale);
     };
+    let failures = login_failure_count(&state, &identification);
+    if failures > 3 {
+        let captcha_valid = if let Some(captcha) = request.captcha.as_deref() {
+            match verify_registration_captcha(&state, &headers, captcha).await {
+                Ok(valid) => valid,
+                Err(response) => return response,
+            }
+        } else {
+            false
+        };
+        if !captcha_valid {
+            return login_result(
+                1,
+                if state.config.locale.starts_with("zh") {
+                    "验证码无效。"
+                } else {
+                    "The CAPTCHA is invalid."
+                },
+                Some(serde_json::json!({ "login_fails": failures })),
+            );
+        }
+    }
     if !(6..=32).contains(&password.chars().count()) {
         return validation_error("password", &state.config.locale);
     }
@@ -12498,6 +12662,7 @@ mod tests {
                 header::{LOCATION, SET_COOKIE},
             },
         };
+        use base64::Engine as _;
         use bcrypt;
         use sqlx::sqlite::SqlitePoolOptions;
         use std::{path::PathBuf, sync::Arc};
@@ -12646,6 +12811,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&setup_storage).unwrap();
         std::fs::write(setup_storage.join("install.lock"), b"").unwrap();
+        let public_dir = std::env::temp_dir().join(format!(
+            "blessing-skin-login-public-{}",
+            super::setup_csrf_token()
+        ));
+        std::fs::create_dir_all(public_dir.join("app/i18n")).unwrap();
+        std::fs::write(
+            public_dir.join("app/app.012abcd.js"),
+            "window.fixture = true;",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/style.012abcd.css"),
+            "body { color: black; }",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/i18n/en.json"),
+            r#"{"auth":{"login":"Log In"}}"#,
+        )
+        .unwrap();
         let app = router(crate::AppState {
             config: Arc::new(config),
             database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
@@ -12657,7 +12842,7 @@ mod tests {
             mail_limits: Default::default(),
             storage_dir: setup_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
-            public_dir: std::path::PathBuf::from("public"),
+            public_dir: public_dir.clone(),
             wasm_plugins: Vec::new(),
         });
         let setup_page = app
@@ -12847,7 +13032,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/auth/login")
+                    .uri("/auth/login?redirect_to=%2Fskinlib")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -12855,11 +13040,26 @@ mod tests {
             .unwrap();
         assert_eq!(login_page.status(), StatusCode::OK);
         let login_html = to_bytes(login_page.into_body(), usize::MAX).await.unwrap();
-        assert!(
-            String::from_utf8(login_html.to_vec())
-                .unwrap()
-                .contains("Email or player name")
-        );
+        let login_html = String::from_utf8(login_html.to_vec()).unwrap();
+        assert!(login_html.contains("Email or player name"));
+        assert!(login_html.contains("id=\"login-app\""));
+        assert!(login_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(login_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_globals = login_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_globals)
+            .unwrap();
+        let globals: serde_json::Value = serde_json::from_slice(&globals_bytes).unwrap();
+        assert_eq!(globals["route"], "auth/login");
+        assert_eq!(globals["base_url"], "http://localhost");
+        assert_eq!(globals["extra"]["redirectTo"], "/skinlib");
+        assert_eq!(globals["i18n"]["auth"]["login"], "Log In");
 
         let forgot_page = app
             .clone()
@@ -14090,7 +14290,30 @@ mod tests {
                 .contains("2 accounts")
         );
 
-        let login = app
+        for expected_failures in 1..=4 {
+            let failed_login = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"identification":"alex@example.test","password":"incorrect horse"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let failed_login: serde_json::Value = serde_json::from_slice(
+                &to_bytes(failed_login.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(failed_login["data"]["login_fails"], expected_failures);
+        }
+        let captcha_required = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -14099,6 +14322,38 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"identification":"alex@example.test","password":"correct horse","keep":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let captcha_required: serde_json::Value = serde_json::from_slice(
+            &to_bytes(captcha_required.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captcha_required["code"], 1);
+        assert_eq!(captcha_required["data"]["login_fails"], 4);
+
+        let (captcha_cookie, captcha_answer) = issue_test_captcha(&app, &captcha_challenges).await;
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("cookie", captcha_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "identification": "alex@example.test",
+                            "password": "correct horse",
+                            "keep": true,
+                            "captcha": captcha_answer,
+                            "redirect_to": "/skinlib"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -14127,7 +14382,7 @@ mod tests {
         let body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["code"], 0);
-        assert_eq!(result["data"]["redirectTo"], "/user");
+        assert_eq!(result["data"]["redirectTo"], "/skinlib");
 
         let dashboard = app
             .clone()
@@ -15323,6 +15578,7 @@ mod tests {
                 .contains("Max-Age=0")
         );
         std::fs::remove_dir_all(&setup_storage).unwrap();
+        std::fs::remove_dir_all(&public_dir).unwrap();
     }
 
     #[test]
