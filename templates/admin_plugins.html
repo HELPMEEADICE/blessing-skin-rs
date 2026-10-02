@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}WASM 插件管理{% else %}WASM plugin management{% endif %} - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:1050px;margin:3rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
+    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+    section{margin-top:1.25rem;padding:1.25rem;background:#f4f6f9;border-radius:8px}
+    h2{font-size:1.1rem;margin:.25rem 0 .75rem}.notice{color:#59636e}
+    button{padding:.55rem .75rem;border:0;border-radius:4px;background:#007bff;color:white;font:inherit;cursor:pointer}
+    button.danger{background:#c82333}button.secondary{background:#59636e}
+    input[type=file]{display:block;margin:.8rem 0}.status{min-height:1.4rem;color:#59636e}
+    .plugin{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem 0;border-bottom:1px solid #d9dee5}
+    .plugin:last-child{border-bottom:0}.meta{min-width:0}.meta strong{display:block;overflow-wrap:anywhere}.meta small{color:#59636e}
+    .actions{display:flex;gap:.45rem;flex-wrap:wrap}.empty{padding:1rem;text-align:center;color:#59636e}
+    @media(max-width:650px){main{margin:1rem;padding:1rem}.plugin{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+<main id="admin-plugins" data-can-upload="{{ can_upload }}">
+  <header><h1>{% if locale.starts_with("zh") %}WASM 插件管理{% else %}WASM plugin management{% endif %}</h1><a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a></header>
+  <section>
+    <h2>{% if locale.starts_with("zh") %}组件列表{% else %}Components{% endif %}</h2>
+    <p class="notice">{% if locale.starts_with("zh") %}Rust 服务只加载通过 lifecycle API 1.0.0 校验的 .wasm 组件。启用、停用、上传或删除后的变化都需要重启服务。组件在无文件、网络、数据库和 WASI 权限的沙箱中运行。{% else %}The Rust service loads .wasm components that implement lifecycle API 1.0.0. Changes made here take effect after a service restart. Components run without filesystem, network, database, or WASI access.{% endif %}</p>
+    <p id="status" class="status" role="status"></p>
+    <div id="plugins" aria-live="polite"></div>
+  </section>
+  {% if can_upload %}
+  <section>
+    <h2>{% if locale.starts_with("zh") %}安装 WASM 组件{% else %}Install a WASM component{% endif %}</h2>
+    <p>{% if locale.starts_with("zh") %}只接受单个有效组件文件，最大 32 MiB。旧 PHP 插件需先用 plugin-migrate 扫描并移植；不支持 ZIP、PHP 文件或远程 URL 下载。{% else %}Upload one valid component up to 32 MiB. Port legacy plugins with plugin-migrate first. ZIP archives, PHP files, and remote URL downloads are not supported.{% endif %}</p>
+    <form id="upload-form"><input id="plugin-file" name="file" type="file" accept=".wasm,application/wasm" required><button type="submit">{% if locale.starts_with("zh") %}上传组件{% else %}Upload component{% endif %}</button></form>
+  </section>
+  {% else %}
+  <section><p>{% if locale.starts_with("zh") %}只有超级管理员可以上传组件。{% else %}Only super administrators can upload components.{% endif %}</p></section>
+  {% endif %}
+  <section>
+    <h2>{% if locale.starts_with("zh") %}移植旧 PHP 插件{% else %}Port a legacy PHP plugin{% endif %}</h2>
+    <p>{% if locale.starts_with("zh") %}在服务器终端运行：{% else %}Run this from a server terminal:{% endif %}</p>
+    <pre><code>blessing-skin-rs plugin-migrate &lt;legacy-plugin-dir&gt; --output &lt;scaffold-dir&gt;</code></pre>
+    <p>{% if locale.starts_with("zh") %}迁移工具会报告 PHP 依赖和钩子并生成 Rust/WASM 脚手架；不会执行或自动翻译 PHP 代码。{% else %}The migration tool reports PHP dependencies and hooks and creates a Rust/WASM scaffold. It does not execute or translate PHP code.{% endif %}</p>
+  </section>
+</main>
+<script>
+(() => {
+  const zh = document.documentElement.lang.startsWith('zh');
+  const canUpload = document.getElementById('admin-plugins').dataset.canUpload === 'true';
+  const root = document.getElementById('plugins'), status = document.getElementById('status');
+  const say = (english, chinese) => zh ? chinese : english;
+  const el = (tag, text, className) => { const node = document.createElement(tag); if (text != null) node.textContent = String(text); if (className) node.className = className; return node; };
+  async function json(response) { const body = await response.json().catch(() => ({})); if (!response.ok || (body.code !== undefined && body.code !== 0)) throw new Error(body.message || say('Request failed.', '请求失败。')); return body; }
+  async function load() {
+    status.textContent = say('Loading…', '正在加载…'); root.replaceChildren();
+    try {
+      const response = await fetch('/admin/plugins/data', { headers: { Accept: 'application/json' } });
+      const plugins = await json(response);
+      if (plugins.length === 0) { root.append(el('div', say('No WASM components found.', '没有找到 WASM 组件。'), 'empty')); }
+      for (const plugin of plugins) {
+        const row = el('article', null, 'plugin'), meta = el('div', null, 'meta');
+        meta.append(el('strong', plugin.title));
+        meta.append(el('small', `${plugin.version} · ${plugin.description}`));
+        const actions = el('div', null, 'actions');
+        const manage = async action => {
+          const result = await json(await fetch('/admin/plugins/manage', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ action, name: plugin.name }) }));
+          status.textContent = result.message || say('Plugin updated.', '插件状态已更新。'); await load();
+        };
+        const button = (label, action, danger = false) => { const node = el('button', label, danger ? 'danger' : 'secondary'); node.type = 'button'; node.addEventListener('click', async () => { try { if (danger && !confirm(say('Delete this component file?', '确定删除此组件文件吗？'))) return; await manage(action); } catch (error) { status.textContent = error.message; } }); return node; };
+        if (plugin.on_disk) {
+          actions.append(button(plugin.enabled ? say('Disable', '停用') : say('Enable', '启用'), plugin.enabled ? 'disable' : 'enable'));
+          actions.append(button(say('Delete', '删除'), 'delete', true));
+        }
+        row.append(meta, actions); root.append(row);
+      }
+      status.textContent = '';
+    } catch (error) { status.textContent = error.message; }
+  }
+  if (canUpload) document.getElementById('upload-form').addEventListener('submit', async event => {
+    event.preventDefault(); const file = document.getElementById('plugin-file').files[0]; if (!file) return;
+    const form = new FormData(); form.append('file', file, file.name); status.textContent = say('Validating and installing…', '正在校验并安装…');
+    try { const result = await json(await fetch('/admin/plugins/upload', { method: 'POST', body: form })); status.textContent = result.message; document.getElementById('upload-form').reset(); await load(); }
+    catch (error) { status.textContent = error.message; }
+  });
+  load();
+})();
+</script>
+</body>
+</html>

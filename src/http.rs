@@ -136,6 +136,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin", get(web_admin_dashboard))
         .route("/admin/chart", get(web_admin_chart))
         .route("/admin/status", get(web_admin_status))
+        .route("/admin/plugins/data", get(web_admin_plugins_data))
+        .route(
+            "/admin/plugins/manage",
+            get(web_admin_plugins_page).post(web_admin_plugins_manage),
+        )
+        .route(
+            "/admin/plugins/upload",
+            post(web_admin_plugins_upload).layer(DefaultBodyLimit::max(34 * 1024 * 1024)),
+        )
         .route("/admin/notifications/send", post(web_send_notification))
         .route("/admin/users", get(web_admin_users_page))
         .route("/admin/users/list", get(admin_user_list))
@@ -2180,6 +2189,20 @@ struct AdminStatusPage {
 }
 
 #[derive(Template)]
+#[template(path = "admin_plugins.html")]
+struct AdminPluginsPage {
+    site_name: String,
+    locale: String,
+    can_upload: bool,
+}
+
+#[derive(Deserialize)]
+struct AdminPluginManageRequest {
+    action: String,
+    name: String,
+}
+
+#[derive(Template)]
 #[template(path = "admin_users.html")]
 struct AdminUsersPage {
     site_name: String,
@@ -3005,6 +3028,357 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let page = AdminPluginsPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        can_upload: user.permission >= 2,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator plugins page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_plugins_data(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match admin_plugin_inventory(&state) {
+        Ok(plugins) => Json(plugins).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list WASM plugins");
+            unavailable()
+        }
+    }
+}
+
+async fn web_admin_plugins_manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let request = match serde_json::from_slice::<AdminPluginManageRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return admin_plugin_result(1, "Invalid plugin request."),
+    };
+    if !crate::plugin_runtime::valid_plugin_name(&request.name) {
+        return admin_plugin_result(1, "Invalid plugin name.");
+    }
+    let enabled = state
+        .config
+        .plugins_dir
+        .join(format!("{}.wasm", request.name));
+    let disabled = state
+        .config
+        .plugins_dir
+        .join(format!("{}.wasm.disabled", request.name));
+    let operation = match request.action.as_str() {
+        "enable" => {
+            if enabled.exists() {
+                return admin_plugin_result(1, "The plugin is already enabled.");
+            }
+            std::fs::rename(&disabled, &enabled)
+        }
+        "disable" => {
+            if disabled.exists() {
+                return admin_plugin_result(1, "The plugin is already disabled.");
+            }
+            std::fs::rename(&enabled, &disabled)
+        }
+        "delete" => {
+            let mut deleted = false;
+            for path in [&enabled, &disabled] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => deleted = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::error!(%error, plugin = %request.name, "failed to remove WASM plugin");
+                        return admin_plugin_result(1, "Could not remove the plugin file.");
+                    }
+                }
+            }
+            if !deleted {
+                return admin_plugin_result(1, "Plugin not found.");
+            }
+            return admin_plugin_result(
+                0,
+                "Plugin file removed. Restart the service for the change to take effect.",
+            );
+        }
+        _ => return admin_plugin_result(1, "Invalid plugin action."),
+    };
+    match operation {
+        Ok(()) => admin_plugin_result(
+            0,
+            "Plugin file updated. Restart the service for the change to take effect.",
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            admin_plugin_result(1, "Plugin not found.")
+        }
+        Err(error) => {
+            tracing::error!(%error, plugin = %request.name, action = %request.action, "failed to update WASM plugin state");
+            admin_plugin_result(1, "Could not update the plugin file.")
+        }
+    }
+}
+
+async fn web_admin_plugins_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 2 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut upload = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "invalid WASM plugin upload request");
+                return admin_plugin_result(1, "Invalid upload request.");
+            }
+        };
+        if field.name() != Some("file") {
+            continue;
+        }
+        if upload.is_some() {
+            return admin_plugin_result(1, "Upload exactly one WASM component.");
+        }
+        let Some(filename) = field.file_name().map(str::to_owned) else {
+            return admin_plugin_result(1, "Choose a .wasm component file.");
+        };
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "could not read WASM plugin upload");
+                return admin_plugin_result(1, "Could not read the uploaded file.");
+            }
+        };
+        if bytes.len() as u64 > crate::plugin_runtime::COMPONENT_FILE_LIMIT {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "code": 1,
+                    "message": "WASM components must be 32 MiB or smaller."
+                })),
+            )
+                .into_response();
+        }
+        upload = Some((filename, bytes));
+    }
+    let Some((filename, bytes)) = upload else {
+        return admin_plugin_result(1, "Choose a .wasm component file.");
+    };
+    let Some(name) = filename.strip_suffix(".wasm") else {
+        return admin_plugin_result(1, "Only .wasm component files are supported.");
+    };
+    if !crate::plugin_runtime::valid_plugin_name(name) {
+        return admin_plugin_result(1, "The uploaded filename is not valid.");
+    }
+    if let Err(error) = crate::plugin_runtime::PluginRuntime::validate_component_bytes(&bytes) {
+        tracing::warn!(%error, plugin = %filename, "rejected invalid WASM plugin component");
+        return admin_plugin_result(1, "The file is not a valid Blessing Skin WASM component.");
+    }
+    if let Err(error) = std::fs::create_dir_all(&state.config.plugins_dir) {
+        tracing::error!(%error, "could not create WASM plugin directory");
+        return unavailable();
+    }
+    let path = state.config.plugins_dir.join(&filename);
+    let disabled = state
+        .config
+        .plugins_dir
+        .join(format!("{name}.wasm.disabled"));
+    if state.wasm_plugins.iter().any(|plugin| plugin == &filename) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": "This plugin is still loaded. Restart the service before replacing it."
+            })),
+        )
+            .into_response();
+    }
+    if path.exists() || disabled.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": "A plugin with that name already exists."
+            })),
+        )
+            .into_response();
+    }
+    let write_path = path.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&write_path)?;
+        if let Err(error) = file.write_all(&bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&write_path);
+            return Err(error);
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => admin_plugin_result(
+            0,
+            "WASM component installed. Restart the service to load it.",
+        ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": "A plugin with that name already exists."
+            })),
+        )
+            .into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(%error, plugin = %filename, "failed to save WASM plugin");
+            unavailable()
+        }
+        Err(error) => {
+            tracing::error!(%error, plugin = %filename, "WASM plugin file operation failed");
+            unavailable()
+        }
+    }
+}
+
+fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, std::io::Error> {
+    let mut plugins = std::collections::BTreeMap::<String, (bool, bool)>::new();
+    for filename in &state.wasm_plugins {
+        if let Some(name) = filename.strip_suffix(".wasm")
+            && crate::plugin_runtime::valid_plugin_name(name)
+        {
+            plugins.insert(name.to_owned(), (true, false));
+        }
+    }
+    let entries = match std::fs::read_dir(&state.config.plugins_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(plugins
+                .into_iter()
+                .map(|(name, (enabled, _))| admin_plugin_record(state, name, enabled, false))
+                .collect());
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        let (name, enabled) = if let Some(name) = filename.strip_suffix(".wasm") {
+            (name, true)
+        } else if let Some(name) = filename.strip_suffix(".wasm.disabled") {
+            (name, false)
+        } else {
+            continue;
+        };
+        if !crate::plugin_runtime::valid_plugin_name(name) {
+            continue;
+        }
+        plugins
+            .entry(name.to_owned())
+            .and_modify(|state| {
+                if !state.1 {
+                    state.0 = enabled;
+                } else {
+                    state.0 |= enabled;
+                }
+                state.1 = true;
+            })
+            .or_insert((enabled, true));
+    }
+    Ok(plugins
+        .into_iter()
+        .map(|(name, (enabled, on_disk))| admin_plugin_record(state, name, enabled, on_disk))
+        .collect())
+}
+
+fn admin_plugin_record(
+    state: &AppState,
+    name: String,
+    enabled: bool,
+    on_disk: bool,
+) -> serde_json::Value {
+    let filename = format!("{name}.wasm");
+    let loaded = state.wasm_plugins.iter().any(|plugin| plugin == &filename);
+    let chinese = state.config.locale.starts_with("zh");
+    let description = if loaded && !on_disk {
+        if chinese {
+            "文件已移除；当前进程重启前仍会运行"
+        } else {
+            "File removed; still running until restart"
+        }
+    } else if loaded {
+        if chinese {
+            "已加载；文件状态变更需重启服务"
+        } else {
+            "Loaded; file changes require restart"
+        }
+    } else if enabled {
+        if chinese {
+            "已启用；将在下次启动时加载"
+        } else {
+            "Enabled; will load on next startup"
+        }
+    } else {
+        if chinese { "已停用" } else { "Disabled" }
+    };
+    serde_json::json!({
+        "name": name,
+        "title": name,
+        "description": description,
+        "version": "WASM lifecycle API 1.0.0",
+        "enabled": enabled,
+        "loaded": loaded,
+        "on_disk": on_disk,
+        "readme": false,
+        "config": false,
+        "icon": {"fa": "puzzle-piece", "faType": "fas", "bg": "teal"}
+    })
+}
+
+fn admin_plugin_result(code: i32, message: &str) -> Response {
+    Json(serde_json::json!({"code": code, "message": message})).into_response()
 }
 
 async fn web_admin_chart(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -11498,6 +11872,93 @@ mod tests {
         .unwrap();
         assert!(reports_html.contains("Report management"));
         assert!(reports_html.contains("/admin/reports/list"));
+
+        let denied_plugins_page = session_request(
+            &app,
+            &registered_cookie,
+            "GET",
+            "/admin/plugins/manage",
+            None,
+        )
+        .await;
+        assert_eq!(denied_plugins_page.status(), StatusCode::FORBIDDEN);
+        let plugins_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/plugins/manage", None).await;
+        assert_eq!(plugins_page.status(), StatusCode::OK);
+        let plugins_html = String::from_utf8(
+            to_bytes(plugins_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(plugins_html.contains("WASM plugin management"));
+        let plugin_data =
+            session_request(&app, &admin_cookie, "GET", "/admin/plugins/data", None).await;
+        assert_eq!(plugin_data.status(), StatusCode::OK);
+        let plugin_data: serde_json::Value =
+            serde_json::from_slice(&to_bytes(plugin_data.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(plugin_data.is_array());
+        let boundary = "blessing-wasm-upload-test";
+        let upload_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"broken.wasm\"\r\nContent-Type: application/wasm\r\n\r\nnot wasm\r\n--{boundary}--\r\n"
+        );
+        let denied_plugin_upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/upload")
+                    .header("cookie", admin_cookie.clone())
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_plugin_upload.status(), StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE users SET permission = 2 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let invalid_plugin_upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/upload")
+                    .header("cookie", admin_cookie.clone())
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_plugin_upload.status(), StatusCode::OK);
+        let invalid_plugin_upload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_plugin_upload.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(invalid_plugin_upload["code"], 1);
+        assert!(
+            invalid_plugin_upload["message"]
+                .as_str()
+                .unwrap()
+                .contains("valid Blessing Skin WASM component")
+        );
+        sqlx::query("UPDATE users SET permission = 1 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let status_page = session_request(&app, &admin_cookie, "GET", "/admin/status", None).await;
         assert_eq!(status_page.status(), StatusCode::OK);

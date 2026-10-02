@@ -13,7 +13,7 @@ const HOST_API_VERSION: &str = "1.0.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
+pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 
 struct PluginStore {
     limits: StoreLimits,
@@ -32,9 +32,7 @@ pub struct PluginRuntime {
 
 impl PluginRuntime {
     pub fn load(directory: &Path) -> Result<Self, Box<dyn Error>> {
-        let mut config = Config::new();
-        config.wasm_component_model(true).consume_fuel(true);
-        let engine = Engine::new(&config)?;
+        let engine = plugin_engine()?;
         let mut paths = Vec::new();
         match find_components(directory, &mut paths) {
             Ok(()) => {}
@@ -54,6 +52,19 @@ impl PluginRuntime {
         }
         tracing::info!(count = runtime.plugins.len(), directory = %directory.display(), "WASM plugins loaded");
         Ok(runtime)
+    }
+
+    pub fn validate_component_bytes(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+        let engine = plugin_engine()?;
+        let mut runtime = Self {
+            plugins: Vec::new(),
+        };
+        runtime.load_component_bytes(&engine, Path::new("uploaded.wasm"), bytes)?;
+        if let Some(plugin) = runtime.plugins.last_mut() {
+            stop_plugin(plugin)?;
+        }
+        runtime.plugins.clear();
+        Ok(())
     }
 
     pub fn loaded_plugin_names(&self) -> Vec<String> {
@@ -80,6 +91,22 @@ impl PluginRuntime {
             .into());
         }
         let bytes = fs::read(path)?;
+        self.load_component_bytes(engine, path, &bytes)
+    }
+
+    fn load_component_bytes(
+        &mut self,
+        engine: &Engine,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        if bytes.len() as u64 > COMPONENT_FILE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "component file exceeds the 32 MiB size limit",
+            )
+            .into());
+        }
         let component = Component::new(engine, bytes)?;
         let state = PluginStore {
             limits: StoreLimitsBuilder::new()
@@ -126,6 +153,15 @@ impl PluginRuntime {
                 .into());
             }
         }
+        let shutdown_export = instance
+            .get_export_index(&mut store, Some(&lifecycle), "shutdown")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "component lifecycle is missing shutdown",
+                )
+            })?;
+        instance.get_typed_func::<(), ()>(&mut store, &shutdown_export)?;
         self.plugins.push(LoadedPlugin {
             path: path.to_owned(),
             store,
@@ -138,24 +174,7 @@ impl PluginRuntime {
 
     pub fn shutdown(&mut self) {
         for plugin in self.plugins.iter_mut().rev() {
-            let result = (|| -> Result<(), Box<dyn Error>> {
-                plugin.store.set_fuel(COMPONENT_FUEL)?;
-                let shutdown_export = plugin
-                    .instance
-                    .get_export_index(&mut plugin.store, Some(&plugin.lifecycle), "shutdown")
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "component lifecycle is missing shutdown",
-                        )
-                    })?;
-                let shutdown = plugin
-                    .instance
-                    .get_typed_func::<(), ()>(&mut plugin.store, &shutdown_export)?;
-                shutdown.call(&mut plugin.store, ())?;
-                Ok(())
-            })();
-            if let Err(error) = result {
+            if let Err(error) = stop_plugin(plugin) {
                 tracing::warn!(%error, plugin = %plugin.path.display(), "WASM plugin shutdown failed");
             } else {
                 tracing::info!(plugin = %plugin.path.display(), "WASM plugin shut down");
@@ -168,6 +187,41 @@ impl PluginRuntime {
     fn loaded_count(&self) -> usize {
         self.plugins.len()
     }
+}
+
+fn stop_plugin(plugin: &mut LoadedPlugin) -> Result<(), Box<dyn Error>> {
+    plugin.store.set_fuel(COMPONENT_FUEL)?;
+    let shutdown_export = plugin
+        .instance
+        .get_export_index(&mut plugin.store, Some(&plugin.lifecycle), "shutdown")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "component lifecycle is missing shutdown",
+            )
+        })?;
+    let shutdown = plugin
+        .instance
+        .get_typed_func::<(), ()>(&mut plugin.store, &shutdown_export)?;
+    shutdown.call(&mut plugin.store, ())?;
+    Ok(())
+}
+
+fn plugin_engine() -> Result<Engine, Box<dyn Error>> {
+    let mut config = Config::new();
+    config.wasm_component_model(true).consume_fuel(true);
+    Ok(Engine::new(&config)?)
+}
+
+pub fn valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.is_ascii()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -205,6 +259,19 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn component_validation_rejects_non_component_bytes() {
+        assert!(PluginRuntime::validate_component_bytes(b"not a wasm component").is_err());
+    }
+
+    #[test]
+    fn plugin_names_are_single_safe_filename_stems() {
+        assert!(super::valid_plugin_name("skin-tools.v2"));
+        assert!(!super::valid_plugin_name("../outside"));
+        assert!(!super::valid_plugin_name("folder/plugin"));
+        assert!(!super::valid_plugin_name(""));
     }
 
     #[test]
