@@ -48,6 +48,8 @@ cargo build --locked --release
 
 Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 已提供 Passport `/oauth/token` 的 password/refresh_token 授权、登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。
 
+官方发行包包含 `public/app` 下的旧站前端 bundle；从源码部署时，可运行 `yarn install --frozen-lockfile` 和 `yarn build` 生成这些资源。Rust 服务通过 `PUBLIC_PATH/app` 提供它们。
+
 ## 本地启动
 
 在服务工作目录准备 `.env`，确认数据库和文件目录可读写，再运行：

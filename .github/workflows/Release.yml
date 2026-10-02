@@ -8,7 +8,34 @@ on:
 permissions: {}
 
 jobs:
+  frontend-assets:
+    name: Build legacy frontend assets
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+      - name: Install frontend dependencies
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+          yarn install --frozen-lockfile
+      - name: Build React and Webpack assets
+        run: yarn build
+      - name: Upload frontend assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-assets
+          path: public/app
+          if-no-files-found: error
+          retention-days: 3
+
   build:
+    needs: frontend-assets
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     permissions:
@@ -29,6 +56,11 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      - name: Download frontend assets
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-assets
+          path: public/app
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -45,6 +77,8 @@ jobs:
           name="blessing-skin-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/blessing-skin-rs" "$name/"
+          mkdir -p "$name/public/app"
+          cp -R public/app/. "$name/public/app/"
           cp LICENSE rust.env.example docs/rust-deployment.md docs/rust-install.md docs/plugin-migration.md "$name/"
           tar -czf "${name}.tar.gz" "$name"
           echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -56,6 +90,8 @@ jobs:
           $name = "blessing-skin-server-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/blessing-skin-rs.exe" "$name/"
+          New-Item -ItemType Directory -Path "$name/public/app" -Force | Out-Null
+          Get-ChildItem -Path "public/app" -Force | Copy-Item -Destination "$name/public/app" -Recurse -Force
           Copy-Item LICENSE, rust.env.example, docs/rust-deployment.md, docs/rust-install.md, docs/plugin-migration.md $name/
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
           "archive=$name.zip" >> $env:GITHUB_OUTPUT
