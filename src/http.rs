@@ -62,6 +62,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api", any(api_root))
         .route("/api/", any(api_root))
         .route("/", get(home))
+        .route("/setup", get(setup_welcome))
+        .route(
+            "/setup/database",
+            get(setup_database_page).post(setup_database_save),
+        )
+        .route("/setup/info", get(setup_info_page))
+        .route("/setup/finish", post(setup_finish))
         .route("/auth/login", get(login_page).post(handle_login))
         .route("/auth/bind", get(bind_email_page).post(bind_email))
         .route("/auth/register", get(register_page).post(handle_register))
@@ -286,6 +293,10 @@ pub fn router(state: AppState) -> Router {
         .route("/avatar/{tid}", get(avatar_by_texture))
         .route("/preview/{tid}", get(preview_by_texture))
         .route("/preview/hash/{hash}", get(preview_by_hash))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            redirect_uninstalled,
+        ))
         .with_state(state)
 }
 
@@ -2198,6 +2209,73 @@ struct AdminPluginsPage {
     site_name: String,
     locale: String,
     can_upload: bool,
+}
+
+#[derive(Template)]
+#[template(path = "setup_welcome.html")]
+struct SetupWelcomePage {
+    locale: String,
+    version: String,
+}
+
+#[derive(Template)]
+#[template(path = "setup_database.html")]
+struct SetupDatabasePage {
+    locale: String,
+    csrf: String,
+    driver: String,
+    host: String,
+    port: String,
+    username: String,
+    database: String,
+    prefix: String,
+    error: String,
+    saved: bool,
+}
+
+#[derive(Template)]
+#[template(path = "setup_info.html")]
+struct SetupInfoPage {
+    locale: String,
+    csrf: String,
+    site_name: String,
+    error: String,
+}
+
+#[derive(Template)]
+#[template(path = "setup_finish.html")]
+struct SetupFinishPage {
+    locale: String,
+}
+
+#[derive(Template)]
+#[template(path = "setup_locked.html")]
+struct SetupLockedPage {
+    locale: String,
+}
+
+#[derive(Deserialize)]
+struct SetupDatabaseRequest {
+    csrf: String,
+    #[serde(rename = "type")]
+    driver: String,
+    host: String,
+    port: String,
+    username: String,
+    password: String,
+    #[serde(rename = "db")]
+    database: String,
+    prefix: String,
+}
+
+#[derive(Deserialize)]
+struct SetupFinishRequest {
+    csrf: String,
+    email: String,
+    nickname: String,
+    password: String,
+    password_confirmation: String,
+    site_name: String,
 }
 
 #[derive(Deserialize)]
@@ -4999,8 +5077,602 @@ async fn live() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
+async fn redirect_uninstalled(
+    State(state): State<AppState>,
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    if state.storage_dir.join("install.lock").exists()
+        || path == "/setup"
+        || path.starts_with("/setup/")
+        || path == "/api"
+        || path.starts_with("/api/")
+        || path == "/health/live"
+        || path == "/health/ready"
+        || path.ends_with(".json")
+        || ["/csl/", "/textures/", "/raw/", "/avatar/", "/preview/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    {
+        next.run(request).await
+    } else {
+        (StatusCode::FOUND, [(LOCATION, "/setup")]).into_response()
+    }
+}
+
 async fn change_password_discovery() -> Response {
     (StatusCode::FOUND, [(LOCATION, "/user/profile")]).into_response()
+}
+
+async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if setup_is_locked(&state) {
+        return render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        );
+    }
+    render_setup_page(
+        &SetupWelcomePage {
+            locale: state.config.locale.clone(),
+            version: state.config.version.to_owned(),
+        },
+        &headers,
+        None,
+    )
+}
+
+async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if setup_is_locked(&state) {
+        return render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        );
+    }
+    if let Some(database) = &state.database
+        && database.ping().await.is_ok()
+    {
+        return Redirect::to("/setup/info").into_response();
+    }
+    let config = &state.config.database;
+    let (driver, host, port, username) = match &config.connection {
+        crate::config::DatabaseConnection::Sqlite(_) => {
+            ("sqlite", String::new(), String::new(), String::new())
+        }
+        crate::config::DatabaseConnection::MySql(_) => (
+            "mysql",
+            config.host.clone().unwrap_or_default(),
+            config.port.map(|port| port.to_string()).unwrap_or_default(),
+            config.username.clone().unwrap_or_default(),
+        ),
+        crate::config::DatabaseConnection::Postgres(_) => (
+            "pgsql",
+            config.host.clone().unwrap_or_default(),
+            config.port.map(|port| port.to_string()).unwrap_or_default(),
+            config.username.clone().unwrap_or_default(),
+        ),
+    };
+    let csrf = setup_csrf_for_page(&headers);
+    render_setup_page(
+        &SetupDatabasePage {
+            locale: state.config.locale.clone(),
+            csrf: csrf.clone(),
+            driver: driver.to_owned(),
+            host,
+            port,
+            username,
+            database: config.database.clone(),
+            prefix: config.table_prefix.clone(),
+            error: String::new(),
+            saved: false,
+        },
+        &headers,
+        Some(&csrf),
+    )
+}
+
+async fn setup_database_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SetupDatabaseRequest>,
+) -> Response {
+    if setup_is_locked(&state) {
+        return render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        );
+    }
+    if !valid_setup_csrf(&headers, &form.csrf) {
+        return setup_database_error(
+            &state,
+            &headers,
+            &form,
+            setup_message(
+                &state,
+                "The setup form expired. Reload this page and try again.",
+                "安装表单已过期，请刷新页面后重试。",
+            ),
+            StatusCode::FORBIDDEN,
+        );
+    }
+    let database = match crate::config::DatabaseConfig::from_setup(
+        &form.driver,
+        &form.host,
+        &form.port,
+        &form.username,
+        &form.password,
+        &form.database,
+        &form.prefix,
+    ) {
+        Ok(database) => database,
+        Err(error) => {
+            let message = setup_message(
+                &state,
+                "Check the database type, required fields, port, and table prefix.",
+                "请检查数据库类型、必填字段、端口和表前缀。 ",
+            );
+            tracing::warn!(%error, "invalid database setup form");
+            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_REQUEST);
+        }
+    };
+    if matches!(
+        &database.connection,
+        crate::config::DatabaseConnection::Sqlite(_)
+    ) && let Some(parent) = std::path::Path::new(&database.database)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::error!(%error, "could not create SQLite database directory during setup");
+        return setup_database_error(
+            &state,
+            &headers,
+            &form,
+            setup_message(
+                &state,
+                "The SQLite database path could not be prepared.",
+                "无法准备 SQLite 数据库路径。",
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let pool = match DatabasePool::connect_for_install(&database).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::warn!(%error, driver = %form.driver, "database connection failed during setup");
+            let message = setup_message(
+                &state,
+                &format!("Could not connect to the database: {error}"),
+                &format!("无法连接数据库：{error}"),
+            );
+            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY);
+        }
+    };
+    if let Err(error) = pool.ping().await {
+        tracing::warn!(%error, driver = %form.driver, "database ping failed during setup");
+        let message = setup_message(
+            &state,
+            &format!("Could not use the database: {error}"),
+            &format!("无法使用该数据库：{error}"),
+        );
+        return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY);
+    }
+    drop(pool);
+    let env_file = state.env_file.clone();
+    let entries = vec![
+        ("DB_CONNECTION", form.driver.clone()),
+        ("DB_HOST", form.host.clone()),
+        ("DB_PORT", form.port.clone()),
+        ("DB_DATABASE", form.database.clone()),
+        ("DB_USERNAME", form.username.clone()),
+        ("DB_PASSWORD", form.password.clone()),
+        ("DB_PREFIX", form.prefix.clone()),
+    ];
+    let write_path = env_file.clone();
+    let saved = tokio::task::spawn_blocking(move || write_setup_env(&write_path, &entries)).await;
+    match saved {
+        Ok(Ok(())) => {
+            let csrf = setup_csrf_for_page(&headers);
+            render_setup_page(
+                &SetupDatabasePage {
+                    locale: state.config.locale.clone(),
+                    csrf: csrf.clone(),
+                    driver: form.driver,
+                    host: form.host,
+                    port: form.port,
+                    username: form.username,
+                    database: form.database,
+                    prefix: form.prefix,
+                    error: String::new(),
+                    saved: true,
+                },
+                &headers,
+                Some(&csrf),
+            )
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, path = %env_file.display(), "could not save database setup");
+            setup_database_error(
+                &state,
+                &headers,
+                &form,
+                setup_message(
+                    &state,
+                    "The database connected, but the environment file could not be saved.",
+                    "数据库连接成功，但无法保存环境配置文件。",
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "database setup file operation failed");
+            setup_database_error(
+                &state,
+                &headers,
+                &form,
+                setup_message(
+                    &state,
+                    "The database connected, but saving its configuration failed.",
+                    "数据库连接成功，但保存配置失败。",
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    }
+}
+
+async fn setup_info_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if setup_is_locked(&state) {
+        return render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        );
+    }
+    let Some(database) = &state.database else {
+        return Redirect::to("/setup/database").into_response();
+    };
+    if database.ping().await.is_err() {
+        return Redirect::to("/setup/database").into_response();
+    }
+    let site_name = database
+        .option(&state.config.database.table_prefix, "site_name")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "Blessing Skin".to_owned());
+    let csrf = setup_csrf_for_page(&headers);
+    render_setup_page(
+        &SetupInfoPage {
+            locale: state.config.locale.clone(),
+            csrf: csrf.clone(),
+            site_name,
+            error: String::new(),
+        },
+        &headers,
+        Some(&csrf),
+    )
+}
+
+async fn setup_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SetupFinishRequest>,
+) -> Response {
+    if setup_is_locked(&state) {
+        return render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        );
+    }
+    if !valid_setup_csrf(&headers, &form.csrf) {
+        return setup_info_error(
+            &state,
+            &headers,
+            &form.site_name,
+            setup_message(
+                &state,
+                "The setup form expired. Reload this page and try again.",
+                "安装表单已过期，请刷新页面后重试。",
+            ),
+            StatusCode::FORBIDDEN,
+        );
+    }
+    let validation_error = if !form.email.contains('@')
+        || form.email.len() > 100
+        || form.email.chars().any(char::is_control)
+    {
+        Some(setup_message(
+            &state,
+            "Enter a valid administrator email address.",
+            "请输入有效的管理员邮箱。",
+        ))
+    } else if form.nickname.trim().is_empty()
+        || form.nickname.len() > 50
+        || form.nickname.chars().any(char::is_control)
+    {
+        Some(setup_message(
+            &state,
+            "Enter a nickname of 1 to 50 characters.",
+            "昵称长度需为 1 至 50 个字符。",
+        ))
+    } else if !(8..=32).contains(&form.password.chars().count()) {
+        Some(setup_message(
+            &state,
+            "The password must contain 8 to 32 characters.",
+            "密码长度需为 8 至 32 个字符。",
+        ))
+    } else if form.password != form.password_confirmation {
+        Some(setup_message(
+            &state,
+            "The passwords do not match.",
+            "两次输入的密码不一致。",
+        ))
+    } else if form.site_name.trim().is_empty()
+        || form.site_name.len() > 100
+        || form.site_name.chars().any(char::is_control)
+    {
+        Some(setup_message(
+            &state,
+            "Enter a valid site name.",
+            "请输入有效的站点名称。",
+        ))
+    } else {
+        None
+    };
+    if let Some(error) = validation_error {
+        return setup_info_error(
+            &state,
+            &headers,
+            &form.site_name,
+            error,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match crate::installer::install_with_details(
+        &state.config,
+        &state.storage_dir,
+        &form.email,
+        &form.nickname,
+        &form.password,
+        &form.site_name,
+    )
+    .await
+    {
+        Ok(()) => render_setup_page(
+            &SetupFinishPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        ),
+        Err(crate::installer::InstallError::AlreadyInstalled) => render_setup_page(
+            &SetupLockedPage {
+                locale: state.config.locale.clone(),
+            },
+            &headers,
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, "web setup installation failed");
+            let message = match error {
+                crate::installer::InstallError::DatabaseNotEmpty => setup_message(
+                    &state,
+                    "The database already contains Blessing Skin data, so installation was stopped.",
+                    "数据库中已有 Blessing Skin 数据，已停止安装。",
+                ),
+                crate::installer::InstallError::UnsupportedPasswordMethod => setup_message(
+                    &state,
+                    "The configured password method cannot create a compatible password hash.",
+                    "当前密码算法无法生成兼容的密码哈希。",
+                ),
+                _ => setup_message(
+                    &state,
+                    "Installation failed. Check the server log and database configuration, then try again.",
+                    "安装失败。请检查服务日志和数据库配置后重试。",
+                ),
+            };
+            setup_info_error(
+                &state,
+                &headers,
+                &form.site_name,
+                message,
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    }
+}
+
+fn setup_database_error(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &SetupDatabaseRequest,
+    error: String,
+    status: StatusCode,
+) -> Response {
+    let csrf = setup_csrf_for_page(&headers);
+    let mut response = render_setup_page(
+        &SetupDatabasePage {
+            locale: state.config.locale.clone(),
+            csrf: csrf.clone(),
+            driver: form.driver.clone(),
+            host: form.host.clone(),
+            port: form.port.clone(),
+            username: form.username.clone(),
+            database: form.database.clone(),
+            prefix: form.prefix.clone(),
+            error,
+            saved: false,
+        },
+        headers,
+        Some(&csrf),
+    );
+    *response.status_mut() = status;
+    response
+}
+
+fn setup_info_error(
+    state: &AppState,
+    headers: &HeaderMap,
+    site_name: &str,
+    error: String,
+    status: StatusCode,
+) -> Response {
+    let csrf = setup_csrf_for_page(&headers);
+    let mut response = render_setup_page(
+        &SetupInfoPage {
+            locale: state.config.locale.clone(),
+            csrf: csrf.clone(),
+            site_name: site_name.to_owned(),
+            error,
+        },
+        headers,
+        Some(&csrf),
+    );
+    *response.status_mut() = status;
+    response
+}
+
+fn setup_is_locked(state: &AppState) -> bool {
+    state.storage_dir.join("install.lock").exists()
+}
+
+fn setup_message(state: &AppState, english: &str, chinese: &str) -> String {
+    if state.config.locale.starts_with("zh") {
+        chinese.to_owned()
+    } else {
+        english.to_owned()
+    }
+}
+
+fn setup_csrf_token() -> String {
+    Alphanumeric.sample_string(&mut rand::thread_rng(), 48)
+}
+
+fn setup_csrf_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                name.eq_ignore_ascii_case("blessing_skin_setup_csrf")
+                    .then_some(value)
+            })
+        })
+}
+
+fn setup_csrf_for_page(headers: &HeaderMap) -> String {
+    setup_csrf_cookie(headers)
+        .filter(|token| token.len() == 48 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .map(str::to_owned)
+        .unwrap_or_else(setup_csrf_token)
+}
+
+fn valid_setup_csrf(headers: &HeaderMap, submitted: &str) -> bool {
+    let Some(cookie) = setup_csrf_cookie(headers) else {
+        return false;
+    };
+    cookie.len() == submitted.len()
+        && cookie.as_bytes().ct_eq(submitted.as_bytes()).unwrap_u8() == 1
+}
+
+fn render_setup_page(
+    template: &impl Template,
+    headers: &HeaderMap,
+    csrf: Option<&str>,
+) -> Response {
+    let html = match template.render() {
+        Ok(html) => html,
+        Err(error) => {
+            tracing::error!(%error, "failed to render setup page");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut response = Html(html).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(csrf) = csrf {
+        let secure = headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("https")
+            });
+        let secure = if secure { "; Secure" } else { "" };
+        if let Ok(cookie) = HeaderValue::from_str(&format!(
+            "blessing_skin_setup_csrf={csrf}; Path=/setup; Max-Age=3600; HttpOnly; SameSite=Strict{secure}"
+        )) {
+            response.headers_mut().append(SET_COOKIE, cookie);
+        }
+    }
+    response
+}
+
+fn write_setup_env(
+    path: &std::path::Path,
+    entries: &[(&str, String)],
+) -> Result<(), std::io::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updates = entries.iter().cloned().collect::<BTreeMap<_, _>>();
+    let mut written = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((key, _)) = assignment.split_once('=')
+            && let Some(value) = updates.get(key.trim())
+        {
+            lines.push(format!("{}={}", key.trim(), quote_env_value(value)));
+            written.insert(key.trim().to_owned());
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    for (key, value) in updates {
+        if !written.contains(key) {
+            lines.push(format!("{key}={}", quote_env_value(&value)));
+        }
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    options.open(path)?.write_all(output.as_bytes())
+}
+
+fn quote_env_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
@@ -10890,6 +11562,38 @@ mod tests {
         (cookie, answer)
     }
 
+    #[test]
+    fn database_setup_env_writer_preserves_existing_values_and_escapes_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "blessing-skin-setup-env-{}.env",
+            super::setup_csrf_token()
+        ));
+        std::fs::write(
+            &path,
+            "# retained comment\nAPP_URL=\"https://skin.example.test\"\nDB_CONNECTION=mysql\nDB_PASSWORD=old\n",
+        )
+        .unwrap();
+        let password = r#"two words; "quoted" \ #value"#;
+        super::write_setup_env(
+            &path,
+            &[
+                ("DB_CONNECTION", "pgsql".to_owned()),
+                ("DB_PASSWORD", password.to_owned()),
+                ("DB_PREFIX", "bs_".to_owned()),
+            ],
+        )
+        .unwrap();
+        let parsed = dotenvy::from_path_iter(&path)
+            .unwrap()
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .unwrap();
+        assert_eq!(parsed.get("APP_URL").unwrap(), "https://skin.example.test");
+        assert_eq!(parsed.get("DB_CONNECTION").unwrap(), "pgsql");
+        assert_eq!(parsed.get("DB_PASSWORD").unwrap(), password);
+        assert_eq!(parsed.get("DB_PREFIX").unwrap(), "bs_");
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn closet_validation_errors_use_the_requested_field_name() {
         use axum::body::to_bytes;
@@ -11256,8 +11960,8 @@ mod tests {
     #[tokio::test]
     async fn api_user_rejects_requests_without_a_bearer_token() {
         use axum::{
-            body::Body,
-            http::{Request, StatusCode},
+            body::{Body, to_bytes},
+            http::{Request, StatusCode, header::SET_COOKIE},
         };
         use sqlx::sqlite::SqliteConnectOptions;
         use std::{path::PathBuf, sync::Arc};
@@ -11286,8 +11990,13 @@ mod tests {
             app_key: None,
             mail: crate::config::MailConfig::default(),
         };
+        let setup_token = super::setup_csrf_token();
+        let setup_storage = std::env::temp_dir().join(format!("blessing-skin-setup-{setup_token}"));
+        let setup_env = std::env::temp_dir().join(format!("blessing-skin-env-{setup_token}"));
+        let setup_database_file =
+            std::env::temp_dir().join(format!("blessing-skin-db-{setup_token}.sqlite"));
         let app = router(crate::AppState {
-            config: Arc::new(config),
+            config: Arc::new(config.clone()),
             database: None,
             passport_key: None,
             passport_signing_key: None,
@@ -11295,8 +12004,140 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            storage_dir: setup_storage,
+            env_file: setup_env.clone(),
             wasm_plugins: Vec::new(),
         });
+        let login_before_install = app
+            .clone()
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(login_before_install.status(), StatusCode::FOUND);
+        assert_eq!(
+            login_before_install
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/setup"
+        );
+        let welcome_page = app
+            .clone()
+            .oneshot(Request::get("/setup").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(welcome_page.status(), StatusCode::OK);
+        let welcome_html = String::from_utf8(
+            to_bytes(welcome_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(welcome_html.contains("Welcome"));
+        let database_page = app
+            .clone()
+            .oneshot(Request::get("/setup/database").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(database_page.status(), StatusCode::OK);
+        let setup_cookie = database_page
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let second_database_page = app
+            .clone()
+            .oneshot(
+                Request::get("/setup/database")
+                    .header("cookie", &setup_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_setup_cookie = second_database_page
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert_eq!(second_setup_cookie, setup_cookie);
+        let database_form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", setup_cookie.split_once('=').unwrap().1)
+            .append_pair("type", "sqlite")
+            .append_pair("host", "")
+            .append_pair("port", "")
+            .append_pair("username", "")
+            .append_pair("password", "")
+            .append_pair("db", setup_database_file.to_str().unwrap())
+            .append_pair("prefix", "setup_")
+            .finish();
+        let database_saved = app
+            .clone()
+            .oneshot(
+                Request::post("/setup/database")
+                    .header("cookie", &setup_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(database_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(database_saved.status(), StatusCode::OK);
+        let database_saved_html = String::from_utf8(
+            to_bytes(database_saved.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(database_saved_html.contains("connection succeeded"));
+        let saved_settings = dotenvy::from_path_iter(&setup_env)
+            .unwrap()
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .unwrap();
+        assert_eq!(saved_settings.get("DB_CONNECTION").unwrap(), "sqlite");
+        assert_eq!(saved_settings.get("DB_PREFIX").unwrap(), "setup_");
+        assert_eq!(
+            saved_settings.get("DB_DATABASE").unwrap(),
+            setup_database_file.to_str().unwrap()
+        );
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::post("/setup/finish")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("csrf=missing&email=admin%40example.test&nickname=Admin&password=correct%20horse&password_confirmation=correct%20horse&site_name=Test"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+        let info_before_restart = app
+            .clone()
+            .oneshot(Request::get("/setup/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info_before_restart.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            info_before_restart
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/setup/database"
+        );
+        std::fs::remove_file(&setup_env).unwrap();
+        std::fs::remove_file(&setup_database_file).unwrap();
+
         let response = app
             .clone()
             .oneshot(
@@ -11340,6 +12181,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report_response.status(), StatusCode::UNAUTHORIZED);
+
+        let finish_token = super::setup_csrf_token();
+        let finish_database_file =
+            std::env::temp_dir().join(format!("blessing-skin-finish-db-{finish_token}.sqlite"));
+        let finish_storage =
+            std::env::temp_dir().join(format!("blessing-skin-finish-storage-{finish_token}"));
+        let finish_env =
+            std::env::temp_dir().join(format!("blessing-skin-finish-env-{finish_token}"));
+        let mut finish_config = config.clone();
+        finish_config.database = crate::config::DatabaseConfig::from_setup(
+            "sqlite",
+            "",
+            "",
+            "",
+            "",
+            finish_database_file.to_str().unwrap(),
+            "web_",
+        )
+        .unwrap();
+        finish_config.app_key = None;
+        finish_config.passport_public_key = None;
+        finish_config.passport_private_key = None;
+        let finish_database =
+            crate::database::DatabasePool::connect_for_install(&finish_config.database)
+                .await
+                .unwrap();
+        let finish_app = router(crate::AppState {
+            config: Arc::new(finish_config.clone()),
+            database: Some(finish_database.clone()),
+            passport_key: None,
+            passport_signing_key: None,
+            session_key: None,
+            login_failures: Default::default(),
+            captcha_challenges: Default::default(),
+            mail_limits: Default::default(),
+            storage_dir: finish_storage.clone(),
+            env_file: finish_env.clone(),
+            wasm_plugins: Vec::new(),
+        });
+        let finish_page = finish_app
+            .clone()
+            .oneshot(Request::get("/setup/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(finish_page.status(), StatusCode::OK);
+        let finish_cookie = finish_page
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let finish_form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", finish_cookie.split_once('=').unwrap().1)
+            .append_pair("email", "first-admin@example.test")
+            .append_pair("nickname", "First admin")
+            .append_pair("password", "correct horse")
+            .append_pair("password_confirmation", "correct horse")
+            .append_pair("site_name", "Rust Skin")
+            .finish();
+        let installed = finish_app
+            .clone()
+            .oneshot(
+                Request::post("/setup/finish")
+                    .header("cookie", &finish_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(finish_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed.status(), StatusCode::OK);
+        let installed_html = String::from_utf8(
+            to_bytes(installed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(installed_html.contains("Installation complete"));
+        assert!(finish_storage.join("install.lock").exists());
+        let installed_admin = match &finish_database {
+            crate::database::DatabasePool::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, String, i64, bool, String)>(
+                    "SELECT email, nickname, permission, verified, password FROM web_users LIMIT 1",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(installed_admin.0, "first-admin@example.test");
+        assert_eq!(installed_admin.1, "First admin");
+        assert_eq!(installed_admin.2, 2);
+        assert!(installed_admin.3);
+        assert!(crate::auth::verify_legacy_password(
+            "correct horse",
+            &installed_admin.4,
+            "BCRYPT",
+            ""
+        ));
+        assert!(finish_storage.join("oauth-private.key").exists());
+        assert!(finish_storage.join("oauth-public.key").exists());
+        assert!(finish_storage.join("app.key").exists());
+        drop(finish_app);
+        if let crate::database::DatabasePool::Sqlite(pool) = finish_database {
+            pool.close().await;
+        }
+        std::fs::remove_dir_all(&finish_storage).unwrap();
+        std::fs::remove_file(&finish_database_file).unwrap();
+        if finish_env.exists() {
+            std::fs::remove_file(&finish_env).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -11493,6 +12451,12 @@ mod tests {
             },
         };
         let captcha_challenges = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let setup_storage = std::env::temp_dir().join(format!(
+            "blessing-skin-setup-test-{}",
+            super::setup_csrf_token()
+        ));
+        std::fs::create_dir_all(&setup_storage).unwrap();
+        std::fs::write(setup_storage.join("install.lock"), b"").unwrap();
         let app = router(crate::AppState {
             config: Arc::new(config),
             database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
@@ -11502,8 +12466,24 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),
             mail_limits: Default::default(),
+            storage_dir: setup_storage.clone(),
+            env_file: std::path::PathBuf::from(".env"),
             wasm_plugins: Vec::new(),
         });
+        let setup_page = app
+            .clone()
+            .oneshot(Request::get("/setup").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(setup_page.status(), StatusCode::OK);
+        let setup_html = String::from_utf8(
+            to_bytes(setup_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(setup_html.contains("Already installed"));
         let change_password = app
             .clone()
             .oneshot(
@@ -14152,6 +15132,7 @@ mod tests {
                 .unwrap()
                 .contains("Max-Age=0")
         );
+        std::fs::remove_dir_all(&setup_storage).unwrap();
     }
 
     #[test]

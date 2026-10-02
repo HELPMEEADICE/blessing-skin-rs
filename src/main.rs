@@ -12,6 +12,7 @@ mod plugin_runtime;
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -26,6 +27,8 @@ use tracing_subscriber::EnvFilter;
 pub struct AppState {
     pub config: Arc<Config>,
     pub database: Option<DatabasePool>,
+    pub storage_dir: PathBuf,
+    pub env_file: PathBuf,
     pub passport_key: Option<DecodingKey>,
     pub passport_signing_key: Option<EncodingKey>,
     pub session_key: Option<EncodingKey>,
@@ -37,14 +40,30 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = dotenvy::dotenv();
+    let (env_file, env_file_error) = if let Some(env_file) = std::env::var_os("BS_ENV_FILE") {
+        let path = PathBuf::from(env_file);
+        let error = dotenvy::from_path(&path)
+            .err()
+            .map(|error| error.to_string());
+        (path, error)
+    } else {
+        match dotenvy::dotenv() {
+            Ok(path) => (path, None),
+            Err(_) => (PathBuf::from(".env"), None),
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    if let Some(error) = env_file_error {
+        tracing::warn!(%error, "could not load the configured environment file");
+    }
 
     let config = Arc::new(Config::from_env()?);
+    let storage_dir =
+        PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "storage".to_owned()));
     if std::env::args().nth(1).as_deref() == Some("install") {
         installer::run(&config).await?;
         return Ok(());
@@ -85,6 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = http::router(AppState {
         config,
         database,
+        storage_dir,
+        env_file,
         passport_key,
         passport_signing_key,
         session_key,

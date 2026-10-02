@@ -63,11 +63,24 @@ pub async fn run(config: &Config) -> Result<(), InstallError> {
     if storage.join("install.lock").exists() {
         return Err(InstallError::AlreadyInstalled);
     }
-
     let email = required_env("BS_INSTALL_ADMIN_EMAIL")?;
     let nickname = required_env("BS_INSTALL_ADMIN_NICKNAME")?;
     let password = required_env("BS_INSTALL_ADMIN_PASSWORD")?;
     let site_name = required_env("BS_INSTALL_SITE_NAME")?;
+    install_with_details(config, &storage, &email, &nickname, &password, &site_name).await
+}
+
+pub async fn install_with_details(
+    config: &Config,
+    storage: &Path,
+    email: &str,
+    nickname: &str,
+    password: &str,
+    site_name: &str,
+) -> Result<(), InstallError> {
+    if storage.join("install.lock").exists() {
+        return Err(InstallError::AlreadyInstalled);
+    }
     if !email.contains('@') || email.len() > 100 {
         return Err(InstallError::InvalidInput("admin email"));
     }
@@ -79,24 +92,25 @@ pub async fn run(config: &Config) -> Result<(), InstallError> {
             "admin password must contain 8 to 32 bytes",
         ));
     }
-    if site_name.trim().is_empty() {
+    if site_name.trim().is_empty() || site_name.chars().any(char::is_control) {
         return Err(InstallError::InvalidInput("site name"));
     }
     let password_hash =
-        hash_legacy_password(&password, &config.password_method, &config.password_salt)
+        hash_legacy_password(password, &config.password_method, &config.password_salt)
             .ok_or(InstallError::UnsupportedPasswordMethod)?;
     let admin = Admin {
-        email,
-        nickname,
+        email: email.to_owned(),
+        nickname: nickname.to_owned(),
         password_hash,
-        site_name,
+        site_name: site_name.to_owned(),
     };
 
-    fs::create_dir_all(&storage)?;
-    if env::var("DB_CONNECTION").is_ok_and(|driver| driver.eq_ignore_ascii_case("sqlite")) {
-        let filename =
-            env::var("DB_DATABASE").unwrap_or_else(|_| "storage/database.sqlite".to_owned());
-        if let Some(parent) = Path::new(&filename)
+    fs::create_dir_all(storage)?;
+    if matches!(
+        config.database.connection,
+        crate::config::DatabaseConnection::Sqlite(_)
+    ) {
+        if let Some(parent) = Path::new(&config.database.database)
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
         {
@@ -105,7 +119,7 @@ pub async fn run(config: &Config) -> Result<(), InstallError> {
     }
     let pool = DatabasePool::connect_for_install(&config.database).await?;
     ensure_database_empty(&pool, &config.database.table_prefix).await?;
-    let keys = prepare_keys(config, &storage)?;
+    let keys = prepare_keys(config, storage)?;
     let site_url = config.app_url.trim_end_matches('/');
     initialize_schema(&pool, &config.database.table_prefix).await?;
     seed_options(

@@ -73,6 +73,8 @@ pub enum ConfigError {
     UnsupportedDatabase(String),
     #[error("DB_PREFIX may contain only ASCII letters, digits, and underscores")]
     InvalidTablePrefix,
+    #[error("invalid database setup value")]
+    InvalidSetupValue,
 }
 
 impl Config {
@@ -145,6 +147,96 @@ impl MailConfig {
 }
 
 impl DatabaseConfig {
+    pub fn from_setup(
+        driver: &str,
+        host: &str,
+        port: &str,
+        username: &str,
+        password: &str,
+        database: &str,
+        table_prefix: &str,
+    ) -> Result<Self, ConfigError> {
+        if !valid_table_prefix(table_prefix) {
+            return Err(ConfigError::InvalidTablePrefix);
+        }
+        if [driver, host, port, username, password, database]
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
+        {
+            return Err(ConfigError::InvalidSetupValue);
+        }
+        let driver = driver.trim().to_ascii_lowercase();
+        let table_prefix = table_prefix.to_owned();
+        match driver.as_str() {
+            "sqlite" => {
+                if database.trim().is_empty() || database.trim() == ":memory:" {
+                    return Err(ConfigError::InvalidSetupValue);
+                }
+                let options = SqliteConnectOptions::new()
+                    .filename(database)
+                    .create_if_missing(false);
+                Ok(Self {
+                    connection: DatabaseConnection::Sqlite(options),
+                    table_prefix,
+                    driver: "SQLite".to_owned(),
+                    host: None,
+                    port: None,
+                    username: None,
+                    database: database.to_owned(),
+                })
+            }
+            "mysql" | "mariadb" => {
+                if host.trim().is_empty()
+                    || username.trim().is_empty()
+                    || database.trim().is_empty()
+                {
+                    return Err(ConfigError::InvalidSetupValue);
+                }
+                let port = parse_setup_port(port, 3306)?;
+                let options = MySqlConnectOptions::new()
+                    .host(host)
+                    .port(port)
+                    .username(username)
+                    .password(password)
+                    .database(database);
+                Ok(Self {
+                    connection: DatabaseConnection::MySql(options),
+                    table_prefix,
+                    driver: "MySQL/MariaDB".to_owned(),
+                    host: Some(host.to_owned()),
+                    port: Some(port),
+                    username: Some(username.to_owned()),
+                    database: database.to_owned(),
+                })
+            }
+            "pgsql" | "postgres" | "postgresql" => {
+                if host.trim().is_empty()
+                    || username.trim().is_empty()
+                    || database.trim().is_empty()
+                {
+                    return Err(ConfigError::InvalidSetupValue);
+                }
+                let port = parse_setup_port(port, 5432)?;
+                let options = PgConnectOptions::new()
+                    .host(host)
+                    .port(port)
+                    .username(username)
+                    .password(password)
+                    .database(database);
+                Ok(Self {
+                    connection: DatabaseConnection::Postgres(options),
+                    table_prefix,
+                    driver: "PostgreSQL".to_owned(),
+                    host: Some(host.to_owned()),
+                    port: Some(port),
+                    username: Some(username.to_owned()),
+                    database: database.to_owned(),
+                })
+            }
+            _ => Err(ConfigError::UnsupportedDatabase(driver)),
+        }
+    }
+
     fn from_env(table_prefix: String) -> Result<Self, ConfigError> {
         let driver = env::var("DB_CONNECTION").unwrap_or_else(|_| "mysql".to_owned());
         let (connection, display_driver, host, port, username, database) = match driver
@@ -224,6 +316,19 @@ impl DatabaseConfig {
     }
 }
 
+fn parse_setup_port(value: &str, default: u16) -> Result<u16, ConfigError> {
+    if value.trim().is_empty() {
+        return Ok(default);
+    }
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidSetupValue)?;
+    if port == 0 {
+        return Err(ConfigError::InvalidSetupValue);
+    }
+    Ok(port)
+}
+
 fn parse_port(name: &str, default: u16) -> u16 {
     env::var(name)
         .ok()
@@ -239,13 +344,47 @@ fn valid_table_prefix(prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_table_prefix;
+    use super::{DatabaseConfig, DatabaseConnection, valid_table_prefix};
 
     #[test]
     fn accepts_empty_and_simple_prefixes() {
         assert!(valid_table_prefix(""));
         assert!(valid_table_prefix("bs_"));
         assert!(valid_table_prefix("skin2026_"));
+    }
+
+    #[test]
+    fn validates_and_builds_database_settings_from_setup_form() {
+        let sqlite =
+            DatabaseConfig::from_setup("sqlite", "", "", "", "", "storage/setup.sqlite", "bs_")
+                .unwrap();
+        assert_eq!(sqlite.driver, "SQLite");
+        assert_eq!(sqlite.table_prefix, "bs_");
+        assert!(matches!(sqlite.connection, DatabaseConnection::Sqlite(_)));
+
+        let postgres = DatabaseConfig::from_setup(
+            "pgsql",
+            "db.example.test",
+            "5433",
+            "blessing",
+            "secret",
+            "blessing_skin",
+            "",
+        )
+        .unwrap();
+        assert_eq!(postgres.port, Some(5433));
+        assert!(matches!(
+            postgres.connection,
+            DatabaseConnection::Postgres(_)
+        ));
+        assert!(
+            DatabaseConfig::from_setup("mysql", "db", "70000", "user", "", "skin", "").is_err()
+        );
+        assert!(
+            DatabaseConfig::from_setup("mysql", "db", "3306", "user", "", "skin", "x;drop")
+                .is_err()
+        );
+        assert!(DatabaseConfig::from_setup("sqlite", "", "", "", "", ":memory:", "").is_err());
     }
 
     #[test]

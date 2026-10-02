@@ -1889,6 +1889,15 @@ mod integration_tests {
         let private_key = include_bytes!("../tests/fixtures/oauth-test-private.pem");
         let public_key = include_bytes!("../tests/fixtures/oauth-test-public.pem");
         let session_secret = "test web session signing secret";
+        let install_storage = std::env::temp_dir().join(format!(
+            "blessing-skin-oauth-install-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&install_storage).unwrap();
+        std::fs::write(install_storage.join("install.lock"), b"").unwrap();
         let config = Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
@@ -1921,6 +1930,8 @@ mod integration_tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            storage_dir: install_storage.clone(),
+            env_file: std::path::PathBuf::from(".env"),
             wasm_plugins: Vec::new(),
         });
 
@@ -2480,5 +2491,6 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let error: Value = response_json(response).await;
         assert_eq!(error["error"], "invalid_grant");
+        std::fs::remove_dir_all(&install_storage).unwrap();
     }
 }

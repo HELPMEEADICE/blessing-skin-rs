@@ -5,6 +5,7 @@
 ## 准备
 
 先按 [Rust 部署说明](rust-deployment.md) 准备 .env。确认 DB_CONNECTION、数据库凭据、DB_PREFIX、APP_URL 和 STORAGE_PATH 正确。SQLite 首次安装会创建数据库文件及其父目录。
+也可启动服务后访问 `/setup` 使用双语 Web 安装向导。向导会测试数据库连接并保存 DB_* 配置到 `.env`（或 `BS_ENV_FILE` 指定的文件）；保存后需重启服务，再完成管理员信息。由 systemd 或其他进程管理器注入的 DB_* 环境变量优先级更高，应同步更新这些变量。
 
 安装器仅在 users、players、textures 表不存在或为空时继续；这些表中只要已有记录就会拒绝安装。选项表中已有的值会保留，缺失的默认值才会补入。
 
