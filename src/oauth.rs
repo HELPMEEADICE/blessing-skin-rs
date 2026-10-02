@@ -62,6 +62,64 @@ struct PassportAccessTokenClaims {
     sub: String,
 }
 
+pub async fn list_authorized_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match crate::http::authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let records = match database
+        .oauth_authorized_tokens_for_user(&state.config.database.table_prefix, user.uid)
+        .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "failed to list OAuth access tokens");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    let tokens = records
+        .into_iter()
+        .map(|token| {
+            let scopes = token.scopes.as_deref().map(decode_stored_scopes);
+            serde_json::json!({
+                "id": token.id,
+                "user_id": token.user_id,
+                "client_id": token.client_id,
+                "name": token.name,
+                "scopes": scopes,
+                "revoked": token.revoked,
+                "created_at": token.created_at,
+                "updated_at": token.updated_at,
+                "expires_at": token.expires_at,
+                "client": {
+                    "id": token.client_id,
+                    "user_id": token.client_user_id,
+                    "name": token.client_name,
+                    "provider": token.client_provider,
+                    "redirect": token.client_redirect,
+                    "personal_access_client": token.client_personal_access_client,
+                    "password_client": token.client_password_client,
+                    "revoked": token.client_revoked,
+                    "created_at": token.client_created_at,
+                    "updated_at": token.client_updated_at
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(tokens).into_response()
+}
+
 pub async fn revoke_access_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -742,7 +800,7 @@ mod integration_tests {
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO scopes (id,name,description) VALUES (1,'Plugin.Custom','Custom plugin capability')")
             .execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE oauth_clients (id INTEGER PRIMARY KEY, name TEXT NOT NULL, secret TEXT, provider TEXT, redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        sqlx::query("CREATE TABLE oauth_clients (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT NOT NULL, secret TEXT, provider TEXT, redirect TEXT NOT NULL, personal_access_client BOOLEAN NOT NULL, password_client BOOLEAN NOT NULL, revoked BOOLEAN NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
             .execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE oauth_access_tokens (id TEXT PRIMARY KEY, user_id INTEGER, client_id INTEGER NOT NULL, name TEXT, scopes TEXT, revoked BOOLEAN NOT NULL, created_at TEXT, updated_at TEXT, expires_at TEXT)")
             .execute(&pool).await.unwrap();
@@ -757,6 +815,10 @@ mod integration_tests {
         .await
         .unwrap();
         sqlx::query("INSERT INTO oauth_clients (id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (2,'Game client','client-secret',NULL,'http://localhost',FALSE,TRUE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO oauth_clients (id,user_id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (3,7,'Third-party app','never-return-this-secret',NULL,'https://example.test/callback',FALSE,FALSE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO oauth_access_tokens (id,user_id,client_id,name,scopes,revoked,created_at,updated_at,expires_at) VALUES ('authorized-third-party',7,3,'Browser','[\"User.Read\"]',FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
             .execute(&pool).await.unwrap();
 
         let private_key = include_bytes!("../tests/fixtures/oauth-test-private.pem");
@@ -866,6 +928,24 @@ mod integration_tests {
                 .unwrap(),
             true
         );
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/tokens")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value = response_json(listed).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], "authorized-third-party");
+        assert_eq!(listed[0]["scopes"][0], "User.Read");
+        assert_eq!(listed[0]["client"]["name"], "Third-party app");
+        assert!(listed[0]["client"].get("secret").is_none());
 
         let second_access = refreshed["access_token"].as_str().unwrap();
         let second_claims = crate::auth::decode_access_token(

@@ -71,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
         .route("/oauth/token", post(crate::oauth::token))
+        .route("/oauth/tokens", get(crate::oauth::list_authorized_tokens))
         .route(
             "/oauth/tokens/{token_id}",
             delete(crate::oauth::revoke_access_token),

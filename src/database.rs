@@ -418,6 +418,28 @@ pub struct OAuthGrantClientRecord {
 }
 
 #[derive(Debug, FromRow)]
+pub struct OAuthAuthorizedTokenRecord {
+    pub id: String,
+    pub user_id: Option<i64>,
+    pub client_id: i64,
+    pub name: Option<String>,
+    pub scopes: Option<String>,
+    pub revoked: bool,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub client_user_id: Option<i64>,
+    pub client_name: Option<String>,
+    pub client_provider: Option<String>,
+    pub client_redirect: Option<String>,
+    pub client_personal_access_client: Option<bool>,
+    pub client_password_client: Option<bool>,
+    pub client_revoked: Option<bool>,
+    pub client_created_at: Option<String>,
+    pub client_updated_at: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
 pub struct OAuthRefreshRecord {
     pub user_id: Option<i64>,
     pub client_id: i64,
@@ -3457,6 +3479,78 @@ impl DatabasePool {
             )
             .bind(refresh_token_id)
             .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn oauth_authorized_tokens_for_user(
+        &self,
+        prefix: &str,
+        user_id: i64,
+    ) -> Result<Vec<OAuthAuthorizedTokenRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT t.id, CAST(t.user_id AS BIGINT) AS user_id, \
+                 CAST(t.client_id AS BIGINT) AS client_id, t.name, CAST(t.scopes AS TEXT) AS scopes, \
+                 t.revoked, CAST(t.created_at AS TEXT) AS created_at, CAST(t.updated_at AS TEXT) AS updated_at, \
+                 CAST(t.expires_at AS TEXT) AS expires_at, CAST(c.user_id AS BIGINT) AS client_user_id, \
+                 c.name AS client_name, c.provider AS client_provider, c.redirect AS client_redirect, \
+                 c.personal_access_client AS client_personal_access_client, \
+                 c.password_client AS client_password_client, c.revoked AS client_revoked, \
+                 CAST(c.created_at AS TEXT) AS client_created_at, CAST(c.updated_at AS TEXT) AS client_updated_at \
+                 FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
+                 WHERE t.user_id = ? AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 ORDER BY t.created_at DESC"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT t.id, CAST(t.user_id AS SIGNED) AS user_id, \
+                 CAST(t.client_id AS SIGNED) AS client_id, t.name, CAST(t.scopes AS CHAR) AS scopes, \
+                 t.revoked, DATE_FORMAT(t.created_at, '%Y-%m-%d %H:%i:%s') AS created_at, \
+                 DATE_FORMAT(t.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at, \
+                 DATE_FORMAT(t.expires_at, '%Y-%m-%d %H:%i:%s') AS expires_at, \
+                 CAST(c.user_id AS SIGNED) AS client_user_id, c.name AS client_name, c.provider AS client_provider, \
+                 c.redirect AS client_redirect, c.personal_access_client AS client_personal_access_client, \
+                 c.password_client AS client_password_client, c.revoked AS client_revoked, \
+                 DATE_FORMAT(c.created_at, '%Y-%m-%d %H:%i:%s') AS client_created_at, \
+                 DATE_FORMAT(c.updated_at, '%Y-%m-%d %H:%i:%s') AS client_updated_at \
+                 FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
+                 WHERE t.user_id = ? AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 ORDER BY t.created_at DESC"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT t.id, CAST(t.user_id AS BIGINT) AS user_id, \
+                 CAST(t.client_id AS BIGINT) AS client_id, t.name, CAST(t.scopes AS TEXT) AS scopes, \
+                 t.revoked, to_char(t.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, \
+                 to_char(t.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at, \
+                 to_char(t.expires_at, 'YYYY-MM-DD HH24:MI:SS') AS expires_at, \
+                 CAST(c.user_id AS BIGINT) AS client_user_id, c.name AS client_name, c.provider AS client_provider, \
+                 c.redirect AS client_redirect, c.personal_access_client AS client_personal_access_client, \
+                 c.password_client AS client_password_client, c.revoked AS client_revoked, \
+                 to_char(c.created_at, 'YYYY-MM-DD HH24:MI:SS') AS client_created_at, \
+                 to_char(c.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS client_updated_at \
+                 FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
+                 WHERE t.user_id = $1 AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 ORDER BY t.created_at DESC"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizedTokenRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizedTokenRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthAuthorizedTokenRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .fetch_all(pool)
             .await?),
         }
     }
