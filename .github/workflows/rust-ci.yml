@@ -41,3 +41,75 @@ jobs:
         run: cargo test --locked --target ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Smoke test Linux and macOS binary startup
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          database="$RUNNER_TEMP/blessing-skin-smoke.sqlite"
+          log="$RUNNER_TEMP/blessing-skin-smoke.log"
+          : > "$database"
+          BS_LISTEN="127.0.0.1:$port" DB_CONNECTION=sqlite DB_DATABASE="$database" \
+            "target/${{ matrix.target }}/release/blessing-skin-rs" >"$log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          deadline=$((SECONDS + 30))
+          while (( SECONDS < deadline )); do
+            if curl --fail --silent --max-time 2 "http://127.0.0.1:$port/health/ready" >/dev/null; then
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 0.25
+          done
+          cat "$log"
+          echo "Rust service did not become ready within 30 seconds."
+          exit 1
+      - name: Smoke test Windows binary startup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = $listener.LocalEndpoint.Port
+          $listener.Stop()
+          $database = Join-Path $env:RUNNER_TEMP "blessing-skin-smoke.sqlite"
+          [System.IO.File]::WriteAllBytes($database, [byte[]]::new(0))
+          $env:BS_LISTEN = "127.0.0.1:$port"
+          $env:DB_CONNECTION = "sqlite"
+          $env:DB_DATABASE = $database
+          $stdout = Join-Path $env:RUNNER_TEMP "blessing-skin-smoke.out.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "blessing-skin-smoke.err.log"
+          $binary = Join-Path $env:GITHUB_WORKSPACE "target/${{ matrix.target }}/release/blessing-skin-rs.exe"
+          $process = Start-Process -FilePath $binary -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $ready = $false
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($stopwatch.Elapsed.TotalSeconds -lt 30) {
+              if ($process.HasExited) {
+                Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+                throw "Rust service exited with code $($process.ExitCode)."
+              }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health/ready" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) {
+              Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+              throw "Rust service did not become ready within 30 seconds."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              $process.WaitForExit()
+            }
+          }
