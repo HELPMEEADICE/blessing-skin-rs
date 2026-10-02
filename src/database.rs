@@ -71,6 +71,16 @@ pub struct NotificationRecord {
     pub data: String,
     pub created_at: String,
 }
+#[derive(Debug)]
+pub enum PlayerRenameOutcome {
+    NotFound,
+    Forbidden,
+    NameExists,
+    Renamed {
+        previous_name: String,
+        player: PlayerRecord,
+    },
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -331,6 +341,131 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn rename_player(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        player_id: i64,
+        new_name: &str,
+    ) -> Result<PlayerRenameOutcome, sqlx::Error> {
+        let select_sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT name, CAST(uid AS BIGINT) AS uid FROM {prefix}players WHERE pid = $1 LIMIT 1"
+            ),
+            _ => format!(
+                "SELECT name, CAST(uid AS BIGINT) AS uid FROM {prefix}players WHERE pid = ? LIMIT 1"
+            ),
+        };
+        let player_identity = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(player_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(player_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(select_sql))
+                    .bind(player_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        let Some((previous_name, owner_id)) = player_identity else {
+            return Ok(PlayerRenameOutcome::NotFound);
+        };
+        if owner_id != user_id {
+            return Ok(PlayerRenameOutcome::Forbidden);
+        }
+
+        let duplicate_sql = match self {
+            Self::Postgres(_) => {
+                format!("SELECT COUNT(*) FROM {prefix}players WHERE name = $1 AND pid <> $2")
+            }
+            _ => format!("SELECT COUNT(*) FROM {prefix}players WHERE name = ? AND pid <> ?"),
+        };
+        let duplicate_count = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(new_name)
+                    .bind(player_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(new_name)
+                    .bind(player_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(duplicate_sql))
+                    .bind(new_name)
+                    .bind(player_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if duplicate_count > 0 {
+            return Ok(PlayerRenameOutcome::NameExists);
+        }
+
+        let update_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}players SET name = $1, last_modified = CURRENT_TIMESTAMP \
+                 WHERE pid = $2 AND uid = $3"
+            ),
+            _ => format!(
+                "UPDATE {prefix}players SET name = ?, last_modified = CURRENT_TIMESTAMP \
+                 WHERE pid = ? AND uid = ?"
+            ),
+        };
+        let updated_rows = match self {
+            Self::Sqlite(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(new_name)
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::MySql(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(new_name)
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(new_name)
+                .bind(player_id)
+                .bind(user_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+        };
+        if updated_rows == 0 {
+            return Ok(PlayerRenameOutcome::NotFound);
+        }
+        let player = self
+            .players_for_user(prefix, user_id)
+            .await?
+            .into_iter()
+            .find(|player| player.pid == player_id);
+        Ok(match player {
+            Some(player) => PlayerRenameOutcome::Renamed {
+                previous_name,
+                player,
+            },
+            None => PlayerRenameOutcome::NotFound,
+        })
+    }
+
     pub async fn unread_notifications(
         &self,
         prefix: &str,
@@ -654,6 +789,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(player_credential.uid, 7);
+        let renamed = database
+            .rename_player("bs_", 7, 3, "Alex_New")
+            .await
+            .unwrap();
+        match renamed {
+            super::PlayerRenameOutcome::Renamed {
+                previous_name,
+                player,
+            } => {
+                assert_eq!(previous_name, "Alex");
+                assert_eq!(player.name, "Alex_New");
+                assert_eq!(player.uid, 7);
+            }
+            result => panic!("expected a rename, got {result:?}"),
+        }
+        assert!(matches!(
+            database.rename_player("bs_", 7, 3, "Other").await.unwrap(),
+            super::PlayerRenameOutcome::NameExists
+        ));
+        assert!(matches!(
+            database
+                .rename_player("bs_", 8, 3, "NoAccess")
+                .await
+                .unwrap(),
+            super::PlayerRenameOutcome::Forbidden
+        ));
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");

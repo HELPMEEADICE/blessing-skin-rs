@@ -16,18 +16,22 @@ use axum::{
         },
     },
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get, post},
+    routing::{any, get, post, put},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
 use pulldown_cmark::{Options, Parser, html as markdown_html};
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
     auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
-    database::{DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, UserProfile},
+    database::{
+        DatabasePool, NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome,
+        UserProfile,
+    },
 };
 
 pub fn router(state: AppState) -> Router {
@@ -44,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/user/notifications", get(api_user_notifications))
         .route("/api/user/notifications/{id}", post(api_read_notification))
         .route("/api/players", get(api_players))
+        .route("/api/players/{pid}/name", put(api_rename_player))
         .route("/{profile}", get(player_json))
         .route("/csl/{profile}", get(player_json))
         .route("/textures/{hash}", get(texture))
@@ -403,6 +408,8 @@ fn validation_error(field: &str, locale: &str) -> Response {
     let field_error = match (field, chinese) {
         ("identification", true) => "此项为必填项。",
         ("identification", false) => "The identification field is required.",
+        ("name", true) => "角色名格式或长度无效。",
+        ("name", false) => "The player name format or length is invalid.",
         (_, true) => "密码为必填项且长度必须为 6 至 32 个字符。",
         (_, false) => "The password field is required or has an invalid length.",
     };
@@ -575,6 +582,167 @@ fn render_notification_markdown(markdown: &str) -> String {
     let mut html = String::with_capacity(markdown.len().saturating_mul(2));
     markdown_html::push_html(&mut html, parser);
     ammonia::clean(&html)
+}
+
+#[derive(Deserialize)]
+struct RenamePlayerRequest {
+    name: Option<String>,
+}
+
+async fn api_rename_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !identity.has_scope("Player.ReadWrite") {
+        return missing_scope();
+    }
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request: RenamePlayerRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request.name.filter(|name| !name.is_empty()) else {
+        return validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let options = &state.config.database.table_prefix;
+    let min_length = database
+        .option(options, "player_name_length_min")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    let max_length = database
+        .option(options, "player_name_length_max")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16);
+    let name_rule = database
+        .option(options, "player_name_rule")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "official".to_owned());
+    let custom_rule = database
+        .option(options, "custom_player_name_regexp")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !valid_player_name(&name, &name_rule, &custom_rule, min_length, max_length) {
+        return validation_error("name", &state.config.locale);
+    }
+
+    match database
+        .rename_player(options, identity.user_id, player_id, &name)
+        .await
+    {
+        Ok(PlayerRenameOutcome::Renamed {
+            previous_name,
+            player,
+        }) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("角色名已从 {previous_name} 更新为 {name}")
+            } else {
+                format!("Player renamed from {previous_name} to {name}.")
+            };
+            login_result(
+                0,
+                &message,
+                Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
+            )
+        }
+        Ok(PlayerRenameOutcome::NameExists) => login_result(
+            1,
+            if state.config.locale.starts_with("zh") {
+                "该角色名已被使用"
+            } else {
+                "That player name is already in use."
+            },
+            None,
+        ),
+        Ok(PlayerRenameOutcome::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": if state.config.locale.starts_with("zh") {
+                    "无权操作此角色"
+                } else {
+                    "You are not allowed to modify this player."
+                }
+            })),
+        )
+            .into_response(),
+        Ok(PlayerRenameOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to rename player");
+            unavailable()
+        }
+    }
+}
+
+fn valid_player_name(
+    name: &str,
+    rule: &str,
+    custom_rule: &str,
+    min_length: usize,
+    max_length: usize,
+) -> bool {
+    let length = name.chars().count();
+    if length < min_length || length > max_length {
+        return false;
+    }
+    match rule {
+        "official" => name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "cjk" => name.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch == '_'
+                || ch == '§'
+                || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        }),
+        "utf8" => !name.chars().any(char::is_whitespace),
+        "custom" => custom_player_name_matches(name, custom_rule),
+        _ => false,
+    }
+}
+
+fn custom_player_name_matches(name: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    let (pattern, flags) = if let Some(inner) = pattern.strip_prefix('/') {
+        let Some(end) = inner.rfind('/') else {
+            return false;
+        };
+        (&inner[..end], &inner[end + 1..])
+    } else {
+        (pattern, "")
+    };
+    if pattern.len() > 512 {
+        return false;
+    }
+    let mut builder = RegexBuilder::new(pattern);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'))
+        .ignore_whitespace(flags.contains('x'));
+    builder.build().is_ok_and(|regex| regex.is_match(name))
 }
 
 async fn api_players(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1267,5 +1435,17 @@ mod tests {
                 .unwrap()
                 .contains("<strong>skin</strong>")
         );
+    }
+
+    #[test]
+    fn applies_the_legacy_player_name_rules() {
+        use super::valid_player_name;
+
+        assert!(valid_player_name("Alex_2", "official", "", 3, 16));
+        assert!(!valid_player_name("Alex!", "official", "", 3, 16));
+        assert!(valid_player_name("玩家§2", "cjk", "", 3, 16));
+        assert!(!valid_player_name("bad name", "utf8", "", 3, 16));
+        assert!(valid_player_name("ABC", "custom", "/^[a-z]+$/i", 3, 16));
+        assert!(!valid_player_name("ABC1", "custom", "/^[a-z]+$/i", 3, 16));
     }
 }
