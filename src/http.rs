@@ -66,6 +66,14 @@ pub fn router(state: AppState) -> Router {
             put(oauth_client_update).delete(oauth_client_delete),
         )
         .route("/user", get(web_dashboard))
+        .route("/user/player", get(web_player_page).post(web_add_player))
+        .route("/user/player/list", get(web_player_list))
+        .route("/user/player/{pid}/name", put(web_rename_player))
+        .route(
+            "/user/player/{pid}/textures",
+            put(web_set_player_textures).delete(web_clear_player_textures),
+        )
+        .route("/user/player/{pid}", delete(web_delete_player))
         .route("/user/profile", post(user_profile_update))
         .route("/user/profile/avatar", post(user_set_avatar))
         .route("/user/dark-mode", put(toggle_user_dark_mode))
@@ -1019,6 +1027,18 @@ struct DashboardPage {
     locale: String,
 }
 
+#[derive(Template)]
+#[template(path = "players.html")]
+struct PlayerManagementPage {
+    site_name: String,
+    locale: String,
+    user: UserProfile,
+    score_per_player: i64,
+    rule_label: String,
+    min_length: usize,
+    max_length: usize,
+}
+
 #[derive(Deserialize)]
 struct OAuthClientRequest {
     name: Option<String>,
@@ -1400,6 +1420,393 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
         Ok(crate::database::UserSignOutcome::NotEligible) => login_result(1, "", None),
         Err(error) => {
             tracing::error!(%error, user_id = user.uid, "failed to apply sign reward");
+            unavailable()
+        }
+    }
+}
+
+async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if session_user_id(&state, &headers).is_none() {
+        return Redirect::to("/auth/login").into_response();
+    }
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let (min_length, max_length, rule, _) = match player_name_settings(database, prefix).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::error!(%error, "failed to load player-name settings");
+            return unavailable();
+        }
+    };
+    let score_per_player = match database.option(prefix, "score_per_player").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(100),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player score cost");
+            return unavailable();
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let rule_label = match (chinese, rule.as_str()) {
+        (true, "official") => "仅允许官方角色名字符".to_owned(),
+        (true, "cjk") => "允许中文角色名".to_owned(),
+        (true, "utf8") => "允许非空白 UTF-8 字符".to_owned(),
+        (true, "custom") => "使用站点自定义正则规则".to_owned(),
+        (false, "official") => "Official player-name characters only".to_owned(),
+        (false, "cjk") => "CJK player names are allowed".to_owned(),
+        (false, "utf8") => "Any non-whitespace UTF-8 characters".to_owned(),
+        (false, "custom") => "Site-defined regular expression".to_owned(),
+        (true, _) => "站点自定义角色名规则".to_owned(),
+        (false, _) => "Site-defined player-name rule".to_owned(),
+    };
+    let page = PlayerManagementPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        user,
+        score_per_player,
+        rule_label,
+        min_length,
+        max_length,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render player-management page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_player_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .players_for_user(&state.config.database.table_prefix, user.uid)
+        .await
+    {
+        Ok(players) => Json(players).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to load web player's list");
+            unavailable()
+        }
+    }
+}
+
+async fn player_name_settings(
+    database: &DatabasePool,
+    prefix: &str,
+) -> Result<(usize, usize, String, String), sqlx::Error> {
+    let min_length = database
+        .option(prefix, "player_name_length_min")
+        .await?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    let max_length = database
+        .option(prefix, "player_name_length_max")
+        .await?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16);
+    let rule = database
+        .option(prefix, "player_name_rule")
+        .await?
+        .unwrap_or_else(|| "official".to_owned());
+    let custom_rule = database
+        .option(prefix, "custom_player_name_regexp")
+        .await?
+        .unwrap_or_default();
+    Ok((min_length, max_length, rule, custom_rule))
+}
+
+async fn web_add_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request.name.filter(|name| !name.is_empty()) else {
+        return validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let (min_length, max_length, rule, custom_rule) =
+        match player_name_settings(database, prefix).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::error!(%error, "failed to load player-name settings");
+                return unavailable();
+            }
+        };
+    if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
+        return validation_error("name", &state.config.locale);
+    }
+    let score_cost = match database.option(prefix, "score_per_player").await {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player score cost");
+            return unavailable();
+        }
+    };
+    match database
+        .add_player(prefix, user.uid, &name, score_cost)
+        .await
+    {
+        Ok(crate::database::PlayerAddOutcome::Added(player)) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("成功添加了角色 {}", player.name)
+            } else {
+                format!("Player {} was added successfully.", player.name)
+            };
+            login_result(
+                0,
+                &message,
+                Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
+            )
+        }
+        Ok(crate::database::PlayerAddOutcome::NameExists) => {
+            duplicate_player_name_error(&state.config.locale)
+        }
+        Ok(crate::database::PlayerAddOutcome::InsufficientScore) => login_result(
+            7,
+            if state.config.locale.starts_with("zh") {
+                "添加角色失败，积分不足"
+            } else {
+                "You don't have enough score to add a player."
+            },
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to add web player");
+            unavailable()
+        }
+    }
+}
+
+async fn web_rename_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return validation_error("name", &state.config.locale),
+    };
+    let Some(name) = request.name.filter(|name| !name.is_empty()) else {
+        return validation_error("name", &state.config.locale);
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let (min_length, max_length, rule, custom_rule) =
+        match player_name_settings(database, prefix).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::error!(%error, "failed to load player-name settings");
+                return unavailable();
+            }
+        };
+    if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
+        return validation_error("name", &state.config.locale);
+    }
+    match database
+        .rename_player(prefix, user.uid, player_id, &name)
+        .await
+    {
+        Ok(PlayerRenameOutcome::Renamed {
+            previous_name,
+            player,
+        }) => {
+            let message = if state.config.locale.starts_with("zh") {
+                format!("角色名已从 {previous_name} 更新为 {name}")
+            } else {
+                format!("Player renamed from {previous_name} to {name}.")
+            };
+            login_result(
+                0,
+                &message,
+                Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
+            )
+        }
+        Ok(PlayerRenameOutcome::NameExists) => duplicate_player_name_error(&state.config.locale),
+        Ok(PlayerRenameOutcome::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": if state.config.locale.starts_with("zh") {
+                    "无权操作此角色"
+                } else {
+                    "You are not allowed to modify this player."
+                }
+            })),
+        )
+            .into_response(),
+        Ok(PlayerRenameOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, player_id, "failed to rename web player");
+            unavailable()
+        }
+    }
+}
+
+async fn web_set_player_textures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let result = database
+        .set_player_textures(
+            &state.config.database.table_prefix,
+            user.uid,
+            player_id,
+            texture_request_id(request.get("skin")),
+            texture_request_id(request.get("cape")),
+        )
+        .await;
+    player_texture_response(result, &state.config.locale, false)
+}
+
+async fn web_clear_player_textures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let clear_type = |kind: &str| {
+        query.contains_key(kind)
+            || query
+                .get("type")
+                .is_some_and(|types| types.split(',').any(|value| value == kind))
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let result = database
+        .clear_player_textures(
+            &state.config.database.table_prefix,
+            user.uid,
+            player_id,
+            clear_type("skin"),
+            clear_type("cape"),
+        )
+        .await;
+    player_texture_response(result, &state.config.locale, true)
+}
+
+async fn web_delete_player(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(raw_id): RoutePath<String>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(player_id) = raw_id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let return_score = match database.option(prefix, "return_score").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load player score refund option");
+            return unavailable();
+        }
+    };
+    let score_reward = if return_score {
+        match database.option(prefix, "score_per_player").await {
+            Ok(value) => value
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to load player score reward");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    match database
+        .delete_player(prefix, user.uid, player_id, return_score, score_reward)
+        .await
+    {
+        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => login_result(
+            0,
+            &if state.config.locale.starts_with("zh") {
+                format!("角色 {name} 已被删除")
+            } else {
+                format!("Player {name} was deleted successfully.")
+            },
+            None,
+        ),
+        Ok(crate::database::PlayerDeleteOutcome::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": if state.config.locale.starts_with("zh") {
+                    "无权操作此角色"
+                } else {
+                    "You are not allowed to modify this player."
+                }
+            })),
+        )
+            .into_response(),
+        Ok(crate::database::PlayerDeleteOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, player_id, "failed to delete web player");
             unavailable()
         }
     }
@@ -6777,6 +7184,33 @@ mod tests {
             .unwrap()
     }
 
+    async fn session_request(
+        app: &axum::Router,
+        cookie: &str,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", cookie)
+            .header("accept", "application/json");
+        let body = if let Some(body) = body {
+            builder = builder.header("content-type", "application/json");
+            Body::from(body.to_owned())
+        } else {
+            Body::empty()
+        };
+        app.clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
     async fn issue_test_captcha(
         app: &axum::Router,
         challenges: &std::sync::Arc<
@@ -7451,13 +7885,177 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user")
-                    .header("cookie", registered_cookie)
+                    .header("cookie", registered_cookie.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(registered_dashboard.status(), StatusCode::OK);
+
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('require_verification','true'), ('score_per_player','10'), ('return_score','true')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unverified_player_page =
+            session_request(&app, &registered_cookie, "GET", "/user/player", None).await;
+        assert_eq!(unverified_player_page.status(), StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE users SET verified = 1 WHERE uid = ?")
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let player_page =
+            session_request(&app, &registered_cookie, "GET", "/user/player", None).await;
+        assert_eq!(player_page.status(), StatusCode::OK);
+        let player_page = to_bytes(player_page.into_body(), usize::MAX).await.unwrap();
+        let player_page = String::from_utf8(player_page.to_vec()).unwrap();
+        assert!(player_page.contains("Add player"));
+        assert!(player_page.contains("/user/player/list"));
+
+        let player_list =
+            session_request(&app, &registered_cookie, "GET", "/user/player/list", None).await;
+        assert_eq!(player_list.status(), StatusCode::OK);
+        let player_list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(player_list.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            player_list
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|player| { player["name"] == "NewGuy" && player["uid"] == registered_user.0 })
+        );
+
+        let forbidden_player = session_request(
+            &app,
+            &registered_cookie,
+            "PUT",
+            "/user/player/3/name",
+            Some(r#"{"name":"NotMine"}"#),
+        )
+        .await;
+        assert_eq!(forbidden_player.status(), StatusCode::FORBIDDEN);
+
+        let added_player = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/player",
+            Some(r#"{"name":"WebPlayer"}"#),
+        )
+        .await;
+        assert_eq!(added_player.status(), StatusCode::OK);
+        let added_player: serde_json::Value = serde_json::from_slice(
+            &to_bytes(added_player.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(added_player["code"], 0);
+        let added_pid = added_player["data"]["pid"].as_i64().unwrap();
+
+        let duplicate_player = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/player",
+            Some(r#"{"name":"Alex"}"#),
+        )
+        .await;
+        assert_eq!(duplicate_player.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let renamed_player = session_request(
+            &app,
+            &registered_cookie,
+            "PUT",
+            &format!("/user/player/{added_pid}/name"),
+            Some(r#"{"name":"WebRenamed"}"#),
+        )
+        .await;
+        let renamed_player: serde_json::Value = serde_json::from_slice(
+            &to_bytes(renamed_player.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renamed_player["code"], 0);
+        assert_eq!(renamed_player["data"]["name"], "WebRenamed");
+
+        sqlx::query(
+            "INSERT INTO user_closet (user_uid,texture_tid,item_name) VALUES (?,2,'Reported skin')",
+        )
+        .bind(registered_user.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let applied_texture = session_request(
+            &app,
+            &registered_cookie,
+            "PUT",
+            &format!("/user/player/{added_pid}/textures"),
+            Some(r#"{"skin":2}"#),
+        )
+        .await;
+        let applied_texture: serde_json::Value = serde_json::from_slice(
+            &to_bytes(applied_texture.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied_texture["code"], 0);
+        assert_eq!(applied_texture["data"]["tid_skin"], 2);
+
+        let cleared_texture = session_request(
+            &app,
+            &registered_cookie,
+            "DELETE",
+            &format!("/user/player/{added_pid}/textures?skin=true&cape=true"),
+            None,
+        )
+        .await;
+        let cleared_texture: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cleared_texture.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleared_texture["code"], 0);
+        assert_eq!(cleared_texture["data"]["tid_skin"], 0);
+        assert_eq!(cleared_texture["data"]["tid_cape"], 0);
+
+        let deleted_player = session_request(
+            &app,
+            &registered_cookie,
+            "DELETE",
+            &format!("/user/player/{added_pid}"),
+            None,
+        )
+        .await;
+        let deleted_player: serde_json::Value = serde_json::from_slice(
+            &to_bytes(deleted_player.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleted_player["code"], 0);
+        let refunded_score: i64 = sqlx::query_scalar("SELECT score FROM users WHERE uid = ?")
+            .bind(registered_user.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(refunded_score, 73);
+        sqlx::query(
+            "UPDATE options SET option_value = '100' WHERE option_name = 'score_per_player'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE options SET option_value = 'false' WHERE option_name IN ('require_verification','return_score')")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let (second_captcha_cookie, second_captcha_answer) =
             issue_test_captcha(&app, &captcha_challenges).await;

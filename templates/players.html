@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}角色管理{% else %}Players{% endif %} - {{ site_name }}</title>
+  <style>
+    body { background:#f4f6f9; color:#343a40; font:16px system-ui,sans-serif; margin:0; }
+    main { background:white; border-radius:8px; box-shadow:0 8px 28px #0002; box-sizing:border-box; margin:3rem auto; max-width:900px; padding:2rem; width:calc(100% - 2rem); }
+    header { align-items:center; display:flex; justify-content:space-between; gap:1rem; }
+    h1 { font-size:1.5rem; } a { color:#0563c1; }
+    form { display:flex; gap:.6rem; margin:1.5rem 0; } input { border:1px solid #c9ced6; border-radius:4px; box-sizing:border-box; flex:1; font:inherit; min-width:0; padding:.65rem; }
+    button { border:0; border-radius:4px; cursor:pointer; font:inherit; padding:.55rem .8rem; } button.primary { background:#007bff; color:white; }
+    #message { min-height:1.5rem; } li { align-items:center; border-bottom:1px solid #e5e7eb; display:flex; flex-wrap:wrap; gap:.6rem; justify-content:space-between; padding:.8rem 0; }
+    .actions { display:flex; flex-wrap:wrap; gap:.4rem; } .muted { color:#667085; font-size:.92rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>{{ site_name }} · {% if locale.starts_with("zh") %}角色管理{% else %}Players{% endif %}</h1>
+        <div class="muted">{{ user.nickname }} · {% if locale.starts_with("zh") %}当前积分{% else %}Current score{% endif %}: {{ user.score }}</div>
+      </div>
+      <nav><a href="/user">{% if locale.starts_with("zh") %}控制台{% else %}Dashboard{% endif %}</a> · <button id="logout" type="button">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></nav>
+    </header>
+    <p class="muted">{{ rule_label }} · {% if locale.starts_with("zh") %}长度{% else %}Length{% endif %}: {{ min_length }}–{{ max_length }} · {% if locale.starts_with("zh") %}添加角色消耗{% else %}Cost per player{% endif %}: {{ score_per_player }}</p>
+    <form id="add-player">
+      <input id="new-player-name" name="name" type="text" minlength="{{ min_length }}" maxlength="{{ max_length }}" placeholder="{% if locale.starts_with("zh") %}新角色名{% else %}New player name{% endif %}" required>
+      <button class="primary" type="submit">{% if locale.starts_with("zh") %}添加角色{% else %}Add player{% endif %}</button>
+    </form>
+    <div id="message" role="status"></div>
+    <ul id="players" aria-live="polite"></ul>
+  </main>
+  <script>
+    const list = document.getElementById('players');
+    const message = document.getElementById('message');
+    const chinese = document.documentElement.lang.startsWith('zh');
+    async function request(url, method = 'GET', data) {
+      const options = { method, headers: { 'Accept': 'application/json' } };
+      if (data !== undefined) {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(data);
+      }
+      const response = await fetch(url, options);
+      const result = await response.json();
+      if (!response.ok) {
+        const fieldErrors = result.errors && Object.values(result.errors).flat();
+        throw new Error((fieldErrors && fieldErrors[0]) || result.message || 'Request failed.');
+      }
+      return result;
+    }
+    function show(text, failed = false) {
+      message.textContent = text;
+      message.style.color = failed ? '#b42318' : '#16703c';
+    }
+    function addButton(row, label, action, kind) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.dataset.action = action;
+      if (kind) button.style.background = kind;
+      row.append(button);
+    }
+    function draw(players) {
+      list.replaceChildren();
+      for (const player of players) {
+        const row = document.createElement('li');
+        const label = document.createElement('span');
+        label.textContent = `${player.name} (PID ${player.pid})`;
+        row.append(label);
+        const actions = document.createElement('span');
+        actions.className = 'actions';
+        addButton(actions, chinese ? '改名' : 'Rename', 'rename');
+        addButton(actions, chinese ? '重置材质' : 'Clear textures', 'clear');
+        addButton(actions, chinese ? '删除' : 'Delete', 'delete', '#dc3545');
+        actions.dataset.pid = player.pid;
+        row.append(actions);
+        list.append(row);
+      }
+      if (players.length === 0) {
+        const row = document.createElement('li');
+        row.textContent = chinese ? '还没有角色' : 'No players yet.';
+        list.append(row);
+      }
+    }
+    async function load() {
+      try { draw(await request('/user/player/list')); }
+      catch (error) { show(error.message, true); }
+    }
+    document.getElementById('add-player').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        const result = await request('/user/player', 'POST', { name: document.getElementById('new-player-name').value });
+        show(result.message);
+        document.getElementById('new-player-name').value = '';
+        await load();
+      } catch (error) { show(error.message, true); }
+    });
+    list.addEventListener('click', async (event) => {
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+      const pid = button.parentElement.dataset.pid;
+      try {
+        if (button.dataset.action === 'rename') {
+          const name = window.prompt(chinese ? '输入新的角色名' : 'Enter a new player name');
+          if (!name) return;
+          const result = await request(`/user/player/${pid}/name`, 'PUT', { name });
+          show(result.message);
+        } else if (button.dataset.action === 'clear') {
+          if (!window.confirm(chinese ? '重置此角色的皮肤和披风？' : 'Clear this player’s skin and cape?')) return;
+          const result = await request(`/user/player/${pid}/textures?skin=true&cape=true`, 'DELETE');
+          show(result.message);
+        } else {
+          if (!window.confirm(chinese ? '删除此角色？' : 'Delete this player?')) return;
+          const result = await request(`/user/player/${pid}`, 'DELETE');
+          show(result.message);
+        }
+        await load();
+      } catch (error) { show(error.message, true); }
+    });
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/auth/logout', { method: 'POST', headers: { 'Accept': 'application/json' } });
+      window.location.href = '/auth/login';
+    });
+    load();
+  </script>
+</body>
+</html>
