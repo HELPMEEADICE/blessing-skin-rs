@@ -3275,6 +3275,148 @@ impl DatabasePool {
         Ok(())
     }
 
+    pub async fn credentials_by_user_id(
+        &self,
+        prefix: &str,
+        uid: i64,
+    ) -> Result<Option<PasswordCredential>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, password, permission FROM {prefix}users WHERE uid = $1 LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(uid AS SIGNED) AS uid, password, permission FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, password, permission FROM {prefix}users WHERE uid = ? LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
+    pub async fn update_user_email_and_reset_verification(
+        &self,
+        prefix: &str,
+        uid: i64,
+        email: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("UPDATE {prefix}users SET email = $1, verified = FALSE WHERE uid = $2")
+            }
+            _ => format!("UPDATE {prefix}users SET email = ?, verified = FALSE WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(email)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_user_verified(
+        &self,
+        prefix: &str,
+        uid: i64,
+        verified: bool,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("UPDATE {prefix}users SET verified = $1 WHERE uid = $2"),
+            _ => format!("UPDATE {prefix}users SET verified = ? WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(verified)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(verified)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(verified)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn toggle_user_dark_mode(&self, prefix: &str, uid: i64) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => {
+                format!("UPDATE {prefix}users SET is_dark_mode = NOT is_dark_mode WHERE uid = $1")
+            }
+            _ => format!("UPDATE {prefix}users SET is_dark_mode = NOT is_dark_mode WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update_user_integer(
         &self,
         prefix: &str,

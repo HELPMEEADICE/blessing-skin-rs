@@ -33,7 +33,7 @@ use crate::{
     AppState,
     auth::{
         audience_matches, bearer_token, decode_access_token, decode_web_session,
-        hash_legacy_password,
+        hash_legacy_password, verify_legacy_password,
     },
     database::{
         AdminUserRecord, ClosetTextureRecord, DatabasePool, NotificationRecord, PlayerProfile,
@@ -60,6 +60,9 @@ pub fn router(state: AppState) -> Router {
             put(oauth_client_update).delete(oauth_client_delete),
         )
         .route("/user", get(web_dashboard))
+        .route("/user/profile", post(user_profile_update))
+        .route("/user/profile/avatar", post(user_set_avatar))
+        .route("/user/dark-mode", put(toggle_user_dark_mode))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -656,6 +659,418 @@ async fn site_name(state: &AppState) -> String {
             .unwrap_or_else(|| "Blessing Skin".to_owned()),
         None => "Blessing Skin".to_owned(),
     }
+}
+
+async fn user_profile_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return login_result(1, illegal_parameters_message(&state.config.locale), None),
+    };
+    let Some(action) = request.get("action").and_then(serde_json::Value::as_str) else {
+        return login_result(1, illegal_parameters_message(&state.config.locale), None);
+    };
+    let prefix = &state.config.database.table_prefix;
+    let chinese = state.config.locale.starts_with("zh");
+    match action {
+        "nickname" => {
+            let Some(nickname) = request
+                .get("new_nickname")
+                .and_then(serde_json::Value::as_str)
+                .filter(|nickname| !nickname.is_empty())
+            else {
+                return profile_validation_error("new_nickname", "required", &state.config.locale);
+            };
+            if let Err(error) = database
+                .update_user_text(prefix, user.uid, "nickname", nickname)
+                .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to update user nickname");
+                return unavailable();
+            }
+            let message = if chinese {
+                format!("昵称已成功设置为 {nickname}")
+            } else {
+                format!("Nickname is successfully updated to {nickname}")
+            };
+            login_result(0, &message, None)
+        }
+        "password" => {
+            let Some(current_password) = request
+                .get("current_password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| (6..=32).contains(&password.chars().count()))
+            else {
+                return profile_validation_error(
+                    "current_password",
+                    "password",
+                    &state.config.locale,
+                );
+            };
+            let Some(new_password) = request
+                .get("new_password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| (8..=32).contains(&password.chars().count()))
+            else {
+                return profile_validation_error(
+                    "new_password",
+                    "new_password",
+                    &state.config.locale,
+                );
+            };
+            let credential = match database.credentials_by_user_id(prefix, user.uid).await {
+                Ok(Some(credential)) => credential,
+                Ok(None) => return unauthenticated(),
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to load user password for profile update");
+                    return unavailable();
+                }
+            };
+            if !verify_legacy_password(
+                current_password,
+                &credential.password,
+                &state.config.password_method,
+                &state.config.password_salt,
+            ) {
+                return login_result(
+                    1,
+                    if chinese {
+                        "原密码错误"
+                    } else {
+                        "Wrong original password."
+                    },
+                    None,
+                );
+            }
+            let Some(hash) = hash_legacy_password(
+                new_password,
+                &state.config.password_method,
+                &state.config.password_salt,
+            ) else {
+                tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
+                return unavailable();
+            };
+            if let Err(error) = database
+                .update_user_text(prefix, user.uid, "password", &hash)
+                .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to update user password");
+                return unavailable();
+            }
+            let response = login_result(
+                0,
+                if chinese {
+                    "密码修改成功，请重新登录"
+                } else {
+                    "Password updated successfully, please log in again."
+                },
+                None,
+            );
+            expire_web_session(&state, response)
+        }
+        "email" => {
+            let Some(email) = request
+                .get("email")
+                .and_then(serde_json::Value::as_str)
+                .filter(|email| valid_email_address(email) && email.len() <= 100)
+            else {
+                return profile_validation_error("email", "email", &state.config.locale);
+            };
+            let Some(password) = request
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| (6..=32).contains(&password.chars().count()))
+            else {
+                return profile_validation_error("password", "password", &state.config.locale);
+            };
+            let credential = match database.credentials_by_user_id(prefix, user.uid).await {
+                Ok(Some(credential)) => credential,
+                Ok(None) => return unauthenticated(),
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to load user password for email update");
+                    return unavailable();
+                }
+            };
+            if !verify_legacy_password(
+                password,
+                &credential.password,
+                &state.config.password_method,
+                &state.config.password_salt,
+            ) {
+                return login_result(
+                    1,
+                    if chinese {
+                        "密码错误"
+                    } else {
+                        "Wrong password."
+                    },
+                    None,
+                );
+            }
+            match database.user_email_exists(prefix, email, user.uid).await {
+                Ok(true) => {
+                    return login_result(
+                        1,
+                        if chinese {
+                            "此邮箱已被占用"
+                        } else {
+                            "This email address is occupied."
+                        },
+                        None,
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to check email uniqueness");
+                    return unavailable();
+                }
+            }
+            if let Err(error) = database
+                .update_user_email_and_reset_verification(prefix, user.uid, email)
+                .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to update user email");
+                return unavailable();
+            }
+            let response = login_result(
+                0,
+                if chinese {
+                    "邮箱修改成功，请重新登录"
+                } else {
+                    "Email address updated successfully, please log in again."
+                },
+                None,
+            );
+            expire_web_session(&state, response)
+        }
+        "delete" => {
+            let Some(password) = request
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| (6..=32).contains(&password.chars().count()))
+            else {
+                return profile_validation_error("password", "password", &state.config.locale);
+            };
+            if user.permission >= 1 {
+                return login_result(
+                    1,
+                    if chinese {
+                        "拥有管理员权限的账号不能被删除"
+                    } else {
+                        "Admin account can not be deleted."
+                    },
+                    None,
+                );
+            }
+            let credential = match database.credentials_by_user_id(prefix, user.uid).await {
+                Ok(Some(credential)) => credential,
+                Ok(None) => return unauthenticated(),
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to load user password for account deletion");
+                    return unavailable();
+                }
+            };
+            if !verify_legacy_password(
+                password,
+                &credential.password,
+                &state.config.password_method,
+                &state.config.password_salt,
+            ) {
+                return login_result(
+                    1,
+                    if chinese {
+                        "密码错误"
+                    } else {
+                        "Wrong password."
+                    },
+                    None,
+                );
+            }
+            match database.delete_user(prefix, user.uid).await {
+                Ok(true) => {
+                    let response = login_result(
+                        0,
+                        if chinese {
+                            "账号已被成功删除"
+                        } else {
+                            "Your account is deleted successfully."
+                        },
+                        None,
+                    );
+                    expire_web_session(&state, response)
+                }
+                Ok(false) => unauthenticated(),
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to delete user account");
+                    unavailable()
+                }
+            }
+        }
+        _ => login_result(1, illegal_parameters_message(&state.config.locale), None),
+    }
+}
+
+async fn user_set_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let Some(tid) = request
+        .as_ref()
+        .and_then(|value| value.get("tid"))
+        .and_then(|value| request_i64(Some(value)))
+    else {
+        return profile_validation_error("tid", "integer", &state.config.locale);
+    };
+    if tid != 0 {
+        let texture = match database
+            .texture_info(&state.config.database.table_prefix, tid)
+            .await
+        {
+            Ok(Some(texture)) => texture,
+            Ok(None) => {
+                return login_result(
+                    1,
+                    if state.config.locale.starts_with("zh") {
+                        "材质不存在"
+                    } else {
+                        "No such texture."
+                    },
+                    None,
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, tid, "failed to load requested user avatar texture");
+                return unavailable();
+            }
+        };
+        if texture.texture_type == "cape" {
+            return login_result(
+                1,
+                if state.config.locale.starts_with("zh") {
+                    "披风不能被设置为头像"
+                } else {
+                    "You can't set a cape as avatar."
+                },
+                None,
+            );
+        }
+        if !texture.is_public && texture.uploader != user.uid && user.permission < 1 {
+            return login_result(
+                1,
+                if state.config.locale.starts_with("zh") {
+                    "请求的材质已经设为私密，仅上传者和管理员可查看"
+                } else {
+                    "The requested texture is private and only visible to the uploader and admins."
+                },
+                None,
+            );
+        }
+    }
+    if let Err(error) = database
+        .update_user_integer(&state.config.database.table_prefix, user.uid, "avatar", tid)
+        .await
+    {
+        tracing::error!(%error, user_id = user.uid, tid, "failed to update user avatar");
+        return unavailable();
+    }
+    login_result(
+        0,
+        if state.config.locale.starts_with("zh") {
+            "设置成功"
+        } else {
+            "New avatar was set successfully."
+        },
+        None,
+    )
+}
+
+async fn toggle_user_dark_mode(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    if let Err(error) = database
+        .toggle_user_dark_mode(&state.config.database.table_prefix, user.uid)
+        .await
+    {
+        tracing::error!(%error, user_id = user.uid, "failed to toggle user dark mode");
+        return unavailable();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn profile_validation_error(field: &str, rule: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let error = match (field, rule, chinese) {
+        ("new_nickname", _, true) => "昵称为必填项。",
+        ("new_nickname", _, false) => "The new_nickname field is required.",
+        ("email", _, true) => "邮箱必须是有效的电子邮件地址。",
+        ("email", _, false) => "The email must be a valid email address.",
+        ("current_password", _, true) => "当前密码为必填项且长度必须为 6 至 32 个字符。",
+        ("current_password", _, false) => {
+            "The current_password field is required and must be between 6 and 32 characters."
+        }
+        ("new_password", _, true) => "新密码长度必须为 8 至 32 个字符。",
+        ("new_password", _, false) => "The new_password must be between 8 and 32 characters.",
+        ("tid", _, true) => "tid 必须是整数。",
+        ("tid", _, false) => "The tid must be an integer.",
+        (_, _, true) => "密码为必填项且长度必须为 6 至 32 个字符。",
+        (_, _, false) => "The password field is required and must be between 6 and 32 characters.",
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": { field: [error] } })),
+    )
+        .into_response()
+}
+
+fn illegal_parameters_message(locale: &str) -> &'static str {
+    if locale.starts_with("zh") {
+        "非法参数"
+    } else {
+        "Illegal parameters."
+    }
+}
+
+fn expire_web_session(state: &AppState, mut response: Response) -> Response {
+    let secure = if state.config.app_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie =
+        format!("blessing_skin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}");
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
 }
 
 async fn logout(State(state): State<AppState>) -> Response {
@@ -6173,6 +6588,241 @@ mod tests {
         let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
         assert!(dashboard_html.contains("alex@example.test"));
         assert!(dashboard_html.contains("Alex"));
+
+        for nickname in ["Changed nickname", "Alex User"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/user/profile")
+                        .header("cookie", cookie.clone())
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"action":"nickname","new_nickname":"{nickname}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["code"], 0);
+        }
+
+        let changed_password = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"password","current_password":"correct horse","new_password":"new secure password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            changed_password
+                .headers()
+                .get(SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let changed_password: serde_json::Value = serde_json::from_slice(
+            &to_bytes(changed_password.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changed_password["code"], 0);
+        let restored_password = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"password","current_password":"new secure password","new_password":"correct horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let restored_password: serde_json::Value = serde_json::from_slice(
+            &to_bytes(restored_password.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_password["code"], 0);
+        let stored_password: String =
+            sqlx::query_scalar("SELECT password FROM users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(crate::auth::verify_legacy_password(
+            "correct horse",
+            &stored_password,
+            "BCRYPT",
+            ""
+        ));
+
+        let changed_email = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"email","email":"changed@example.test","password":"correct horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            changed_email
+                .headers()
+                .get(SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let changed_email: serde_json::Value = serde_json::from_slice(
+            &to_bytes(changed_email.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changed_email["code"], 0);
+        let changed_email_state: (String, bool) =
+            sqlx::query_as("SELECT email,verified FROM users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            changed_email_state,
+            ("changed@example.test".to_owned(), false)
+        );
+        let restored_email = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"email","email":"alex@example.test","password":"correct horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let restored_email: serde_json::Value = serde_json::from_slice(
+            &to_bytes(restored_email.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_email["code"], 0);
+        sqlx::query("UPDATE users SET verified = 1 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let set_avatar = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile/avatar")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tid":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let set_avatar: serde_json::Value =
+            serde_json::from_slice(&to_bytes(set_avatar.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(set_avatar["code"], 0);
+        let avatar: i64 = sqlx::query_scalar("SELECT avatar FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(avatar, 2);
+        let reset_avatar = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile/avatar")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tid":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset_avatar.status(), StatusCode::OK);
+
+        for expected_dark_mode in [true, false] {
+            let dark_mode = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/user/dark-mode")
+                        .header("cookie", cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(dark_mode.status(), StatusCode::NO_CONTENT);
+            let is_dark_mode: bool =
+                sqlx::query_scalar("SELECT is_dark_mode FROM users WHERE uid = 7")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(is_dark_mode, expected_dark_mode);
+        }
+        let refused_admin_deletion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header("cookie", cookie.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"delete","password":"correct horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let refused_admin_deletion: serde_json::Value = serde_json::from_slice(
+            &to_bytes(refused_admin_deletion.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refused_admin_deletion["code"], 1);
 
         let clients_before = app
             .clone()
