@@ -48,7 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/skinlib/list", get(skinlib_list))
         .route("/skinlib/report", post(submit_skinlib_report))
         .route("/skinlib/info/{tid}", get(skinlib_info))
-        .route("/texture/{tid}", get(skinlib_info))
+        .route("/texture/{tid}", get(skinlib_info).delete(delete_texture))
         .route("/texture/{tid}/name", put(rename_texture))
         .route("/texture/{tid}/type", put(update_texture_type))
         .route("/texture/{tid}/privacy", put(toggle_texture_privacy))
@@ -1952,6 +1952,170 @@ async fn rename_texture(
     login_result(0, &message, None)
 }
 
+fn texture_delete_score_refund(
+    texture: &TextureInfoRecord,
+    return_score: bool,
+    public_cost_per_kb: i64,
+    private_cost_per_kb: i64,
+    public_award: i64,
+    take_back_public_award: bool,
+) -> i64 {
+    let mut refund = if return_score {
+        texture.size.saturating_mul(if texture.is_public {
+            public_cost_per_kb
+        } else {
+            private_cost_per_kb
+        })
+    } else {
+        0
+    };
+    if texture.is_public && take_back_public_award {
+        refund = refund.saturating_sub(public_award);
+    }
+    refund
+}
+
+async fn delete_texture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(tid_path): RoutePath<String>,
+) -> Response {
+    let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let return_score = match database
+        .option(&state.config.database.table_prefix, "return_score")
+        .await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture deletion score option");
+            return unavailable();
+        }
+    };
+    let public_cost_per_kb = match database
+        .option(&state.config.database.table_prefix, "score_per_storage")
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read public texture storage score");
+            return unavailable();
+        }
+    };
+    let private_cost_per_kb = match database
+        .option(
+            &state.config.database.table_prefix,
+            "private_score_per_storage",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(10),
+        Err(error) => {
+            tracing::error!(%error, "failed to read private texture storage score");
+            return unavailable();
+        }
+    };
+    let public_award = match database
+        .option(
+            &state.config.database.table_prefix,
+            "score_award_per_texture",
+        )
+        .await
+    {
+        Ok(value) => value
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score award");
+            return unavailable();
+        }
+    };
+    let take_back_award = match database
+        .option(
+            &state.config.database.table_prefix,
+            "take_back_scores_after_deletion",
+        )
+        .await
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read texture score return option");
+            return unavailable();
+        }
+    };
+    let closet_score_refund = if return_score {
+        match database
+            .option(&state.config.database.table_prefix, "score_per_closet_item")
+            .await
+        {
+            Ok(value) => value
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
+            Err(error) => {
+                tracing::error!(%error, "failed to read closet item score");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
+    let uploader_score_refund = texture_delete_score_refund(
+        &texture,
+        return_score,
+        public_cost_per_kb,
+        private_cost_per_kb,
+        public_award,
+        take_back_award,
+    );
+    let remove_texture_file = match database
+        .delete_texture(
+            &state.config.database.table_prefix,
+            &texture,
+            uploader_score_refund,
+            closet_score_refund,
+        )
+        .await
+    {
+        Ok(remove_texture_file) => remove_texture_file,
+        Err(error) => {
+            tracing::error!(%error, tid, "failed to delete legacy texture row");
+            return unavailable();
+        }
+    };
+    if remove_texture_file && valid_texture_hash(&texture.hash) {
+        let path = state.config.textures_dir.join(&texture.hash);
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, hash = texture.hash, "failed to remove texture file");
+            }
+        }
+    }
+    login_result(
+        0,
+        if state.config.locale.starts_with("zh") {
+            "材质已被成功删除"
+        } else {
+            "The texture was deleted successfully."
+        },
+        None,
+    )
+}
+
 fn texture_privacy_score_diff(
     texture: &TextureInfoRecord,
     public_cost_per_kb: i64,
@@ -2852,6 +3016,33 @@ mod tests {
         assert!(value["errors"]["reason"][0].as_str().is_some());
         assert!(value["errors"]["field"].is_null());
     }
+    #[test]
+    fn calculates_legacy_texture_deletion_score_refunds() {
+        let texture = crate::database::TextureInfoRecord {
+            tid: 1,
+            name: "Public".to_owned(),
+            texture_type: "alex".to_owned(),
+            hash: "hash".to_owned(),
+            size: 4,
+            uploader: 7,
+            is_public: true,
+            upload_at: String::new(),
+            likes: 0,
+        };
+        assert_eq!(
+            super::texture_delete_score_refund(&texture, true, 0, 10, 3, true),
+            -3
+        );
+        assert_eq!(
+            super::texture_delete_score_refund(&texture, true, 0, 10, 3, false),
+            0
+        );
+        assert_eq!(
+            super::texture_delete_score_refund(&texture, false, 0, 10, 3, true),
+            -3
+        );
+    }
+
     #[test]
     fn calculates_legacy_texture_privacy_score_changes() {
         let public_texture = crate::database::TextureInfoRecord {

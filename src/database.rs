@@ -554,6 +554,209 @@ impl DatabasePool {
         }
         Ok(TexturePrivacyOutcome::Updated { is_public })
     }
+    pub async fn delete_texture(
+        &self,
+        prefix: &str,
+        texture: &TextureInfoRecord,
+        uploader_score_refund: i64,
+        closet_score_refund: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let delete_shared_file = match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = ?");
+                let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(&texture.hash)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                let likers_sql = format!(
+                    "SELECT CAST(user_uid AS BIGINT) FROM {prefix}user_closet \
+                     WHERE texture_tid = ? AND user_uid <> ? ORDER BY user_uid"
+                );
+                let likers = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(likers_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                if uploader_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(uploader_score_refund)
+                        .bind(texture.uploader)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                if closet_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                    for user_id in likers {
+                        sqlx::query(sqlx::AssertSqlSafe(score_sql.clone()))
+                            .bind(closet_score_refund)
+                            .bind(user_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
+                let closet_sql = format!(
+                    "DELETE FROM {prefix}user_closet WHERE texture_tid = ? AND user_uid <> ?"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_skin_sql =
+                    format!("UPDATE {prefix}players SET tid_skin = 0 WHERE tid_skin = ?");
+                sqlx::query(sqlx::AssertSqlSafe(players_skin_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_cape_sql =
+                    format!("UPDATE {prefix}players SET tid_cape = 0 WHERE tid_cape = ?");
+                sqlx::query(sqlx::AssertSqlSafe(players_cape_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let delete_sql = format!("DELETE FROM {prefix}textures WHERE tid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                reference_count == 1
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = ?");
+                let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(&texture.hash)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                let likers_sql = format!(
+                    "SELECT CAST(user_uid AS SIGNED) FROM {prefix}user_closet \
+                     WHERE texture_tid = ? AND user_uid <> ? ORDER BY user_uid"
+                );
+                let likers = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(likers_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                if uploader_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(uploader_score_refund)
+                        .bind(texture.uploader)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                if closet_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + ? WHERE uid = ?");
+                    for user_id in likers {
+                        sqlx::query(sqlx::AssertSqlSafe(score_sql.clone()))
+                            .bind(closet_score_refund)
+                            .bind(user_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
+                let closet_sql = format!(
+                    "DELETE FROM {prefix}user_closet WHERE texture_tid = ? AND user_uid <> ?"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_skin_sql =
+                    format!("UPDATE {prefix}players SET tid_skin = 0 WHERE tid_skin = ?");
+                sqlx::query(sqlx::AssertSqlSafe(players_skin_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_cape_sql =
+                    format!("UPDATE {prefix}players SET tid_cape = 0 WHERE tid_cape = ?");
+                sqlx::query(sqlx::AssertSqlSafe(players_cape_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let delete_sql = format!("DELETE FROM {prefix}textures WHERE tid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                reference_count == 1
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let count_sql = format!("SELECT COUNT(*) FROM {prefix}textures WHERE hash = $1");
+                let reference_count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
+                    .bind(&texture.hash)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                let likers_sql = format!(
+                    "SELECT CAST(user_uid AS BIGINT) FROM {prefix}user_closet \
+                     WHERE texture_tid = $1 AND user_uid <> $2 ORDER BY user_uid"
+                );
+                let likers = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(likers_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                if uploader_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2");
+                    sqlx::query(sqlx::AssertSqlSafe(score_sql))
+                        .bind(uploader_score_refund)
+                        .bind(texture.uploader)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                if closet_score_refund != 0 {
+                    let score_sql =
+                        format!("UPDATE {prefix}users SET score = score + $1 WHERE uid = $2");
+                    for user_id in likers {
+                        sqlx::query(sqlx::AssertSqlSafe(score_sql.clone()))
+                            .bind(closet_score_refund)
+                            .bind(user_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
+                let closet_sql = format!(
+                    "DELETE FROM {prefix}user_closet WHERE texture_tid = $1 AND user_uid <> $2"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(closet_sql))
+                    .bind(texture.tid)
+                    .bind(texture.uploader)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_skin_sql =
+                    format!("UPDATE {prefix}players SET tid_skin = 0 WHERE tid_skin = $1");
+                sqlx::query(sqlx::AssertSqlSafe(players_skin_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let players_cape_sql =
+                    format!("UPDATE {prefix}players SET tid_cape = 0 WHERE tid_cape = $1");
+                sqlx::query(sqlx::AssertSqlSafe(players_cape_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                let delete_sql = format!("DELETE FROM {prefix}textures WHERE tid = $1");
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(texture.tid)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                reference_count == 1
+            }
+        };
+        Ok(delete_shared_file)
+    }
     pub async fn player_profile(
         &self,
         prefix: &str,
@@ -3301,5 +3504,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(private_score, 45);
+        sqlx::query("UPDATE bs_players SET tid_skin = 14, tid_cape = 14 WHERE pid = 4")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 14, 'Other liker'), (8, 14, 'Uploader item')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let public_private_texture = database.texture_info("bs_", 14).await.unwrap().unwrap();
+        assert!(
+            database
+                .delete_texture("bs_", &public_private_texture, -3, 2)
+                .await
+                .unwrap()
+        );
+        assert!(database.texture_info("bs_", 14).await.unwrap().is_none());
+        let cleared_player: (i64, i64) =
+            sqlx::query_as("SELECT tid_skin, tid_cape FROM bs_players WHERE pid = 4")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared_player, (0, 0));
+        let uploader_closet_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bs_user_closet WHERE texture_tid = 14 AND user_uid = 8",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let other_closet_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bs_user_closet WHERE texture_tid = 14 AND user_uid = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(uploader_closet_rows, 1);
+        assert_eq!(other_closet_rows, 0);
+        let rewarded_user_score: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let refunded_uploader_score: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 8")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rewarded_user_score, 42);
+        assert_eq!(refunded_uploader_score, 42);
+        let shared_texture = database.texture_info("bs_", 15).await.unwrap().unwrap();
+        assert!(
+            !database
+                .delete_texture("bs_", &shared_texture, 0, 0)
+                .await
+                .unwrap()
+        );
     }
 }
