@@ -45,7 +45,7 @@ cargo build --locked --release
 | `PWD_METHOD`, `SALT` | 兼容旧密码格式所需设置；保留旧站的原值 |
 | `MAIL_MAILER` | `smtp`、`log` 或 `array`；其余 SMTP 参数沿用 `MAIL_*` |
 
-Rust 直接读取旧数据库表和纹理文件，不会自动迁移 schema 或创建初始管理员。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 当前没有 PHP 插件兼容层。
+Rust 直接读取旧数据库表和纹理文件，不会自动迁移 schema 或创建初始管理员。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 已提供 Passport `/oauth/token` 的 password/refresh_token 授权、登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。
 
 ## 本地启动
 

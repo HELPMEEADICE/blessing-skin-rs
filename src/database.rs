@@ -446,6 +446,12 @@ pub struct OAuthRefreshRecord {
     pub scopes: String,
 }
 
+#[derive(Debug, FromRow)]
+pub struct OAuthScopeRecord {
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum OAuthClientDeleteOutcome {
     NotFound,
@@ -3380,6 +3386,117 @@ impl DatabasePool {
         }
     }
 
+    pub async fn oauth_personal_access_client_id(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let sql = format!(
+            "SELECT CAST(id AS BIGINT) FROM {prefix}oauth_clients \
+             WHERE personal_access_client = TRUE AND revoked = FALSE ORDER BY id LIMIT 1"
+        );
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
+
+    pub async fn issue_oauth_personal_access_token(
+        &self,
+        prefix: &str,
+        access_token_id: &str,
+        user_id: i64,
+        client_id: i64,
+        name: &str,
+        scopes: &str,
+        created_at: &str,
+        expires_at: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,name,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES ($1,$2,$3,$4,$5,FALSE,$6::TIMESTAMP,$6::TIMESTAMP,$7::TIMESTAMP)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,name,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES (?,?,?,?,?,FALSE,?,?,?)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(name)
+                    .bind(scopes)
+                    .bind(created_at)
+                    .bind(created_at)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(name)
+                    .bind(scopes)
+                    .bind(created_at)
+                    .bind(created_at)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(user_id)
+                    .bind(client_id)
+                    .bind(name)
+                    .bind(scopes)
+                    .bind(created_at)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn oauth_scope_descriptions(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<OAuthScopeRecord>, sqlx::Error> {
+        let sql = format!("SELECT name, description FROM {prefix}scopes ORDER BY name");
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, OAuthScopeRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .fetch_all(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, OAuthScopeRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .fetch_all(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, OAuthScopeRecord>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .fetch_all(pool)
+            .await?),
+        }
+    }
+
     pub async fn oauth_scopes(&self, prefix: &str) -> Result<Vec<String>, sqlx::Error> {
         let sql = format!("SELECT name FROM {prefix}scopes ORDER BY name");
         match self {
@@ -3483,11 +3600,17 @@ impl DatabasePool {
         }
     }
 
-    pub async fn oauth_authorized_tokens_for_user(
+    pub async fn oauth_tokens_for_user(
         &self,
         prefix: &str,
         user_id: i64,
+        personal_access: bool,
     ) -> Result<Vec<OAuthAuthorizedTokenRecord>, sqlx::Error> {
+        let client_filter = if personal_access {
+            "c.personal_access_client = TRUE AND t.revoked = FALSE"
+        } else {
+            "c.personal_access_client = FALSE AND c.password_client = FALSE"
+        };
         let sql = match self {
             Self::Sqlite(_) => format!(
                 "SELECT t.id, CAST(t.user_id AS BIGINT) AS user_id, \
@@ -3499,7 +3622,7 @@ impl DatabasePool {
                  c.password_client AS client_password_client, c.revoked AS client_revoked, \
                  CAST(c.created_at AS TEXT) AS client_created_at, CAST(c.updated_at AS TEXT) AS client_updated_at \
                  FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
-                 WHERE t.user_id = ? AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 WHERE t.user_id = ? AND {client_filter} \
                  ORDER BY t.created_at DESC"
             ),
             Self::MySql(_) => format!(
@@ -3514,7 +3637,7 @@ impl DatabasePool {
                  DATE_FORMAT(c.created_at, '%Y-%m-%d %H:%i:%s') AS client_created_at, \
                  DATE_FORMAT(c.updated_at, '%Y-%m-%d %H:%i:%s') AS client_updated_at \
                  FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
-                 WHERE t.user_id = ? AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 WHERE t.user_id = ? AND {client_filter} \
                  ORDER BY t.created_at DESC"
             ),
             Self::Postgres(_) => format!(
@@ -3529,7 +3652,7 @@ impl DatabasePool {
                  to_char(c.created_at, 'YYYY-MM-DD HH24:MI:SS') AS client_created_at, \
                  to_char(c.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS client_updated_at \
                  FROM {prefix}oauth_access_tokens t JOIN {prefix}oauth_clients c ON c.id = t.client_id \
-                 WHERE t.user_id = $1 AND c.personal_access_client = FALSE AND c.password_client = FALSE \
+                 WHERE t.user_id = $1 AND {client_filter} \
                  ORDER BY t.created_at DESC"
             ),
         };

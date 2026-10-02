@@ -71,9 +71,19 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/captcha", any(captcha_image))
         .route("/auth/logout", post(logout))
         .route("/oauth/token", post(crate::oauth::token))
+        .route("/oauth/scopes", get(crate::oauth::list_scopes))
         .route("/oauth/tokens", get(crate::oauth::list_authorized_tokens))
         .route(
             "/oauth/tokens/{token_id}",
+            delete(crate::oauth::revoke_access_token),
+        )
+        .route(
+            "/oauth/personal-access-tokens",
+            get(crate::oauth::list_personal_access_tokens)
+                .post(crate::oauth::create_personal_access_token),
+        )
+        .route(
+            "/oauth/personal-access-tokens/{token_id}",
             delete(crate::oauth::revoke_access_token),
         )
         .route(

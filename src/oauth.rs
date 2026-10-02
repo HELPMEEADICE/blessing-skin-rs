@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,19 +14,64 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use jsonwebtoken::{Algorithm, Header, encode};
 use rand::{
     RngCore,
     distributions::{Alphanumeric, DistString},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::{AppState, database::OAuthGrantClientRecord};
 
 const ACCESS_TOKEN_TTL: u64 = 365 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL: u64 = 365 * 24 * 60 * 60;
+const DEFAULT_SCOPE_DESCRIPTIONS: &[(&str, &str)] = &[
+    ("User.Read", "auth.oauth.scope.user.read"),
+    ("Notification.Read", "auth.oauth.scope.notification.read"),
+    (
+        "Notification.ReadWrite",
+        "auth.oauth.scope.notification.readwrite",
+    ),
+    ("Player.Read", "auth.oauth.scope.player.read"),
+    ("Player.ReadWrite", "auth.oauth.scope.player.readwrite"),
+    ("Closet.Read", "auth.oauth.scope.closet.read"),
+    ("Closet.ReadWrtie", "auth.oauth.scope.closet.readwrite"),
+    (
+        "UsersManagement.Read",
+        "auth.oauth.scope.users-management.read",
+    ),
+    (
+        "UsersManagement.ReadWrite",
+        "auth.oauth.scope.users-management.readwrite",
+    ),
+    (
+        "PlayersManagement.Read",
+        "auth.oauth.scope.players-management.read",
+    ),
+    (
+        "PlayersManagement.ReadWrite",
+        "auth.oauth.scope.players-management.readwrite",
+    ),
+    (
+        "ClosetManagement.Read",
+        "auth.oauth.scope.closet-management.read",
+    ),
+    (
+        "ClosetManagement.ReadWrite",
+        "auth.oauth.scope.closet-management.readwrite",
+    ),
+    (
+        "ReportsManagement.Read",
+        "auth.oauth.scope.reports-management.read",
+    ),
+    (
+        "ReportsManagement.ReadWrite",
+        "auth.oauth.scope.reports-management.readwrite",
+    ),
+];
+
 const KNOWN_SCOPES: &[&str] = &[
     "User.Read",
     "Notification.Read",
@@ -62,6 +107,50 @@ struct PassportAccessTokenClaims {
     sub: String,
 }
 
+pub async fn list_scopes(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = crate::http::authenticated_web_user(&state, &headers).await {
+        return response;
+    }
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let mut scopes = DEFAULT_SCOPE_DESCRIPTIONS
+        .iter()
+        .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    match database
+        .oauth_scope_descriptions(&state.config.database.table_prefix)
+        .await
+    {
+        Ok(custom) => {
+            scopes.extend(
+                custom
+                    .into_iter()
+                    .map(|scope| (scope.name, scope.description)),
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load OAuth scope descriptions");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    }
+    Json(
+        scopes
+            .into_iter()
+            .map(|(id, description)| serde_json::json!({ "id": id, "description": description }))
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
+}
+
 pub async fn list_authorized_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match crate::http::authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -75,7 +164,7 @@ pub async fn list_authorized_tokens(State(state): State<AppState>, headers: Head
         );
     };
     let records = match database
-        .oauth_authorized_tokens_for_user(&state.config.database.table_prefix, user.uid)
+        .oauth_tokens_for_user(&state.config.database.table_prefix, user.uid, false)
         .await
     {
         Ok(records) => records,
@@ -118,6 +207,231 @@ pub async fn list_authorized_tokens(State(state): State<AppState>, headers: Head
         })
         .collect::<Vec<_>>();
     Json(tokens).into_response()
+}
+
+#[derive(Deserialize)]
+struct PersonalAccessTokenRequest {
+    name: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+pub async fn list_personal_access_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match crate::http::authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let records = match database
+        .oauth_tokens_for_user(&state.config.database.table_prefix, user.uid, true)
+        .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "failed to list OAuth personal access tokens");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    let tokens = records
+        .into_iter()
+        .map(|token| {
+            let scopes = token.scopes.as_deref().map(decode_stored_scopes);
+            serde_json::json!({
+                "id": token.id,
+                "user_id": token.user_id,
+                "client_id": token.client_id,
+                "name": token.name,
+                "scopes": scopes,
+                "revoked": token.revoked,
+                "created_at": token.created_at,
+                "updated_at": token.updated_at,
+                "expires_at": token.expires_at,
+                "client": {
+                    "id": token.client_id,
+                    "user_id": token.client_user_id,
+                    "name": token.client_name,
+                    "provider": token.client_provider,
+                    "redirect": token.client_redirect,
+                    "personal_access_client": token.client_personal_access_client,
+                    "password_client": token.client_password_client,
+                    "revoked": token.client_revoked,
+                    "created_at": token.client_created_at,
+                    "updated_at": token.client_updated_at
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(tokens).into_response()
+}
+
+pub async fn create_personal_access_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match crate::http::authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let request: PersonalAccessTokenRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return oauth_validation_error(
+                "The given data was invalid.",
+                serde_json::json!({
+                    "name": ["The name field is required."],
+                }),
+            );
+        }
+    };
+    if request.name.trim().is_empty() || request.name.chars().count() > 191 {
+        return oauth_validation_error(
+            "The given data was invalid.",
+            serde_json::json!({ "name": ["The name field is required and may not exceed 191 characters."] }),
+        );
+    }
+    let Some(database) = &state.database else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let prefix = &state.config.database.table_prefix;
+    let personal_client_id = match database.oauth_personal_access_client_id(prefix).await {
+        Ok(Some(client_id)) => client_id,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The personal access client is not configured.",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load OAuth personal access client");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    let known_scopes = load_known_scopes(database, prefix).await;
+    let mut scopes = Vec::with_capacity(request.scopes.len());
+    for scope in request.scopes {
+        if !known_scopes.iter().any(|known| known == &scope) {
+            return oauth_validation_error(
+                "The given data was invalid.",
+                serde_json::json!({ "scopes": [format!("The selected scope {scope} is invalid.")] }),
+            );
+        }
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    let Some(signing_key) = state.passport_signing_key.as_ref() else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    };
+    let now = unix_now();
+    let expires_at_unix = now.saturating_add(ACCESS_TOKEN_TTL);
+    let token_id = new_uuid();
+    let claims = PassportAccessTokenClaims {
+        aud: personal_client_id.to_string(),
+        exp: expires_at_unix,
+        iat: now,
+        jti: token_id.clone(),
+        nbf: now,
+        scopes: scopes.clone(),
+        sub: user.uid.to_string(),
+    };
+    let access_token = match encode(&Header::new(Algorithm::RS256), &claims, signing_key) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, "failed to sign Passport personal access token");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "The authorization service is unavailable.",
+            );
+        }
+    };
+    let scopes_json = match serde_json::to_string(&scopes) {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize OAuth personal token scopes");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The authorization service failed.",
+            );
+        }
+    };
+    let created_at = database_datetime(now);
+    let expires_at = database_datetime(expires_at_unix);
+    if let Err(error) = database
+        .issue_oauth_personal_access_token(
+            prefix,
+            &token_id,
+            user.uid,
+            personal_client_id,
+            &request.name,
+            &scopes_json,
+            &created_at,
+            &expires_at,
+        )
+        .await
+    {
+        tracing::error!(%error, "failed to persist OAuth personal access token");
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "The authorization service is unavailable.",
+        );
+    }
+    let created_at_json = DateTime::<Utc>::from_timestamp(now as i64, 0)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true));
+    let expires_at_json = DateTime::<Utc>::from_timestamp(expires_at_unix as i64, 0)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true));
+    Json(serde_json::json!({
+        "accessToken": access_token,
+        "token": {
+            "id": token_id,
+            "user_id": user.uid,
+            "client_id": personal_client_id,
+            "name": request.name,
+            "scopes": scopes,
+            "revoked": false,
+            "created_at": created_at_json,
+            "updated_at": created_at_json,
+            "expires_at": expires_at_json
+        }
+    }))
+    .into_response()
+}
+
+fn oauth_validation_error(message: &str, errors: serde_json::Value) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
 }
 
 pub async fn revoke_access_token(
@@ -818,6 +1132,8 @@ mod integration_tests {
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO oauth_clients (id,user_id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (3,7,'Third-party app','never-return-this-secret',NULL,'https://example.test/callback',FALSE,FALSE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
             .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO oauth_clients (id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (4,'Personal Access Client','personal-secret',NULL,'http://localhost',TRUE,FALSE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+            .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO oauth_access_tokens (id,user_id,client_id,name,scopes,revoked,created_at,updated_at,expires_at) VALUES ('authorized-third-party',7,3,'Browser','[\"User.Read\"]',FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
             .execute(&pool).await.unwrap();
 
@@ -929,6 +1245,25 @@ mod integration_tests {
             true
         );
 
+        let scopes = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/scopes")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scopes.status(), StatusCode::OK);
+        let scopes: Value = response_json(scopes).await;
+        assert!(scopes.as_array().unwrap().iter().any(|scope| {
+            scope["id"] == "User.Read" && scope["description"] == "auth.oauth.scope.user.read"
+        }));
+        assert!(scopes.as_array().unwrap().iter().any(|scope| {
+            scope["id"] == "Plugin.Custom" && scope["description"] == "Custom plugin capability"
+        }));
+
         let listed = app
             .clone()
             .oneshot(
@@ -946,6 +1281,78 @@ mod integration_tests {
         assert_eq!(listed[0]["scopes"][0], "User.Read");
         assert_eq!(listed[0]["client"]["name"], "Third-party app");
         assert!(listed[0]["client"].get("secret").is_none());
+
+        let personal_created = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/personal-access-tokens")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"CLI token","scopes":["User.Read"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(personal_created.status(), StatusCode::OK);
+        let personal_created: Value = response_json(personal_created).await;
+        assert_eq!(personal_created["token"]["name"], "CLI token");
+        let personal_access = personal_created["accessToken"].as_str().unwrap();
+        let personal_claims = crate::auth::decode_access_token(
+            personal_access,
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(personal_created["token"]["id"], personal_claims.jti);
+        let personal_use = app
+            .clone()
+            .oneshot(
+                Request::get("/api/user")
+                    .header("authorization", format!("Bearer {personal_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(personal_use.status(), StatusCode::OK);
+        let personal_list = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/personal-access-tokens")
+                    .header("cookie", session_cookie(7, session_secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(personal_list.status(), StatusCode::OK);
+        let personal_list: Value = response_json(personal_list).await;
+        assert_eq!(personal_list.as_array().unwrap().len(), 1);
+        assert_eq!(personal_list[0]["id"], personal_claims.jti);
+        let personal_revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/oauth/personal-access-tokens/{}",
+                    personal_claims.jti
+                ))
+                .header("cookie", session_cookie(7, session_secret))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(personal_revoke.status(), StatusCode::NO_CONTENT);
+        let revoked_use = app
+            .clone()
+            .oneshot(
+                Request::get("/api/user")
+                    .header("authorization", format!("Bearer {personal_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_use.status(), StatusCode::UNAUTHORIZED);
 
         let second_access = refreshed["access_token"].as_str().unwrap();
         let second_claims = crate::auth::decode_access_token(
