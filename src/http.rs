@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/", any(api_root))
         .route("/", get(home))
         .route("/auth/login", get(login_page).post(handle_login))
+        .route("/auth/bind", get(bind_email_page).post(bind_email))
         .route("/auth/register", get(register_page).post(handle_register))
         .route("/auth/forgot", get(forgot_page).post(handle_forgot))
         .route(
@@ -365,6 +366,139 @@ fn safe_local_redirect(target: Option<&str>) -> Option<String> {
         return None;
     }
     Some(target.to_owned())
+}
+#[derive(Template)]
+#[template(path = "bind_email.html")]
+struct BindEmailPage {
+    site_name: String,
+    locale: String,
+}
+
+async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to load account for email binding");
+            return unavailable();
+        }
+    };
+    if user.permission == -1 {
+        let message = if state.config.locale.starts_with("zh") {
+            "你已被本站封禁，详情请联系站点管理员"
+        } else {
+            "You are banned on this site. Please contact the admin."
+        };
+        let mut response = login_result(-1, message, None);
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    if !user.email.is_empty() {
+        return Redirect::to("/user").into_response();
+    }
+    let page = BindEmailPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to render account email binding page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to load account for email binding");
+            return unavailable();
+        }
+    };
+    if user.permission == -1 {
+        let message = if state.config.locale.starts_with("zh") {
+            "你已被本站封禁，详情请联系站点管理员"
+        } else {
+            "You are banned on this site. Please contact the admin."
+        };
+        let mut response = login_result(-1, message, None);
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    if !user.email.is_empty() {
+        return Redirect::to("/user").into_response();
+    }
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    let email = if is_json {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("email")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        form_urlencoded::parse(&body)
+            .find(|(key, _)| key == "email")
+            .map(|(_, value)| value.into_owned())
+    };
+    let Some(email) = email.filter(|email| valid_email_address(email) && email.len() <= 100) else {
+        return registration_validation_error("email", "email", &state.config.locale);
+    };
+    let prefix = &state.config.database.table_prefix;
+    match database.user_email_exists(prefix, &email, user_id).await {
+        Ok(true) => return registration_validation_error("email", "unique", &state.config.locale),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to check account email uniqueness");
+            return unavailable();
+        }
+    }
+    if let Err(error) = database
+        .update_user_text(prefix, user_id, "email", &email)
+        .await
+    {
+        tracing::error!(%error, user_id, "failed to bind account email");
+        return unavailable();
+    }
+    if !is_json {
+        Redirect::to("/user").into_response()
+    } else {
+        login_result(
+            0,
+            if state.config.locale.starts_with("zh") {
+                "邮箱已绑定。"
+            } else {
+                "Email address bound successfully."
+            },
+            Some(serde_json::json!({ "redirectTo": "/user" })),
+        )
+    }
 }
 async fn login_page(
     State(state): State<AppState>,
@@ -10211,6 +10345,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let unbound_password = bcrypt::hash("correct horse", 4).unwrap();
+        sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (9,'','Unbound','en',0,0,?,0,'','',1,0)")
+            .bind(unbound_password)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO players (pid,uid,name,tid_skin,tid_cape,last_modified) VALUES (3,7,'Alex',0,0,'2026-10-02 12:00:00')")
             .execute(&pool)
             .await
@@ -10284,6 +10424,79 @@ mod tests {
             captcha_challenges: captcha_challenges.clone(),
             mail_limits: Default::default(),
         });
+        let now = jsonwebtoken::get_current_timestamp();
+        let unbound_claims = crate::auth::WebSessionClaims {
+            sub: "9".to_owned(),
+            iat: now,
+            exp: now + 3600,
+        };
+        let unbound_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &unbound_claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        let unbound_cookie = format!("blessing_skin_session={unbound_token}");
+        let bind_page = session_request(&app, &unbound_cookie, "GET", "/auth/bind", None).await;
+        assert_eq!(bind_page.status(), StatusCode::OK);
+        let bind_html = String::from_utf8(
+            to_bytes(bind_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(bind_html.contains("Bind your email"));
+        let duplicate_email = session_request(
+            &app,
+            &unbound_cookie,
+            "POST",
+            "/auth/bind",
+            Some(r#"{"email":"alex@example.test"}"#),
+        )
+        .await;
+        assert_eq!(duplicate_email.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let duplicate_email: serde_json::Value = serde_json::from_slice(
+            &to_bytes(duplicate_email.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate_email["errors"]["email"][0],
+            "The email has already been taken."
+        );
+        let bind_response = session_request(
+            &app,
+            &unbound_cookie,
+            "POST",
+            "/auth/bind",
+            Some(r#"{"email":"new-account@example.test"}"#),
+        )
+        .await;
+        assert_eq!(bind_response.status(), StatusCode::OK);
+        let bind_response: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bind_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bind_response["data"]["redirectTo"], "/user");
+        let bound_email: String = sqlx::query_scalar("SELECT email FROM users WHERE uid = 9")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(bound_email, "new-account@example.test");
+        let bound_verified: bool = sqlx::query_scalar("SELECT verified FROM users WHERE uid = 9")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(bound_verified);
+        let bound_page = session_request(&app, &unbound_cookie, "GET", "/user/profile", None).await;
+        assert_eq!(bound_page.status(), StatusCode::OK);
+        let already_bound = session_request(&app, &unbound_cookie, "GET", "/auth/bind", None).await;
+        assert_eq!(already_bound.status(), StatusCode::SEE_OTHER);
+        assert_eq!(already_bound.headers().get("location").unwrap(), "/user");
         let homepage = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -10554,7 +10767,7 @@ mod tests {
         assert!(admin_dashboard.contains("chart-users-registration"));
         assert!(admin_dashboard.contains("chart-textures-upload"));
         assert!(admin_dashboard.contains("fetch('/admin/chart'"));
-        assert!(admin_dashboard.contains(">3<"));
+        assert!(admin_dashboard.contains(">4<"));
         assert!(admin_dashboard.contains(">2<"));
         assert!(admin_dashboard.contains(">1<"));
         assert!(admin_dashboard.contains(">8<"));

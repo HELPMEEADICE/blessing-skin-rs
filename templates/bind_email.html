@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}绑定邮箱{% else %}Bind email{% endif %} · {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40;min-height:100vh;display:grid;place-items:center}main{box-sizing:border-box;width:min(440px,calc(100% - 2rem));padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}h1{font-size:1.55rem;margin:.2rem 0}.muted{color:#667085}label{display:block;font-weight:600;margin:.8rem 0 .4rem}input{box-sizing:border-box;width:100%;padding:.7rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}button{width:100%;margin-top:1rem;padding:.75rem;border:0;border-radius:4px;background:#007bff;color:#fff;font:inherit;cursor:pointer}#error{min-height:1.4rem;color:#b42318}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{% if locale.starts_with("zh") %}绑定邮箱{% else %}Bind your email{% endif %}</h1>
+    <p class="muted">{% if locale.starts_with("zh") %}请先为账户绑定邮箱，然后继续使用本站。{% else %}Add an email address to your account before continuing.{% endif %}</p>
+    <form id="bind-form">
+      <label for="email">{% if locale.starts_with("zh") %}邮箱地址{% else %}Email address{% endif %}</label>
+      <input id="email" name="email" type="email" maxlength="100" autocomplete="email" required>
+      <div id="error" role="alert"></div>
+      <button type="submit">{% if locale.starts_with("zh") %}绑定并继续{% else %}Bind and continue{% endif %}</button>
+    </form>
+  </main>
+  <script>
+    document.getElementById('bind-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const error = document.getElementById('error');
+      const button = event.currentTarget.querySelector('button');
+      button.disabled = true;
+      error.textContent = '';
+      try {
+        const response = await fetch('/auth/bind', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ email: document.getElementById('email').value })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (response.ok && result.code === 0) {
+          window.location.href = result.data?.redirectTo || '/user';
+          return;
+        }
+        error.textContent = result.errors?.email?.[0] || result.message || 'Unable to bind email.';
+      } catch (_) {
+        error.textContent = 'Unable to connect to the server.';
+      }
+      button.disabled = false;
+    });
+  </script>
+</body>
+</html>
