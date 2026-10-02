@@ -29,6 +29,7 @@ pub struct AppState {
     pub database: Option<DatabasePool>,
     pub storage_dir: PathBuf,
     pub env_file: PathBuf,
+    pub public_dir: PathBuf,
     pub passport_key: Option<DecodingKey>,
     pub passport_signing_key: Option<EncodingKey>,
     pub session_key: Option<EncodingKey>,
@@ -64,6 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::from_env()?);
     let storage_dir =
         PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "storage".to_owned()));
+    let public_dir =
+        PathBuf::from(std::env::var("PUBLIC_PATH").unwrap_or_else(|_| "public".to_owned()));
     if std::env::args().nth(1).as_deref() == Some("install") {
         installer::run(&config).await?;
         return Ok(());
@@ -106,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         database,
         storage_dir,
         env_file,
+        public_dir,
         passport_key,
         passport_signing_key,
         session_key,

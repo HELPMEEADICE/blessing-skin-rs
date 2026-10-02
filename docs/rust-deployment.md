@@ -35,6 +35,7 @@ cargo build --locked --release
 | `DB_PREFIX` | 旧表前缀，只允许 ASCII 字母、数字和下划线 |
 | `DB_FOREIGN_KEYS` | SQLite 中设为 `false` 或 `0` 可关闭外键检查 |
 | `STORAGE_PATH` | 默认 `storage`；Passport 公钥默认从此目录的 `oauth-public.key` 读取 |
+| `PUBLIC_PATH` | 默认 `public`；前端静态资源从此目录的 `app/` 子目录提供 |
 | `TEXTURES_DIR` | 默认 `$STORAGE_PATH/textures`；请指向旧站实际纹理目录 |
 | `PLUGINS_DIR` | 默认 `$STORAGE_PATH/plugins`；只扫描 `.wasm` 组件，不运行 PHP 插件 |
 | `APP_URL` | 对外站点 URL，默认 `http://localhost` |

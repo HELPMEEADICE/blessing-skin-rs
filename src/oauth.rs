@@ -1932,6 +1932,7 @@ mod integration_tests {
             mail_limits: Default::default(),
             storage_dir: install_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
+            public_dir: std::path::PathBuf::from("public"),
             wasm_plugins: Vec::new(),
         });
 

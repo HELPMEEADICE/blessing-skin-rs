@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", any(live))
         .route("/health/ready", any(ready))
+        .route("/app/{*path}", get(frontend_asset))
         .route(
             "/.well-known/change-password",
             get(change_password_discovery),
@@ -5077,6 +5078,124 @@ async fn live() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
+async fn frontend_asset(
+    State(state): State<AppState>,
+    RoutePath(asset_path): RoutePath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let relative = std::path::PathBuf::from(&asset_path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let app_root = state.public_dir.join("app");
+    let canonical_root = match tokio::fs::canonicalize(&app_root).await {
+        Ok(path) => path,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let canonical_asset = match tokio::fs::canonicalize(app_root.join(relative)).await {
+        Ok(path) if path.starts_with(&canonical_root) => path,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let contents = match tokio::fs::read(canonical_asset).await {
+        Ok(contents) => contents,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    frontend_asset_response(&asset_path, contents, &headers)
+}
+
+fn frontend_asset_response(asset_path: &str, contents: Vec<u8>, headers: &HeaderMap) -> Response {
+    let digest = hex::encode(Md5::digest(&contents));
+    let etag = format!("\"{digest}\"");
+    let cache_control = if frontend_asset_is_fingerprinted(asset_path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=300"
+    };
+    let not_modified = headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        });
+
+    let mut response = if not_modified {
+        (StatusCode::NOT_MODIFIED, Body::empty()).into_response()
+    } else {
+        let length = contents.len().to_string();
+        let mut response = Response::new(Body::from(contents));
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&length).expect("content length is numeric"),
+        );
+        response
+    };
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(frontend_asset_content_type(asset_path)),
+    );
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag).expect("MD5 ETag is ASCII"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn frontend_asset_is_fingerprinted(asset_path: &str) -> bool {
+    let Some(filename) = std::path::Path::new(asset_path)
+        .file_name()
+        .and_then(|filename| filename.to_str())
+    else {
+        return false;
+    };
+    let segments = filename.split('.').collect::<Vec<_>>();
+    segments.len() >= 3
+        && segments[segments.len() - 2].len() == 7
+        && segments[segments.len() - 2]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn frontend_asset_content_type(asset_path: &str) -> &'static str {
+    match std::path::Path::new(asset_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "eot" => "application/vnd.ms-fontobject",
+        _ => "application/octet-stream",
+    }
+}
+
 async fn redirect_uninstalled(
     State(state): State<AppState>,
     request: axum::http::Request<Body>,
@@ -5090,6 +5209,8 @@ async fn redirect_uninstalled(
         || path.starts_with("/api/")
         || path == "/health/live"
         || path == "/health/ready"
+        || path == "/app"
+        || path.starts_with("/app/")
         || path.ends_with(".json")
         || ["/csl/", "/textures/", "/raw/", "/avatar/", "/preview/"]
             .iter()
@@ -11961,7 +12082,10 @@ mod tests {
     async fn api_user_rejects_requests_without_a_bearer_token() {
         use axum::{
             body::{Body, to_bytes},
-            http::{Request, StatusCode, header::SET_COOKIE},
+            http::{
+                Request, StatusCode,
+                header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, SET_COOKIE},
+            },
         };
         use sqlx::sqlite::SqliteConnectOptions;
         use std::{path::PathBuf, sync::Arc};
@@ -12006,6 +12130,13 @@ mod tests {
             mail_limits: Default::default(),
             storage_dir: setup_storage,
             env_file: setup_env.clone(),
+            public_dir: {
+                let path = std::env::temp_dir().join(format!("blessing-skin-public-{setup_token}"));
+                std::fs::create_dir_all(path.join("app")).unwrap();
+                std::fs::write(path.join("app/main.012abcd.js"), b"window.fixture = true;")
+                    .unwrap();
+                path
+            },
             wasm_plugins: Vec::new(),
         });
         let login_before_install = app
@@ -12035,6 +12166,59 @@ mod tests {
         )
         .unwrap();
         assert!(welcome_html.contains("Welcome"));
+        let asset = app
+            .clone()
+            .oneshot(
+                Request::get("/app/main.012abcd.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset.headers().get(CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            asset.headers().get(CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        let asset_etag = asset
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            to_bytes(asset.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"window.fixture = true;"
+        );
+        let cached_asset = app
+            .clone()
+            .oneshot(
+                Request::get("/app/main.012abcd.js")
+                    .header(IF_NONE_MATCH, &asset_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_asset.status(), StatusCode::NOT_MODIFIED);
+        let unsafe_asset = app
+            .clone()
+            .oneshot(
+                Request::get("/app/%2e%2e/Cargo.toml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(unsafe_asset.status(), StatusCode::OK);
         let database_page = app
             .clone()
             .oneshot(Request::get("/setup/database").body(Body::empty()).unwrap())
@@ -12137,6 +12321,10 @@ mod tests {
         );
         std::fs::remove_file(&setup_env).unwrap();
         std::fs::remove_file(&setup_database_file).unwrap();
+        std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("blessing-skin-public-{setup_token}")),
+        )
+        .unwrap();
 
         let response = app
             .clone()
@@ -12218,6 +12406,7 @@ mod tests {
             mail_limits: Default::default(),
             storage_dir: finish_storage.clone(),
             env_file: finish_env.clone(),
+            public_dir: PathBuf::from("public"),
             wasm_plugins: Vec::new(),
         });
         let finish_page = finish_app
@@ -12468,6 +12657,7 @@ mod tests {
             mail_limits: Default::default(),
             storage_dir: setup_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
+            public_dir: std::path::PathBuf::from("public"),
             wasm_plugins: Vec::new(),
         });
         let setup_page = app
