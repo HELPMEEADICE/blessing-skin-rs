@@ -25,8 +25,14 @@
     dialog{max-width:min(90vw,720px);max-height:90vh;border:0;border-radius:8px;padding:1rem;box-shadow:0 8px 40px #0005}dialog img{max-width:80vw;max-height:75vh;object-fit:contain}dialog::backdrop{background:#0009}
     @media(max-width:700px){main{margin:1rem;padding:1rem}}
   </style>
+<meta name="csrf-token" content="">
+{% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+{% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
+{% if frontend_script_available %}
+<div class="wrapper"><div class="content-wrapper" style="margin-left:0;min-height:0;background:transparent"><section class="content-header"><div class="container-fluid"><h1>{% if locale.starts_with("zh") %}举报管理{% else %}Report management{% endif %}</h1><a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a></div></section><section class="content"><div class="container-fluid"></div></section></div></div>
+{% else %}
 <main id="admin-reports">
   <header><h1>{% if locale.starts_with("zh") %}举报管理{% else %}Report management{% endif %}</h1><a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a></header>
   <form id="search-form">
@@ -100,5 +106,7 @@
   load(1);
 })();
 </script>
+{% endif %}
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>

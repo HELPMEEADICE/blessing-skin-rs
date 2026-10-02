@@ -2508,6 +2508,11 @@ struct AdminPlayersPage {
 struct AdminReportsPage {
     site_name: String,
     locale: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 struct AdminStatusGroup {
@@ -10423,9 +10428,26 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/reports",
+        serde_json::json!({}),
+        i18n,
+    );
     let page = AdminReportsPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13652,7 +13674,24 @@ mod tests {
         )
         .unwrap();
         assert!(reports_html.contains("Report management"));
-        assert!(reports_html.contains("/admin/reports/list"));
+        assert!(reports_html.contains(r#"class="container-fluid""#));
+        assert!(reports_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(reports_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_reports_globals = reports_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let reports_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_reports_globals)
+            .unwrap();
+        let reports_globals: serde_json::Value =
+            serde_json::from_slice(&reports_globals_bytes).unwrap();
+        assert_eq!(reports_globals["route"], "admin/reports");
+        assert_eq!(reports_globals["extra"], serde_json::json!({}));
+        assert_eq!(reports_globals["i18n"]["auth"]["login"], "Log In");
 
         let denied_plugins_page = session_request(
             &app,
