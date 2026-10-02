@@ -2542,6 +2542,11 @@ struct SkinLibraryPage {
     locale: String,
     logged_in: bool,
     current_uid: i64,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -7297,11 +7302,29 @@ struct ClosetListQuery {
 
 async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let current_uid = session_user_id(&state, &headers).unwrap_or_default();
+    let logged_in = current_uid > 0;
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "skinlib",
+        serde_json::json!({ "currentUid": logged_in.then_some(current_uid) }),
+        i18n,
+    );
     let page = SkinLibraryPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
-        logged_in: current_uid > 0,
+        logged_in,
         current_uid,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14331,8 +14354,27 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(skinlib_page.contains("/skinlib/list"));
-        assert!(skinlib_page.contains("</title><style>"));
+        assert!(skinlib_page.contains(r#"class="content-wrapper""#));
+        assert!(skinlib_page.contains("http://localhost/app/style.012abcd.css"));
+        assert!(skinlib_page.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_skinlib_globals = skinlib_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let skinlib_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_skinlib_globals)
+            .unwrap();
+        let skinlib_globals: serde_json::Value =
+            serde_json::from_slice(&skinlib_globals_bytes).unwrap();
+        assert_eq!(skinlib_globals["route"], "skinlib");
+        assert_eq!(
+            skinlib_globals["extra"]["currentUid"],
+            serde_json::Value::Null
+        );
+        assert_eq!(skinlib_globals["i18n"]["auth"]["login"], "Log In");
 
         let skinlib_list = session_request(
             &app,
