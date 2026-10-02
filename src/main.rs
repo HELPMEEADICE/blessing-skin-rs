@@ -4,6 +4,7 @@ mod config;
 mod database;
 mod http;
 mod mailer;
+mod plugin_runtime;
 
 use std::{
     collections::HashMap,
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    let mut plugins = plugin_runtime::PluginRuntime::load(&config.plugins_dir)?;
     let database = match DatabasePool::connect(&config.database).await {
         Ok(pool) => Some(pool),
         Err(error) => {
@@ -76,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    plugins.shutdown();
     Ok(())
 }
 
