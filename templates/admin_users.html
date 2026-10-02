@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}用户管理{% else %}User management{% endif %} - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:1200px;margin:3rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
+    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+    form{display:flex;gap:.5rem;margin:1.25rem 0}
+    input{flex:1;min-width:0;padding:.65rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}
+    button{padding:.55rem .75rem;border:0;border-radius:4px;background:#007bff;color:white;font:inherit;cursor:pointer}
+    button.danger{background:#c82333}button.secondary{background:#59636e}
+    .table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:.92rem}
+    th,td{text-align:left;vertical-align:top;padding:.6rem;border:1px solid #d9dee5;white-space:nowrap}
+    th{background:#f4f6f9}.actions{display:flex;flex-wrap:wrap;gap:.35rem;max-width:300px}
+    .status{min-height:1.4rem;color:#59636e}.pagination{display:flex;justify-content:center;align-items:center;gap:1rem;margin-top:1rem}
+    @media(max-width:700px){main{margin:1rem;padding:1rem}th,td{padding:.45rem}}
+  </style>
+</head>
+<body>
+<main id="admin-users" data-current-uid="{{ current_uid }}" data-current-permission="{{ current_permission }}">
+  <header>
+    <h1>{% if locale.starts_with("zh") %}用户管理{% else %}User management{% endif %}</h1>
+    <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a>
+  </header>
+  <form id="search-form">
+    <input id="search-query" type="search" aria-label="{% if locale.starts_with("zh") %}搜索用户{% else %}Search users{% endif %}" placeholder="{% if locale.starts_with("zh") %}按 UID、昵称或邮箱搜索{% else %}Search by UID, nickname or email{% endif %}">
+    <button type="submit">{% if locale.starts_with("zh") %}搜索{% else %}Search{% endif %}</button>
+  </form>
+  <p id="status" class="status" role="status"></p>
+  <div class="table-wrap"><table>
+    <thead><tr>
+      <th>UID</th><th>{% if locale.starts_with("zh") %}邮箱{% else %}Email{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}昵称{% else %}Nickname{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}积分{% else %}Score{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}权限{% else %}Permission{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}邮箱验证{% else %}Verification{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}注册时间{% else %}Registered{% endif %}</th>
+      <th>{% if locale.starts_with("zh") %}操作{% else %}Actions{% endif %}</th>
+    </tr></thead><tbody id="users"></tbody>
+  </table></div>
+  <div class="pagination"><button id="previous" class="secondary" type="button">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</button><span id="page-label"></span><button id="next" class="secondary" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button></div>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('admin-users');
+  const zh = document.documentElement.lang.startsWith('zh');
+  const currentUid = Number(root.dataset.currentUid);
+  const currentPermission = Number(root.dataset.currentPermission);
+  const users = document.getElementById('users');
+  const status = document.getElementById('status');
+  const pageLabel = document.getElementById('page-label');
+  let page = 1, lastPage = 1, query = '';
+  const say = (english, chinese) => zh ? chinese : english;
+  const cell = value => { const node = document.createElement('td'); node.textContent = value == null ? '' : String(value); return node; };
+  const button = (label, action, danger = false) => {
+    const node = document.createElement('button'); node.type = 'button'; node.textContent = label;
+    if (danger) node.className = 'danger';
+    node.addEventListener('click', action); return node;
+  };
+  const request = async (url, method = 'GET', payload) => {
+    const response = await fetch(url, {
+      method,
+      headers: payload === undefined ? { Accept: 'application/json' } : { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || (result.code !== undefined && result.code !== 0)) throw new Error(result.message || say('Request failed.', '请求失败。'));
+    return result;
+  };
+  const change = async (user, field, label, type = 'text') => {
+    const value = prompt(label, user[field] == null ? '' : String(user[field]));
+    if (value === null) return;
+    if (!value.trim()) { alert(say('A value is required.', '此项不能为空。')); return; }
+    const payload = type === 'number' ? Number(value) : value;
+    if (type === 'number' && !Number.isFinite(payload)) { alert(say('Enter a valid number.', '请输入有效数字。')); return; }
+    const result = await request(`/admin/users/${user.uid}/${field === 'email' ? 'email' : field === 'nickname' ? 'nickname' : field === 'score' ? 'score' : 'password'}`, 'PUT', { [field]: payload });
+    status.textContent = result.message || say('Saved.', '已保存。');
+    await load(page);
+  };
+  const action = async (label, work) => { try { await work(); } catch (error) { status.textContent = error.message; } };
+  const renderUser = user => {
+    const row = document.createElement('tr');
+    row.append(cell(user.uid), cell(user.email), cell(user.nickname), cell(user.score));
+    const permissions = { '-1': say('Banned', '已封禁'), '0': say('Normal', '普通用户'), '1': say('Admin', '管理员'), '2': say('Super admin', '超级管理员') };
+    row.append(cell(permissions[String(user.permission)] || user.permission));
+    row.append(cell(user.verified ? say('Verified', '已验证') : say('Unverified', '未验证')));
+    row.append(cell(user.register_at));
+    const actions = document.createElement('td'), group = document.createElement('div'); group.className = 'actions';
+    const canModify = user.uid === currentUid || currentPermission > user.permission;
+    if (canModify) {
+      group.append(button(say('Email', '邮箱'), () => action('', () => change(user, 'email', say('New email', '新邮箱')))));
+      group.append(button(say('Nickname', '昵称'), () => action('', () => change(user, 'nickname', say('New nickname', '新昵称')))));
+      group.append(button(say('Score', '积分'), () => action('', () => change(user, 'score', say('New score', '新积分'), 'number'))));
+      group.append(button(user.verified ? say('Unverify', '取消验证') : say('Verify', '验证邮箱'), () => action('', async () => {
+        const result = await request(`/admin/users/${user.uid}/verification`, 'PUT');
+        status.textContent = result.message || say('Verification updated.', '验证状态已更新。'); await load(page);
+      })));
+      group.append(button(say('Password', '密码'), () => action('', () => change(user, 'password', say('New password', '新密码')))));
+      if (currentPermission > user.permission) group.append(button(say('Permission', '权限'), () => action('', async () => {
+        const value = prompt(say('Permission: -1 banned, 0 normal, 1 admin', '权限：-1 封禁，0 普通，1 管理员'), String(user.permission));
+        if (value === null) return;
+        const permission = Number(value);
+        if (!Number.isInteger(permission) || ![-1, 0, 1].includes(permission)) throw new Error(say('Invalid permission.', '权限值无效。'));
+        const result = await request(`/admin/users/${user.uid}/permission`, 'PUT', { permission });
+        status.textContent = result.message || say('Permission updated.', '权限已更新。'); await load(page);
+      })));
+      if (user.uid !== currentUid) group.append(button(say('Delete', '删除'), () => action('', async () => {
+        if (!confirm(say('Delete this user?', '确定删除该用户吗？'))) return;
+        const result = await request(`/admin/users/${user.uid}`, 'DELETE');
+        status.textContent = result.message || say('User deleted.', '用户已删除。'); await load(page);
+      }), true));
+    }
+    actions.append(group); row.append(actions); users.append(row);
+  };
+  async function load(targetPage) {
+    page = targetPage; status.textContent = say('Loading…', '正在加载…'); users.replaceChildren();
+    try {
+      const params = new URLSearchParams({ q: query, page: String(page) });
+      const data = await request(`/admin/users/list?${params}`);
+      lastPage = Math.max(1, Number(data.last_page) || 1);
+      for (const user of data.data || []) renderUser(user);
+      if (!data.data || data.data.length === 0) {
+        const row = document.createElement('tr'), empty = document.createElement('td'); empty.colSpan = 8;
+        empty.textContent = say('No users found.', '没有找到用户。'); row.append(empty); users.append(row);
+      }
+      pageLabel.textContent = `${data.current_page} / ${lastPage} · ${data.total} ${say('users', '位用户')}`;
+      document.getElementById('previous').disabled = page <= 1;
+      document.getElementById('next').disabled = page >= lastPage;
+      status.textContent = '';
+    } catch (error) { status.textContent = error.message; }
+  }
+  document.getElementById('search-form').addEventListener('submit', event => { event.preventDefault(); query = document.getElementById('search-query').value; load(1); });
+  document.getElementById('previous').addEventListener('click', () => { if (page > 1) load(page - 1); });
+  document.getElementById('next').addEventListener('click', () => { if (page < lastPage) load(page + 1); });
+  load(1);
+})();
+</script>
+</body>
+</html>

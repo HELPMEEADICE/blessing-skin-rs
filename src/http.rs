@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/chart", get(web_admin_chart))
         .route("/admin/status", get(web_admin_status))
         .route("/admin/notifications/send", post(web_send_notification))
+        .route("/admin/users", get(web_admin_users_page))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -2174,6 +2175,15 @@ struct AdminStatusPage {
     locale: String,
     groups: Vec<AdminStatusGroup>,
     wasm_plugins: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "admin_users.html")]
+struct AdminUsersPage {
+    site_name: String,
+    locale: String,
+    current_uid: i64,
+    current_permission: i32,
 }
 
 struct AdminStatusGroup {
@@ -8199,6 +8209,29 @@ fn admin_player_success(
     login_result(0, &message, None)
 }
 
+async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let page = AdminUsersPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        current_uid: user.uid,
+        current_permission: user.permission,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator users page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn admin_user_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -11357,6 +11390,22 @@ mod tests {
         let denied_status_page =
             session_request(&app, &registered_cookie, "GET", "/admin/status", None).await;
         assert_eq!(denied_status_page.status(), StatusCode::FORBIDDEN);
+        let denied_users_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/users", None).await;
+        assert_eq!(denied_users_page.status(), StatusCode::FORBIDDEN);
+
+        let users_page = session_request(&app, &admin_cookie, "GET", "/admin/users", None).await;
+        assert_eq!(users_page.status(), StatusCode::OK);
+        let users_html = String::from_utf8(
+            to_bytes(users_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(users_html.contains("User management"));
+        assert!(users_html.contains("/admin/users/list"));
+        assert!(users_html.contains("data-current-permission=\"1\""));
 
         let status_page = session_request(&app, &admin_cookie, "GET", "/admin/status", None).await;
         assert_eq!(status_page.status(), StatusCode::OK);
