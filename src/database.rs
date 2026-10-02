@@ -370,6 +370,14 @@ pub struct PlayerProfile {
 }
 
 #[derive(Debug, FromRow)]
+pub struct AdminDashboardStats {
+    pub users: i64,
+    pub players: i64,
+    pub textures: i64,
+    pub storage: i64,
+}
+
+#[derive(Debug, FromRow)]
 pub struct AccessTokenRecord {
     pub user_id: Option<i64>,
     pub client_id: i64,
@@ -4484,6 +4492,37 @@ impl DatabasePool {
             .await?),
         }
     }
+    pub async fn admin_dashboard_stats(
+        &self,
+        prefix: &str,
+    ) -> Result<AdminDashboardStats, sqlx::Error> {
+        let integer_cast = if matches!(self, Self::MySql(_)) {
+            "SIGNED"
+        } else {
+            "BIGINT"
+        };
+        let sql = format!(
+            "SELECT CAST((SELECT COUNT(*) FROM {prefix}users) AS {integer_cast}) AS users, CAST((SELECT COUNT(*) FROM {prefix}players) AS {integer_cast}) AS players, CAST((SELECT COUNT(*) FROM {prefix}textures) AS {integer_cast}) AS textures, CAST((SELECT COALESCE(SUM(size), 0) FROM {prefix}textures) AS {integer_cast}) AS storage"
+        );
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, AdminDashboardStats>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .fetch_one(pool)
+            .await?),
+            Self::MySql(pool) => Ok(
+                sqlx::query_as::<_, AdminDashboardStats>(sqlx::AssertSqlSafe(sql))
+                    .fetch_one(pool)
+                    .await?,
+            ),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, AdminDashboardStats>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .fetch_one(pool)
+            .await?),
+        }
+    }
+
     pub async fn user_usage(&self, prefix: &str, uid: i64) -> Result<(i64, i64), sqlx::Error> {
         let integer_cast = if matches!(self, Self::MySql(_)) {
             "SIGNED"

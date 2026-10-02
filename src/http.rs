@@ -44,9 +44,9 @@ use crate::{
         hash_legacy_password, verify_legacy_password,
     },
     database::{
-        AdminUserRecord, ClosetTextureRecord, DatabasePool, NotificationRecord, PlayerProfile,
-        PlayerRecord, PlayerRenameOutcome, PlayerTextureOutcome, ReportManagementRecord,
-        ReportSearchFilters, TextureInfoRecord, UserProfile,
+        AdminDashboardStats, AdminUserRecord, ClosetTextureRecord, DatabasePool,
+        NotificationRecord, PlayerProfile, PlayerRecord, PlayerRenameOutcome, PlayerTextureOutcome,
+        ReportManagementRecord, ReportSearchFilters, TextureInfoRecord, UserProfile,
     },
 };
 
@@ -125,6 +125,7 @@ pub fn router(state: AppState) -> Router {
         .route("/user/dark-mode", put(toggle_user_dark_mode))
         .route("/user/score-info", get(user_score_info))
         .route("/user/sign", post(user_sign))
+        .route("/admin", get(web_admin_dashboard))
         .route("/admin/users/list", get(admin_user_list))
         .route("/admin/users/{uid}/email", put(web_admin_user_email))
         .route(
@@ -1956,6 +1957,14 @@ struct DashboardNotification {
 }
 
 #[derive(Template)]
+#[template(path = "admin_dashboard.html")]
+struct AdminDashboardPage {
+    site_name: String,
+    locale: String,
+    stats: AdminDashboardStats,
+}
+
+#[derive(Template)]
 #[template(path = "players.html")]
 struct PlayerManagementPage {
     site_name: String,
@@ -2295,6 +2304,41 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to render user dashboard");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let stats = match database
+        .admin_dashboard_stats(&state.config.database.table_prefix)
+        .await
+    {
+        Ok(stats) => stats,
+        Err(error) => {
+            tracing::error!(%error, "failed to load admin dashboard statistics");
+            return unavailable();
+        }
+    };
+    let page = AdminDashboardPage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        stats,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render admin dashboard");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -10327,6 +10371,51 @@ mod tests {
         assert!(registered_dashboard.contains("/user/reports"));
         assert!(registered_dashboard.contains("/user/profile"));
         assert!(registered_dashboard.contains("/user/oauth/manage"));
+        assert!(!registered_dashboard.contains(r#"href="/admin""#));
+
+        let non_admin_dashboard =
+            session_request(&app, &registered_cookie, "GET", "/admin", None).await;
+        assert_eq!(non_admin_dashboard.status(), StatusCode::FORBIDDEN);
+        let admin_now = jsonwebtoken::get_current_timestamp();
+        let admin_claims = crate::auth::WebSessionClaims {
+            sub: "7".to_owned(),
+            iat: admin_now,
+            exp: admin_now + 3600,
+        };
+        let admin_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &admin_claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        let admin_cookie = format!("blessing_skin_session={admin_token}");
+        let admin_dashboard = session_request(&app, &admin_cookie, "GET", "/admin", None).await;
+        assert_eq!(admin_dashboard.status(), StatusCode::OK);
+        let admin_dashboard = String::from_utf8(
+            to_bytes(admin_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(admin_dashboard.contains("Users"));
+        assert!(admin_dashboard.contains("Players"));
+        assert!(admin_dashboard.contains("Textures"));
+        assert!(admin_dashboard.contains("Storage"));
+        assert!(admin_dashboard.contains(">3<"));
+        assert!(admin_dashboard.contains(">2<"));
+        assert!(admin_dashboard.contains(">1<"));
+        assert!(admin_dashboard.contains(">8<"));
+        let admin_user_dashboard = session_request(&app, &admin_cookie, "GET", "/user", None).await;
+        assert_eq!(admin_user_dashboard.status(), StatusCode::OK);
+        let admin_user_dashboard = String::from_utf8(
+            to_bytes(admin_user_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(admin_user_dashboard.contains(r#"href="/admin""#));
         let profile_page =
             session_request(&app, &registered_cookie, "GET", "/user/profile", None).await;
         assert_eq!(profile_page.status(), StatusCode::OK);

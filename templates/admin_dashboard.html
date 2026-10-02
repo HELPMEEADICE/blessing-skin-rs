@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{% endif %} - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:960px;margin:4rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
+    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+    nav{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}
+    .stat{padding:1.25rem;background:#f4f6f9;border-radius:8px}
+    .stat h2{font-size:1rem;margin:0 0 .65rem}
+    .stat p{font-size:1.6rem;font-weight:700;margin:0;overflow-wrap:anywhere}
+  </style>
+</head>
+<body><main>
+  <header><h1>{{ site_name }}</h1><a href="/user">{% if locale.starts_with("zh") %}返回用户中心{% else %}User dashboard{% endif %}</a></header>
+  <h2>{% if locale.starts_with("zh") %}管理后台概览{% else %}Admin overview{% endif %}</h2>
+  <nav aria-label="{% if locale.starts_with("zh") %}管理导航{% else %}Admin navigation{% endif %}">
+    <a href="/admin/users/list">{% if locale.starts_with("zh") %}用户{% else %}Users{% endif %}</a>
+    <a href="/admin/players/list">{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</a>
+    <a href="/admin/reports/list">{% if locale.starts_with("zh") %}举报{% else %}Reports{% endif %}</a>
+    <a href="/admin/options">{% if locale.starts_with("zh") %}站点设置{% else %}Site settings{% endif %}</a>
+  </nav>
+  <section class="stats" aria-label="{% if locale.starts_with("zh") %}站点统计{% else %}Site statistics{% endif %}">
+    <article class="stat"><h2>{% if locale.starts_with("zh") %}用户{% else %}Users{% endif %}</h2><p>{{ stats.users }}</p></article>
+    <article class="stat"><h2>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h2><p>{{ stats.players }}</p></article>
+    <article class="stat"><h2>{% if locale.starts_with("zh") %}纹理{% else %}Textures{% endif %}</h2><p>{{ stats.textures }}</p></article>
+    <article class="stat"><h2>{% if locale.starts_with("zh") %}存储用量（字节）{% else %}Storage (bytes){% endif %}</h2><p>{{ stats.storage }}</p></article>
+  </section>
+</main></body>
+</html>
