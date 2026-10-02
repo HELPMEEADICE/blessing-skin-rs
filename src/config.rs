@@ -13,6 +13,9 @@ pub struct Config {
     pub plugins_dir: PathBuf,
     pub app_url: String,
     pub passport_public_key: Option<Vec<u8>>,
+    pub password_method: String,
+    pub password_salt: String,
+    pub app_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +72,9 @@ impl Config {
             plugins_dir,
             app_url: env::var("APP_URL").unwrap_or_else(|_| "http://localhost".to_owned()),
             passport_public_key,
+            password_method: env::var("PWD_METHOD").unwrap_or_else(|_| "BCRYPT".to_owned()),
+            password_salt: env::var("SALT").unwrap_or_default(),
+            app_key: env::var("APP_KEY").ok().filter(|value| !value.is_empty()),
         })
     }
 }

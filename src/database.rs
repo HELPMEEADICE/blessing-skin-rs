@@ -59,6 +59,12 @@ pub struct PlayerRecord {
     pub tid_cape: i64,
     pub last_modified: String,
 }
+#[derive(Debug, FromRow)]
+pub struct PasswordCredential {
+    pub uid: i64,
+    pub password: String,
+    pub permission: i32,
+}
 impl DatabasePool {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = match &config.connection {
@@ -319,6 +325,63 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn credentials_by_email(
+        &self,
+        prefix: &str,
+        email: &str,
+    ) -> Result<Option<PasswordCredential>, sqlx::Error> {
+        self.password_credential(prefix, email, true).await
+    }
+
+    pub async fn credentials_by_player_name(
+        &self,
+        prefix: &str,
+        player_name: &str,
+    ) -> Result<Option<PasswordCredential>, sqlx::Error> {
+        self.password_credential(prefix, player_name, false).await
+    }
+
+    async fn password_credential(
+        &self,
+        prefix: &str,
+        identifier: &str,
+        is_email: bool,
+    ) -> Result<Option<PasswordCredential>, sqlx::Error> {
+        let sql = match (self, is_email) {
+            (Self::Postgres(_), true) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, password, permission FROM {prefix}users WHERE email = $1 LIMIT 1"
+            ),
+            (Self::Postgres(_), false) => format!(
+                "SELECT CAST(u.uid AS BIGINT) AS uid, u.password, u.permission FROM {prefix}players p INNER JOIN {prefix}users u ON u.uid = p.uid WHERE p.name = $1 LIMIT 1"
+            ),
+            (_, true) => format!(
+                "SELECT CAST(uid AS BIGINT) AS uid, password, permission FROM {prefix}users WHERE email = ? LIMIT 1"
+            ),
+            (_, false) => format!(
+                "SELECT CAST(u.uid AS BIGINT) AS uid, u.password, u.permission FROM {prefix}players p INNER JOIN {prefix}users u ON u.uid = p.uid WHERE p.name = ? LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(identifier)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(sqlx::AssertSqlSafe(
+                sql,
+            ))
+            .bind(identifier)
+            .fetch_optional(pool)
+            .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, PasswordCredential>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(identifier)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -388,6 +451,19 @@ mod tests {
         assert_eq!(players[0].tid_skin, 11);
         assert_eq!(players[0].tid_cape, 12);
         assert_eq!(players[0].last_modified, "2026-10-02 12:00:00");
+        let email_credential = database
+            .credentials_by_email("bs_", "alex@example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(email_credential.uid, 7);
+        assert_eq!(email_credential.permission, 0);
+        let player_credential = database
+            .credentials_by_player_name("bs_", "Alex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(player_credential.uid, 7);
         let user = database.user_profile("bs_", 7).await.unwrap().unwrap();
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");

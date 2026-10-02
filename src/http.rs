@@ -1,30 +1,32 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
+use askama::Template;
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path as RoutePath, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
-            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-            LAST_MODIFIED,
+            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_MODIFIED_SINCE,
+            IF_NONE_MATCH, LAST_MODIFIED, SET_COOKIE,
         },
     },
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{any, get, post},
 };
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use jsonwebtoken::{Algorithm, Header, encode};
 use md5::{Digest, Md5};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
-    auth::{audience_matches, bearer_token, decode_access_token},
-    database::{DatabasePool, PlayerProfile},
+    auth::{audience_matches, bearer_token, decode_access_token, decode_web_session},
+    database::{DatabasePool, PlayerProfile, PlayerRecord, UserProfile},
 };
 
 pub fn router(state: AppState) -> Router {
@@ -33,6 +35,10 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", any(ready))
         .route("/api", any(api_root))
         .route("/api/", any(api_root))
+        .route("/", get(home))
+        .route("/auth/login", get(login_page).post(handle_login))
+        .route("/auth/logout", post(logout))
+        .route("/user", get(web_dashboard))
         .route("/api/user", get(api_user))
         .route("/api/players", get(api_players))
         .route("/{profile}", get(player_json))
@@ -43,6 +49,376 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginPage {
+    site_name: String,
+    locale: String,
+    title: String,
+    prompt: String,
+    identification_label: String,
+    password_label: String,
+    remember_label: String,
+    submit_label: String,
+}
+
+async fn login_page(State(state): State<AppState>) -> Response {
+    let site_name = match &state.database {
+        Some(database) => database
+            .option(&state.config.database.table_prefix, "site_name")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Blessing Skin".to_owned()),
+        None => "Blessing Skin".to_owned(),
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let page = LoginPage {
+        site_name,
+        locale: state.config.locale.clone(),
+        title: if chinese { "登录" } else { "Log In" }.to_owned(),
+        prompt: if chinese {
+            "登录以管理您的角色与皮肤"
+        } else {
+            "Log in to manage your skin and players"
+        }
+        .to_owned(),
+        identification_label: if chinese {
+            "邮箱或角色名"
+        } else {
+            "Email or player name"
+        }
+        .to_owned(),
+        password_label: if chinese { "密码" } else { "Password" }.to_owned(),
+        remember_label: if chinese {
+            "保持登录"
+        } else {
+            "Remember me"
+        }
+        .to_owned(),
+        submit_label: if chinese { "登录" } else { "Log In" }.to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render login page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    identification: Option<String>,
+    password: Option<String>,
+    keep: Option<bool>,
+}
+
+async fn handle_login(State(state): State<AppState>, body: Bytes) -> Response {
+    let request: LoginRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return validation_error("identification", &state.config.locale),
+    };
+    let Some(identification) = request
+        .identification
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned())
+    else {
+        return validation_error("identification", &state.config.locale);
+    };
+    let Some(password) = request.password.filter(|value| !value.is_empty()) else {
+        return validation_error("password", &state.config.locale);
+    };
+    if !(6..=32).contains(&password.chars().count()) {
+        return validation_error("password", &state.config.locale);
+    }
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let credential = if looks_like_email(&identification) {
+        database
+            .credentials_by_email(&state.config.database.table_prefix, &identification)
+            .await
+    } else {
+        database
+            .credentials_by_player_name(&state.config.database.table_prefix, &identification)
+            .await
+    };
+    let credential = match credential {
+        Ok(Some(credential)) => credential,
+        Ok(None) => {
+            let message = if state.config.locale.starts_with("zh") {
+                "用户不存在"
+            } else {
+                "No such user."
+            };
+            return login_result(2, message, None);
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to look up login account");
+            return unavailable();
+        }
+    };
+    if !crate::auth::verify_legacy_password(
+        &password,
+        &credential.password,
+        &state.config.password_method,
+        &state.config.password_salt,
+    ) {
+        let failures = {
+            let now = Instant::now();
+            let mut attempts = state
+                .login_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if attempts.len() > 4096 {
+                attempts.retain(|_, (_, updated)| {
+                    now.duration_since(*updated) < Duration::from_secs(3600)
+                });
+            }
+            let entry = attempts.entry(identification.clone()).or_insert((0, now));
+            if now.duration_since(entry.1) >= Duration::from_secs(3600) {
+                entry.0 = 0;
+            }
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = now;
+            entry.0
+        };
+        let message = if state.config.locale.starts_with("zh") {
+            "密码错误"
+        } else {
+            "Wrong password."
+        };
+        return login_result(
+            1,
+            message,
+            Some(serde_json::json!({ "login_fails": failures })),
+        );
+    }
+
+    let Some(key) = &state.session_key else {
+        tracing::error!("APP_KEY is required to create a web login session");
+        return unavailable();
+    };
+    let now = jsonwebtoken::get_current_timestamp();
+    let max_age = if request.keep.unwrap_or(false) {
+        60 * 60 * 24 * 30
+    } else {
+        60 * 60 * 12
+    };
+    let claims = crate::auth::WebSessionClaims {
+        sub: credential.uid.to_string(),
+        iat: now,
+        exp: now + max_age,
+    };
+    let session = match encode(&Header::new(Algorithm::HS256), &claims, key) {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::error!(%error, "failed to issue web login session");
+            return unavailable();
+        }
+    };
+    state
+        .login_failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&identification);
+
+    let message = if state.config.locale.starts_with("zh") {
+        "登录成功，欢迎回来"
+    } else {
+        "Logged in successfully."
+    };
+    let mut response = login_result(
+        0,
+        message,
+        Some(serde_json::json!({ "redirectTo": "/user" })),
+    );
+    let secure = if state.config.app_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+    );
+    match HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            response.headers_mut().insert(SET_COOKIE, value);
+            response
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to create web session cookie");
+            unavailable()
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "home.html")]
+struct HomePage {
+    site_name: String,
+    locale: String,
+    title: String,
+    login: String,
+}
+
+async fn home(State(state): State<AppState>) -> Response {
+    let site_name = site_name(&state).await;
+    let chinese = state.config.locale.starts_with("zh");
+    let page = HomePage {
+        site_name,
+        locale: state.config.locale.clone(),
+        title: if chinese { "皮肤站" } else { "Skin Server" }.to_owned(),
+        login: if chinese { "登录" } else { "Log in" }.to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render home page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+struct DashboardPage {
+    site_name: String,
+    user: UserProfile,
+    players: Vec<PlayerRecord>,
+    locale: String,
+}
+
+async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let user = match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(user)) if user.permission != -1 => user,
+        Ok(Some(_)) => return StatusCode::FORBIDDEN.into_response(),
+        Ok(None) => return Redirect::to("/auth/login").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to load web session user");
+            return unavailable();
+        }
+    };
+    let players = match database
+        .players_for_user(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(players) => players,
+        Err(error) => {
+            tracing::error!(%error, "failed to load web session players");
+            return unavailable();
+        }
+    };
+    let page = DashboardPage {
+        site_name: site_name(&state).await,
+        user,
+        players,
+        locale: state.config.locale.clone(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render user dashboard");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn site_name(state: &AppState) -> String {
+    match &state.database {
+        Some(database) => database
+            .option(&state.config.database.table_prefix, "site_name")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Blessing Skin".to_owned()),
+        None => "Blessing Skin".to_owned(),
+    }
+}
+
+async fn logout(State(state): State<AppState>) -> Response {
+    let mut response = login_result(
+        0,
+        if state.config.locale.starts_with("zh") {
+            "已退出登录"
+        } else {
+            "Logged out successfully."
+        },
+        None,
+    );
+    let secure = if state.config.app_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie =
+        format!("blessing_skin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}");
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+}
+
+fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+    let cookie_header = headers.get(COOKIE)?.to_str().ok()?;
+    let token = cookie_header.split(';').find_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        (name == "blessing_skin_session" && !value.is_empty()).then_some(value)
+    })?;
+    decode_web_session(token, state.config.app_key.as_deref()?)
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !value.chars().any(char::is_whitespace)
+        && !domain.contains('@')
+}
+
+fn validation_error(field: &str, locale: &str) -> Response {
+    let chinese = locale.starts_with("zh");
+    let message = if chinese {
+        "给定数据无效。"
+    } else {
+        "The given data was invalid."
+    };
+    let field_error = match (field, chinese) {
+        ("identification", true) => "此项为必填项。",
+        ("identification", false) => "The identification field is required.",
+        (_, true) => "密码为必填项且长度必须为 6 至 32 个字符。",
+        (_, false) => "The password field is required or has an invalid length.",
+    };
+    let mut errors = serde_json::Map::new();
+    errors.insert(field.to_owned(), serde_json::json!([field_error]));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "message": message, "errors": errors })),
+    )
+        .into_response()
+}
+
+fn login_result(code: i32, message: &str, data: Option<serde_json::Value>) -> Response {
+    let mut body = serde_json::json!({ "code": code, "message": message });
+    if let Some(data) = data {
+        body["data"] = data;
+    }
+    Json(body).into_response()
+}
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
@@ -553,11 +929,16 @@ mod tests {
             plugins_dir: PathBuf::new(),
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
+            password_method: "BCRYPT".to_owned(),
+            password_salt: String::new(),
+            app_key: None,
         };
         let app = router(crate::AppState {
             config: Arc::new(config),
             database: None,
             passport_key: None,
+            session_key: None,
+            login_failures: Default::default(),
         });
         let response = app
             .oneshot(
@@ -569,5 +950,175 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_issues_a_session_that_opens_the_user_dashboard() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, StatusCode, header::SET_COOKIE},
+        };
+        use bcrypt;
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::{path::PathBuf, sync::Arc};
+        use tower::ServiceExt;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE users (uid INTEGER PRIMARY KEY, email TEXT NOT NULL, nickname TEXT NOT NULL, locale TEXT, score INTEGER NOT NULL, avatar INTEGER NOT NULL, password TEXT NOT NULL, permission INTEGER NOT NULL, last_sign_at TEXT NOT NULL, register_at TEXT NOT NULL, verified BOOLEAN NOT NULL, is_dark_mode BOOLEAN NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE players (pid INTEGER PRIMARY KEY, uid INTEGER NOT NULL, name TEXT NOT NULL, tid_skin INTEGER NOT NULL, tid_cape INTEGER NOT NULL, last_modified TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let password_hash = bcrypt::hash("correct horse", 4).unwrap();
+        sqlx::query("INSERT INTO users (uid,email,nickname,locale,score,avatar,password,permission,last_sign_at,register_at,verified,is_dark_mode) VALUES (7,'alex@example.test','Alex User','en',5,0,?,0,'','',1,0)")
+            .bind(password_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO players (pid,uid,name,tid_skin,tid_cape,last_modified) VALUES (3,7,'Alex',0,0,'2026-10-02 12:00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let secret = "a test APP_KEY with enough entropy".to_owned();
+        let config = crate::config::Config {
+            bind: "127.0.0.1:3000".parse().unwrap(),
+            version: "test",
+            locale: "en".to_owned(),
+            database: crate::config::DatabaseConfig {
+                connection: crate::config::DatabaseConnection::Sqlite(
+                    sqlx::sqlite::SqliteConnectOptions::new(),
+                ),
+                table_prefix: String::new(),
+            },
+            textures_dir: PathBuf::new(),
+            plugins_dir: PathBuf::new(),
+            app_url: "http://localhost".to_owned(),
+            passport_public_key: None,
+            password_method: "BCRYPT".to_owned(),
+            password_salt: String::new(),
+            app_key: Some(secret.clone()),
+        };
+        let app = router(crate::AppState {
+            config: Arc::new(config),
+            database: Some(crate::database::DatabasePool::Sqlite(pool)),
+            passport_key: None,
+            session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
+            login_failures: Default::default(),
+        });
+        let homepage = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(homepage.status(), StatusCode::OK);
+        let homepage_html = to_bytes(homepage.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(homepage_html.to_vec())
+                .unwrap()
+                .contains("Skin Server")
+        );
+
+        let login_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_page.status(), StatusCode::OK);
+        let login_html = to_bytes(login_page.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(login_html.to_vec())
+                .unwrap()
+                .contains("Email or player name")
+        );
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"identification":"alex@example.test","password":"correct horse","keep":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(
+            login
+                .headers()
+                .get(SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=2592000")
+        );
+        let body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], 0);
+        assert_eq!(result["data"]["redirectTo"], "/user");
+
+        let dashboard = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::OK);
+        let dashboard_html = to_bytes(dashboard.into_body(), usize::MAX).await.unwrap();
+        let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
+        assert!(dashboard_html.contains("alex@example.test"));
+        assert!(dashboard_html.contains("Alex"));
+
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(
+            logout
+                .headers()
+                .get(SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
     }
 }

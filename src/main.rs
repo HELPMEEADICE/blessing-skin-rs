@@ -3,11 +3,16 @@ mod config;
 mod database;
 mod http;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use config::Config;
 use database::DatabasePool;
-use jsonwebtoken::DecodingKey;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +21,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub database: Option<DatabasePool>,
     pub passport_key: Option<DecodingKey>,
+    pub session_key: Option<EncodingKey>,
+    pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
 
 #[tokio::main]
@@ -36,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let session_key = config
+        .app_key
+        .as_deref()
+        .map(|key| EncodingKey::from_secret(key.as_bytes()));
     let address: SocketAddr = config.bind;
     let passport_key = config.passport_public_key.as_deref().and_then(|key| {
         match DecodingKey::from_rsa_pem(key) {
@@ -50,6 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         database,
         passport_key,
+        session_key,
+        login_failures: Arc::new(Mutex::new(HashMap::new())),
     });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");

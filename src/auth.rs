@@ -3,10 +3,17 @@ use argon2::{Algorithm as ArgonAlgorithm, Argon2, Params, PasswordVerifier, Vers
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use md5::{Digest, Md5};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Sha256, Sha512};
 use subtle::ConstantTimeEq;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebSessionClaims {
+    pub sub: String,
+    pub iat: u64,
+    pub exp: u64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct PassportClaims {
@@ -36,6 +43,18 @@ pub fn decode_access_token(token: &str, key: &DecodingKey) -> Option<PassportCla
     decode::<PassportClaims>(token, key, &validation)
         .ok()
         .map(|data| data.claims)
+}
+
+pub fn decode_web_session(token: &str, secret: &str) -> Option<i64> {
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_aud = false;
+    decode::<WebSessionClaims>(token, &key, &validation)
+        .ok()?
+        .claims
+        .sub
+        .parse()
+        .ok()
 }
 
 pub fn has_scope(claims: &PassportClaims, required: &str) -> bool {
