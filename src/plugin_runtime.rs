@@ -34,6 +34,11 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "player.added",
     "player.renamed",
     "player.deleted",
+    "texture.uploaded",
+    "texture.renamed",
+    "texture.deleted",
+    "texture.visibility.updated",
+    "texture.type.updated",
 ];
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 

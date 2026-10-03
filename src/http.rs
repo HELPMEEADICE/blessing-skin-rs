@@ -8837,6 +8837,12 @@ async fn upload_texture(
         .await
     {
         Ok(crate::database::TextureUploadOutcome::Uploaded(tid)) => {
+            emit_plugin_event(
+                &state,
+                "texture.uploaded",
+                serde_json::json!({"user_id": reporter.uid, "texture_id": tid, "hash": hash, "name": name, "type": texture_type, "public": is_public}),
+            )
+            .await;
             let message = if state.config.locale.starts_with("zh") {
                 format!("材质 {name} 上传成功")
             } else {
@@ -9067,7 +9073,7 @@ async fn rename_texture(
     RoutePath(tid_path): RoutePath<String>,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
-    let (tid, _texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
+    let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
         Ok(context) => context,
         Err(response) => return response,
     };
@@ -9107,6 +9113,12 @@ async fn rename_texture(
         tracing::error!(%error, tid, "failed to rename texture");
         return unavailable();
     }
+    emit_plugin_event(
+        &state,
+        "texture.renamed",
+        serde_json::json!({"texture_id": tid, "previous_name": texture.name, "name": name}),
+    )
+    .await;
     let message = if state.config.locale.starts_with("zh") {
         format!("材质名称已被成功设置为 {name}")
     } else {
@@ -9268,6 +9280,12 @@ async fn delete_texture(
             }
         }
     }
+    emit_plugin_event(
+        &state,
+        "texture.deleted",
+        serde_json::json!({"texture_id": tid, "uploader_id": texture.uploader, "hash": texture.hash, "name": texture.name}),
+    )
+    .await;
     login_result(
         0,
         if state.config.locale.starts_with("zh") {
@@ -9389,6 +9407,12 @@ async fn toggle_texture_privacy(
         .await
     {
         Ok(crate::database::TexturePrivacyOutcome::Updated { is_public }) => {
+            emit_plugin_event(
+                &state,
+                "texture.visibility.updated",
+                serde_json::json!({"texture_id": tid, "public": is_public}),
+            )
+            .await;
             let privacy = if state.config.locale.starts_with("zh") {
                 if is_public { "公开" } else { "私密" }
             } else if is_public {
@@ -9437,7 +9461,7 @@ async fn update_texture_type(
     RoutePath(tid_path): RoutePath<String>,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
-    let (tid, _texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
+    let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
         Ok(context) => context,
         Err(response) => return response,
     };
@@ -9457,6 +9481,12 @@ async fn update_texture_type(
         tracing::error!(%error, tid, "failed to update texture type");
         return unavailable();
     }
+    emit_plugin_event(
+        &state,
+        "texture.type.updated",
+        serde_json::json!({"texture_id": tid, "previous_type": texture.texture_type, "type": texture_type}),
+    )
+    .await;
     let message = if state.config.locale.starts_with("zh") {
         format!("材质的适用模型已被修改为 {texture_type}")
     } else {
