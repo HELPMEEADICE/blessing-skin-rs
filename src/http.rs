@@ -4784,6 +4784,12 @@ async fn web_rename_player(
             previous_name,
             player,
         }) => {
+            emit_plugin_event(
+                &state,
+                "player.renamed",
+                serde_json::json!({"user_id": user.uid, "player_id": player_id, "previous_name": previous_name, "name": name}),
+            )
+            .await;
             let message = if state.config.locale.starts_with("zh") {
                 format!("角色名已从 {previous_name} 更新为 {name}")
             } else {
@@ -5334,6 +5340,12 @@ async fn user_profile_update(
                 tracing::error!(%error, user_id = user.uid, "failed to update user nickname");
                 return unavailable();
             }
+            emit_plugin_event(
+                &state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": user.uid, "action": "nickname"}),
+            )
+            .await;
             let message = if chinese {
                 format!("昵称已成功设置为 {nickname}")
             } else {
@@ -5403,6 +5415,12 @@ async fn user_profile_update(
                 tracing::error!(%error, user_id = user.uid, "failed to update user password");
                 return unavailable();
             }
+            emit_plugin_event(
+                &state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": user.uid, "action": "password"}),
+            )
+            .await;
             let response = login_result(
                 0,
                 if chinese {
@@ -5478,6 +5496,12 @@ async fn user_profile_update(
                 tracing::error!(%error, user_id = user.uid, "failed to update user email");
                 return unavailable();
             }
+            emit_plugin_event(
+                &state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": user.uid, "action": "email"}),
+            )
+            .await;
             let response = login_result(
                 0,
                 if chinese {
@@ -5534,6 +5558,12 @@ async fn user_profile_update(
             }
             match database.delete_user(prefix, user.uid).await {
                 Ok(true) => {
+                    emit_plugin_event(
+                        &state,
+                        "user.deleted",
+                        serde_json::json!({"user_id": user.uid}),
+                    )
+                    .await;
                     let response = login_result(
                         0,
                         if chinese {
@@ -5628,6 +5658,12 @@ async fn user_set_avatar(
         tracing::error!(%error, user_id = user.uid, tid, "failed to update user avatar");
         return unavailable();
     }
+    emit_plugin_event(
+        &state,
+        "user.avatar.updated",
+        serde_json::json!({"user_id": user.uid, "texture_id": tid}),
+    )
+    .await;
     login_result(
         0,
         if state.config.locale.starts_with("zh") {
@@ -7242,6 +7278,12 @@ async fn api_rename_player(
             previous_name,
             player,
         }) => {
+            emit_plugin_event(
+                &state,
+                "player.renamed",
+                serde_json::json!({"user_id": identity.user_id, "player_id": player_id, "previous_name": previous_name, "name": name}),
+            )
+            .await;
             let message = if state.config.locale.starts_with("zh") {
                 format!("角色名已从 {previous_name} 更新为 {name}")
             } else {

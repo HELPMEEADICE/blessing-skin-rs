@@ -28,7 +28,11 @@ const PLUGIN_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.logged-in",
     "user.registered",
+    "user.profile.updated",
+    "user.avatar.updated",
+    "user.deleted",
     "player.added",
+    "player.renamed",
     "player.deleted",
 ];
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
@@ -632,6 +636,20 @@ mod tests {
     #[test]
     fn plugin_events_are_allowlisted_bounded_json_objects() {
         assert!(validate_plugin_event("user.logged-in", br#"{"user_id":7}"#).is_ok());
+        assert!(
+            validate_plugin_event(
+                "user.profile.updated",
+                br#"{"user_id":7,"action":"nickname"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "player.renamed",
+                br#"{"user_id":7,"player_id":3,"previous_name":"Alex","name":"Steve"}"#
+            )
+            .is_ok()
+        );
         assert!(validate_plugin_event("unsupported", b"{}").is_err());
         assert!(validate_plugin_event("player.added", b"[]").is_err());
         assert!(validate_plugin_event("player.deleted", b"not json").is_err());
