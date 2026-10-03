@@ -389,16 +389,28 @@ async fn persist_plugin_state(
     table_prefix: &str,
     plugin: &LoadedPlugin,
 ) -> Result<(), Box<dyn Error>> {
-    let mut entries: Vec<_> = plugin
-        .store
-        .data()
-        .state
+    checkpoint_plugin_state(
+        database,
+        table_prefix,
+        &plugin.store.data().name,
+        &plugin.store.data().state,
+    )
+    .await
+}
+
+async fn checkpoint_plugin_state(
+    database: &DatabasePool,
+    table_prefix: &str,
+    plugin_name: &str,
+    state: &HashMap<String, Vec<u8>>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries: Vec<_> = state
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     database
-        .replace_wasm_plugin_state(table_prefix, &plugin.store.data().name, &entries)
+        .replace_wasm_plugin_state(table_prefix, plugin_name, &entries)
         .await?;
     Ok(())
 }
@@ -477,8 +489,8 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 mod tests {
     use super::{
         PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore,
-        StoreLimitsBuilder, log_plugin_message, plugin_state_delete, plugin_state_get,
-        plugin_state_set, validated_plugin_state,
+        StoreLimitsBuilder, checkpoint_plugin_state, log_plugin_message, plugin_state_delete,
+        plugin_state_get, plugin_state_set, validated_plugin_state,
     };
     use std::{
         collections::HashMap,
@@ -517,6 +529,57 @@ mod tests {
         assert!(
             log_plugin_message("fixture", "info", &"x".repeat(PLUGIN_LOG_MESSAGE_LIMIT + 1))
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_state_checkpoint_restores_the_bounded_guest_store() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let database = crate::database::DatabasePool::Sqlite(pool);
+        database
+            .ensure_wasm_plugin_state_schema("bs_")
+            .await
+            .unwrap();
+
+        let mut guest_store = PluginStore {
+            name: "checkpoint-fixture".to_owned(),
+            limits: StoreLimitsBuilder::new().build(),
+            state: HashMap::new(),
+        };
+        plugin_state_set(
+            &mut guest_store,
+            "binary-value".to_owned(),
+            vec![0, 127, 128, 255],
+        )
+        .unwrap();
+        checkpoint_plugin_state(&database, "bs_", &guest_store.name, &guest_store.state)
+            .await
+            .unwrap();
+
+        let restored = validated_plugin_state(
+            database
+                .wasm_plugin_state_entries("bs_", "checkpoint-fixture")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_state_get(
+                &PluginStore {
+                    name: "checkpoint-fixture".to_owned(),
+                    limits: StoreLimitsBuilder::new().build(),
+                    state: restored,
+                },
+                "binary-value",
+            )
+            .unwrap(),
+            Some(vec![0, 127, 128, 255])
         );
     }
 
