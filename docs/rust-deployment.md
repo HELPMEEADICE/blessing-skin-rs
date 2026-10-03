@@ -132,7 +132,7 @@ server {
 
 1. 备份数据库和完整纹理目录，记录备份时间、文件数量及纹理哈希清单。先在隔离副本上验证，不直接对唯一生产数据做试运行。
 2. 为 Rust 配置与旧站相同的 `DB_CONNECTION`、`DB_PREFIX`、`DB_SOCKET`（如有）、`TEXTURES_DIR`、`PWD_METHOD`、`SALT`、Passport 公私钥及 `APP_URL`。不要运行新站安装器，也不要更换 Passport 密钥。
-3. 用 PHP 生成并保存代表性请求样本：Yggdrasil/CustomSkin、OAuth、用户与管理接口、纹理读取/上传、图片预览和页面请求。记录状态码、内容类型、JSON 字段与错误体、ETag/缓存头及可稳定比较的响应内容。
+3. 用 PHP 生成并保存代表性请求样本：Yggdrasil/CustomSkin、OAuth、用户与管理接口、纹理读取、图片预览和页面请求。记录状态码、内容类型、JSON 字段与错误体、ETag/缓存头及可稳定比较的响应内容；影子比较器仅重放无 session 和文件缓存副作用的只读白名单，上传、预览缓存及网页登录页面需在隔离副本中另行验证。
 4. 检查所需插件是否已有 WASM 移植版本。Rust 不执行 PHP 插件；未移植插件的功能必须在切换前安排替代或接受停用。
 
 ### 只读影子比对（至少 24 小时）
@@ -140,6 +140,17 @@ server {
 - 只对明确列入只读白名单的请求做影子调用。认证挑战、OAuth 授权/令牌、任何写请求，以及可能更新 session、计数或状态的路由不得复制。
 - 影子请求发到隔离的数据副本或只读凭据；不把 Rust 响应返回给访客，也不向 Rust 镜像写请求。比较 PHP 与 Rust 的状态码、内容类型、协议字段、错误语义、ETag/缓存头和纹理哈希。忽略预先标记的动态值（例如时间戳和随机 ID），但不能忽略业务字段差异。
 - 记录每个样本的结果、差异和 Rust/PHP 错误率基线。存在未解释的数据或响应差异时，修复并重新开始本阶段的 24 小时观察。
+维护者可使用仓库内的只读探针比较器重放这些 GET 样本。它只接受显式白名单路由，拒绝 session、认证挑战、安装和写入路由，也不跟随重定向；头像/预览缓存等可能写文件的路由需在隔离副本上单独验证。比较器要求 Python 3.10+ 标准库：
+
+```sh
+export BS_SHADOW_OAUTH_TOKEN='只读 User.Read 测试令牌'
+python3 tools/compat_compare.py \
+  --php-url http://127.0.0.1:8080 \
+  --rust-url http://127.0.0.1:3000 \
+  --fixtures docs/compat-shadow.example.json
+```
+
+可在本机复制并修改 [示例探针](compat-shadow.example.json)，令牌应从环境变量传入，不要写入 fixture。动态 JSON 字段可用 `ignore_json_pointers` 标注；响应体中的其他字段、状态码和缓存相关头仍会比较。工具只打印差异类别、JSON 字段路径或非 JSON 响应的 SHA-256，不打印响应内容。
 
 ### 单业务域灰度（每个域至少 24 小时）
 

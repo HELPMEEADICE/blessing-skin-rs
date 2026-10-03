@@ -27,3 +27,7 @@ storage/options.php
 resources/views/overrides
 .DS_Store
 */.DS_Store
+
+# Python tooling
+__pycache__/
+*.py[cod]

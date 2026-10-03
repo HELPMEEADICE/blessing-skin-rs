@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "requests": [
+    {
+      "name": "API root",
+      "path": "/api/",
+      "headers": {
+        "Accept": "application/json"
+      }
+    },
+    {
+      "name": "OAuth user profile",
+      "path": "/api/user",
+      "headers": {
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_OAUTH_TOKEN}"
+      }
+    },
+    {
+      "name": "Yggdrasil player profile (replace with a fixture player)",
+      "path": "/ExamplePlayer.json",
+      "headers": {
+        "Accept": "application/json"
+      }
+    }
+  ]
+}

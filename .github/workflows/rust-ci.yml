@@ -10,6 +10,17 @@ permissions:
   contents: read
 
 jobs:
+  compat-probe:
+    name: Read-only compatibility probe tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test safe request allowlist and response comparison
+        run: python -m unittest tools.test_compat_compare
+
   build:
     name: ${{ matrix.name }}
     strategy:
