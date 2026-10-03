@@ -2611,6 +2611,9 @@ struct SetupDatabasePage {
     prefix: String,
     error: String,
     saved: bool,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -2632,6 +2635,12 @@ struct SetupFinishPage {
 #[template(path = "setup_locked.html")]
 struct SetupLockedPage {
     locale: String,
+}
+
+struct SetupPageAssets {
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Deserialize)]
@@ -5921,23 +5930,19 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
         );
     }
     let version = state.config.version.to_owned();
-    let app_dir = state.public_dir.join("app");
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
-    let frontend_globals_b64 = encode_frontend_globals(
+    let assets = setup_page_assets(
         &state,
-        "Blessing Skin",
         "setup",
         serde_json::json!({ "setup_welcome": { "version": &version } }),
-        i18n,
-    );
+    )
+    .await;
     render_setup_page(
         &SetupWelcomePage {
             locale: state.config.locale.clone(),
             version,
-            frontend_script_available: frontend_script.is_some(),
-            frontend_script: frontend_script.unwrap_or_default(),
-            frontend_globals_b64,
+            frontend_script_available: assets.frontend_script_available,
+            frontend_script: assets.frontend_script,
+            frontend_globals_b64: assets.frontend_globals_b64,
         },
         &headers,
         None,
@@ -5978,6 +5983,18 @@ async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) 
         ),
     };
     let csrf = setup_csrf_for_page(&headers);
+    let extra = setup_database_extra(
+        &csrf,
+        driver,
+        &host,
+        &port,
+        &username,
+        &config.database,
+        &config.table_prefix,
+        "",
+        false,
+    );
+    let assets = setup_page_assets(&state, "setup/database", extra).await;
     render_setup_page(
         &SetupDatabasePage {
             locale: state.config.locale.clone(),
@@ -5990,6 +6007,9 @@ async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) 
             prefix: config.table_prefix.clone(),
             error: String::new(),
             saved: false,
+            frontend_script_available: assets.frontend_script_available,
+            frontend_script: assets.frontend_script,
+            frontend_globals_b64: assets.frontend_globals_b64,
         },
         &headers,
         Some(&csrf),
@@ -6021,7 +6041,8 @@ async fn setup_database_save(
                 "安装表单已过期，请刷新页面后重试。",
             ),
             StatusCode::FORBIDDEN,
-        );
+        )
+        .await;
     }
     let database = match crate::config::DatabaseConfig::from_setup(
         &form.driver,
@@ -6040,7 +6061,8 @@ async fn setup_database_save(
                 "请检查数据库类型、必填字段、端口和表前缀。 ",
             );
             tracing::warn!(%error, "invalid database setup form");
-            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_REQUEST);
+            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_REQUEST)
+                .await;
         }
     };
     if matches!(
@@ -6062,7 +6084,8 @@ async fn setup_database_save(
                 "无法准备 SQLite 数据库路径。",
             ),
             StatusCode::BAD_REQUEST,
-        );
+        )
+        .await;
     }
     let pool = match DatabasePool::connect_for_install(&database).await {
         Ok(pool) => pool,
@@ -6073,7 +6096,8 @@ async fn setup_database_save(
                 &format!("Could not connect to the database: {error}"),
                 &format!("无法连接数据库：{error}"),
             );
-            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY);
+            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY)
+                .await;
         }
     };
     if let Err(error) = pool.ping().await {
@@ -6083,7 +6107,8 @@ async fn setup_database_save(
             &format!("Could not use the database: {error}"),
             &format!("无法使用该数据库：{error}"),
         );
-        return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY);
+        return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY)
+            .await;
     }
     drop(pool);
     let env_file = state.env_file.clone();
@@ -6101,6 +6126,18 @@ async fn setup_database_save(
     match saved {
         Ok(Ok(())) => {
             let csrf = setup_csrf_for_page(&headers);
+            let extra = setup_database_extra(
+                &csrf,
+                &form.driver,
+                &form.host,
+                &form.port,
+                &form.username,
+                &form.database,
+                &form.prefix,
+                "",
+                true,
+            );
+            let assets = setup_page_assets(&state, "setup/database", extra).await;
             render_setup_page(
                 &SetupDatabasePage {
                     locale: state.config.locale.clone(),
@@ -6113,6 +6150,9 @@ async fn setup_database_save(
                     prefix: form.prefix,
                     error: String::new(),
                     saved: true,
+                    frontend_script_available: assets.frontend_script_available,
+                    frontend_script: assets.frontend_script,
+                    frontend_globals_b64: assets.frontend_globals_b64,
                 },
                 &headers,
                 Some(&csrf),
@@ -6131,6 +6171,7 @@ async fn setup_database_save(
                 ),
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
+            .await
         }
         Err(error) => {
             tracing::error!(%error, "database setup file operation failed");
@@ -6145,6 +6186,7 @@ async fn setup_database_save(
                 ),
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
+            .await
         }
     }
 }
@@ -6316,7 +6358,7 @@ async fn setup_finish(
     }
 }
 
-fn setup_database_error(
+async fn setup_database_error(
     state: &AppState,
     headers: &HeaderMap,
     form: &SetupDatabaseRequest,
@@ -6324,6 +6366,18 @@ fn setup_database_error(
     status: StatusCode,
 ) -> Response {
     let csrf = setup_csrf_for_page(&headers);
+    let extra = setup_database_extra(
+        &csrf,
+        &form.driver,
+        &form.host,
+        &form.port,
+        &form.username,
+        &form.database,
+        &form.prefix,
+        &error,
+        false,
+    );
+    let assets = setup_page_assets(state, "setup/database", extra).await;
     let mut response = render_setup_page(
         &SetupDatabasePage {
             locale: state.config.locale.clone(),
@@ -6336,6 +6390,9 @@ fn setup_database_error(
             prefix: form.prefix.clone(),
             error,
             saved: false,
+            frontend_script_available: assets.frontend_script_available,
+            frontend_script: assets.frontend_script,
+            frontend_globals_b64: assets.frontend_globals_b64,
         },
         headers,
         Some(&csrf),
@@ -6376,6 +6433,48 @@ fn setup_message(state: &AppState, english: &str, chinese: &str) -> String {
     } else {
         english.to_owned()
     }
+}
+
+async fn setup_page_assets(
+    state: &AppState,
+    route: &str,
+    extra: serde_json::Value,
+) -> SetupPageAssets {
+    let app_dir = state.public_dir.join("app");
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(state, "Blessing Skin", route, extra, i18n);
+    SetupPageAssets {
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
+    }
+}
+
+fn setup_database_extra(
+    csrf: &str,
+    driver: &str,
+    host: &str,
+    port: &str,
+    username: &str,
+    database: &str,
+    prefix: &str,
+    error: &str,
+    saved: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setup_database": {
+            "csrf": csrf,
+            "driver": driver,
+            "host": host,
+            "port": port,
+            "username": username,
+            "database": database,
+            "prefix": prefix,
+            "error": error,
+            "saved": saved,
+        }
+    })
 }
 
 fn setup_csrf_token() -> String {
@@ -13334,6 +13433,36 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+        let database_page_html = String::from_utf8(
+            to_bytes(database_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(database_page_html.contains("id=\"setup-database-app\""));
+        assert!(database_page_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_database_globals = database_page_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let database_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_database_globals)
+            .unwrap();
+        let database_globals: serde_json::Value =
+            serde_json::from_slice(&database_globals_bytes).unwrap();
+        assert_eq!(database_globals["route"], "setup/database");
+        assert_eq!(
+            database_globals["extra"]["setup_database"]["driver"],
+            "sqlite"
+        );
+        assert_eq!(
+            database_globals["extra"]["setup_database"]["csrf"],
+            setup_cookie.split_once('=').unwrap().1
+        );
         let second_database_page = app
             .clone()
             .oneshot(
