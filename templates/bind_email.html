@@ -6,9 +6,19 @@
   <title>{% if locale.starts_with("zh") %}绑定邮箱{% else %}Bind email{% endif %} · {{ site_name }}</title>
   <style>
     body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40;min-height:100vh;display:grid;place-items:center}main{box-sizing:border-box;width:min(440px,calc(100% - 2rem));padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}h1{font-size:1.55rem;margin:.2rem 0}.muted{color:#667085}label{display:block;font-weight:600;margin:.8rem 0 .4rem}input{box-sizing:border-box;width:100%;padding:.7rem;border:1px solid #c9ced6;border-radius:4px;font:inherit}button{width:100%;margin-top:1rem;padding:.75rem;border:0;border-radius:4px;background:#007bff;color:#fff;font:inherit;cursor:pointer}#error{min-height:1.4rem;color:#b42318}
+    .site-intro{box-sizing:border-box;width:min(440px,calc(100% - 2rem));padding:0 2rem}
+    .site-intro h1{font-size:1.55rem;margin:.2rem 0}
+    .site-intro p{color:#667085}
   </style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
+  {% if frontend_script_available %}
+  <header class="site-intro"><h1>{% if locale.starts_with("zh") %}绑定邮箱{% else %}Bind your email{% endif %}</h1><p>{% if locale.starts_with("zh") %}请先为账户绑定邮箱，然后继续使用本站。{% else %}Add an email address to your account before continuing.{% endif %}</p></header>
+  <main><p class="muted" role="status">{% if locale.starts_with("zh") %}正在加载邮箱绑定表单…{% else %}Loading email binding form…{% endif %}</p></main>
+  {% else %}
   <main>
     <h1>{% if locale.starts_with("zh") %}绑定邮箱{% else %}Bind your email{% endif %}</h1>
     <p class="muted">{% if locale.starts_with("zh") %}请先为账户绑定邮箱，然后继续使用本站。{% else %}Add an email address to your account before continuing.{% endif %}</p>
@@ -44,5 +54,7 @@
       button.disabled = false;
     });
   </script>
+  {% endif %}
+  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>

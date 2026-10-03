@@ -120,6 +120,11 @@ const routes: Route[] = [
     el: '#login-app',
   },
   {
+    path: 'auth/bind',
+    react: () => import('../views/auth/BindEmail'),
+    el: 'main',
+  },
+  {
     path: 'auth/register',
     react: () => import('../views/auth/Registration'),
     el: 'main',
