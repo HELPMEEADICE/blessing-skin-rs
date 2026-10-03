@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.5.0";
+const HOST_API_VERSION: &str = "1.6.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -38,6 +38,9 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.verification.updated",
     "user.permission.updated",
     "user.score.updated",
+    "closet.added",
+    "closet.renamed",
+    "closet.removed",
     "player.added",
     "player.renamed",
     "player.deleted",
@@ -950,6 +953,23 @@ mod tests {
                 br#"{"report_id":9,"admin_user_id":1,"action":"reject","status":2}"#
             )
             .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "closet.added",
+                br#"{"user_id":7,"texture_id":11,"item_name":"Favorite"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "closet.renamed",
+                br#"{"user_id":7,"texture_id":11,"item_name":"New name"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event("closet.removed", br#"{"user_id":7,"texture_id":11}"#).is_ok()
         );
         assert!(validate_plugin_event("unsupported", b"{}").is_err());
         assert!(validate_plugin_event("player.added", b"[]").is_err());

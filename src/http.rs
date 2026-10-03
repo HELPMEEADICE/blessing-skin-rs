@@ -5562,7 +5562,7 @@ fn admin_plugin_record(
         "name": name,
         "title": name,
         "description": description,
-        "version": "WASM host API 1.5.0",
+        "version": "WASM host API 1.6.0",
         "enabled": enabled,
         "loaded": loaded,
         "on_disk": on_disk,
@@ -6705,15 +6705,27 @@ async fn web_add_closet_item(
         )
         .await
     {
-        Ok(crate::database::ClosetAddOutcome::Added) => login_result(
-            0,
-            &if request_locale(&state).starts_with("zh") {
-                format!("材质 {name} 收藏成功")
-            } else {
-                format!("Added {name} to closet successfully.")
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetAddOutcome::Added) => {
+            emit_plugin_event(
+                &state,
+                "closet.added",
+                serde_json::json!({
+                    "user_id": user.uid,
+                    "texture_id": tid,
+                    "item_name": name,
+                }),
+            )
+            .await;
+            login_result(
+                0,
+                &if request_locale(&state).starts_with("zh") {
+                    format!("材质 {name} 收藏成功")
+                } else {
+                    format!("Added {name} to closet successfully.")
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
             1,
             if request_locale(&state).starts_with("zh") {
@@ -6789,15 +6801,27 @@ async fn web_rename_closet_item(
         .rename_closet_item(&state.config.database.table_prefix, user.uid, tid, name)
         .await
     {
-        Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
-            0,
-            &if request_locale(&state).starts_with("zh") {
-                format!("衣柜物品成功重命名至 {name}")
-            } else {
-                format!("The item is successfully renamed to {name}")
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetRenameOutcome::Renamed) => {
+            emit_plugin_event(
+                &state,
+                "closet.renamed",
+                serde_json::json!({
+                    "user_id": user.uid,
+                    "texture_id": tid,
+                    "item_name": name,
+                }),
+            )
+            .await;
+            login_result(
+                0,
+                &if request_locale(&state).starts_with("zh") {
+                    format!("衣柜物品成功重命名至 {name}")
+                } else {
+                    format!("The item is successfully renamed to {name}")
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetRenameOutcome::NotInCloset) => closet_item_missing(&state),
         Err(error) => {
             tracing::error!(%error, user_id=user.uid, tid, "failed to rename web closet item");
@@ -6855,15 +6879,23 @@ async fn web_remove_closet_item(
         .remove_closet_item(prefix, user.uid, tid, refund, score_refund, like_award)
         .await
     {
-        Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
-            0,
-            if request_locale(&state).starts_with("zh") {
-                "材质已从衣柜中移除"
-            } else {
-                "The texture was removed from closet successfully."
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetRemoveOutcome::Removed) => {
+            emit_plugin_event(
+                &state,
+                "closet.removed",
+                serde_json::json!({"user_id": user.uid, "texture_id": tid}),
+            )
+            .await;
+            login_result(
+                0,
+                if request_locale(&state).starts_with("zh") {
+                    "材质已从衣柜中移除"
+                } else {
+                    "The texture was removed from closet successfully."
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetRemoveOutcome::NotInCloset) => closet_item_missing(&state),
         Err(error) => {
             tracing::error!(%error, user_id=user.uid, tid, "failed to remove web closet item");
@@ -9468,15 +9500,27 @@ async fn api_add_closet_item(
         )
         .await
     {
-        Ok(crate::database::ClosetAddOutcome::Added) => login_result(
-            0,
-            &if request_locale(&state).starts_with("zh") {
-                format!("材质 {name} 收藏成功")
-            } else {
-                format!("Added {name} to closet successfully.")
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetAddOutcome::Added) => {
+            emit_plugin_event(
+                &state,
+                "closet.added",
+                serde_json::json!({
+                    "user_id": identity.user_id,
+                    "texture_id": tid,
+                    "item_name": name,
+                }),
+            )
+            .await;
+            login_result(
+                0,
+                &if request_locale(&state).starts_with("zh") {
+                    format!("材质 {name} 收藏成功")
+                } else {
+                    format!("Added {name} to closet successfully.")
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
             1,
             if request_locale(&state).starts_with("zh") {
@@ -9559,15 +9603,27 @@ async fn api_rename_closet_item(
         )
         .await
     {
-        Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
-            0,
-            &if request_locale(&state).starts_with("zh") {
-                format!("衣柜物品成功重命名至 {name}")
-            } else {
-                format!("The item is successfully renamed to {name}")
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetRenameOutcome::Renamed) => {
+            emit_plugin_event(
+                &state,
+                "closet.renamed",
+                serde_json::json!({
+                    "user_id": identity.user_id,
+                    "texture_id": tid,
+                    "item_name": name,
+                }),
+            )
+            .await;
+            login_result(
+                0,
+                &if request_locale(&state).starts_with("zh") {
+                    format!("衣柜物品成功重命名至 {name}")
+                } else {
+                    format!("The item is successfully renamed to {name}")
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetRenameOutcome::NotInCloset) => closet_item_missing(&state),
         Err(error) => {
             tracing::error!(%error, "failed to rename a closet item");
@@ -9635,15 +9691,23 @@ async fn api_remove_closet_item(
         )
         .await
     {
-        Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
-            0,
-            if request_locale(&state).starts_with("zh") {
-                "材质已从衣柜中移除"
-            } else {
-                "The texture was removed from closet successfully."
-            },
-            None,
-        ),
+        Ok(crate::database::ClosetRemoveOutcome::Removed) => {
+            emit_plugin_event(
+                &state,
+                "closet.removed",
+                serde_json::json!({"user_id": identity.user_id, "texture_id": tid}),
+            )
+            .await;
+            login_result(
+                0,
+                if request_locale(&state).starts_with("zh") {
+                    "材质已从衣柜中移除"
+                } else {
+                    "The texture was removed from closet successfully."
+                },
+                None,
+            )
+        }
         Ok(crate::database::ClosetRemoveOutcome::NotInCloset) => closet_item_missing(&state),
         Err(error) => {
             tracing::error!(%error, "failed to remove a texture from the closet");
@@ -12816,6 +12880,12 @@ async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: 
                 login_result(1, message, None)
             }
             Ok(crate::database::AdminClosetRemoveOutcome::Removed) => {
+                emit_plugin_event(
+                    state,
+                    "closet.removed",
+                    serde_json::json!({"user_id": uid, "texture_id": tid}),
+                )
+                .await;
                 let texture = match database
                     .texture_info(&state.config.database.table_prefix, tid)
                     .await
@@ -12870,6 +12940,16 @@ async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: 
                         return unavailable();
                     }
                 };
+                emit_plugin_event(
+                    state,
+                    "closet.added",
+                    serde_json::json!({
+                        "user_id": uid,
+                        "texture_id": tid,
+                        "item_name": texture.name.clone(),
+                    }),
+                )
+                .await;
                 let texture_json = texture_info_json(texture);
                 login_result(
                     0,
