@@ -1976,6 +1976,48 @@ mod integration_tests {
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
 
+        // Model a Laravel Passport RS256 access token already persisted by the PHP service.
+        let legacy_token_id = "a36f0be8-6a74-4cf0-94ad-0378c4831111";
+        let legacy_now = unix_now();
+        let legacy_claims = serde_json::json!({
+            "aud": "2",
+            "exp": legacy_now + 300,
+            "iat": legacy_now.saturating_sub(30),
+            "jti": legacy_token_id,
+            "nbf": legacy_now.saturating_sub(30),
+            "scopes": ["User.Read"],
+            "sub": "7",
+        });
+        let legacy_access_token = encode(
+            &Header::new(Algorithm::RS256),
+            &legacy_claims,
+            &EncodingKey::from_rsa_pem(private_key).unwrap(),
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO oauth_access_tokens (id,user_id,client_id,name,scopes,revoked) VALUES (?,7,2,'PHP Passport token','[\"User.Read\"]',FALSE)")
+            .bind(legacy_token_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy_response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/user")
+                    .header("authorization", format!("Bearer {legacy_access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+        let legacy_user: Value = response_json(legacy_response).await;
+        assert_eq!(legacy_user["uid"], 7);
+        sqlx::query("DELETE FROM oauth_access_tokens WHERE id = ?")
+            .bind(legacy_token_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let password_body = form(&[
             ("grant_type", "password"),
             ("client_id", "2"),
