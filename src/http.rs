@@ -2358,19 +2358,26 @@ async fn handle_register(
             return registration_validation_error("email", "required", &request_locale(&state));
         }
     };
+    let body_locale = request
+        .get("lang")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_locale);
+    let locale = body_locale
+        .map(str::to_owned)
+        .unwrap_or_else(|| request_locale(&state));
     let Some(email) = request
         .get("email")
         .and_then(serde_json::Value::as_str)
         .filter(|email| valid_email_address(email) && email.len() <= 100)
     else {
-        return registration_validation_error("email", "email", &request_locale(&state));
+        return registration_validation_error("email", "email", &locale);
     };
     let Some(password) = request
         .get("password")
         .and_then(serde_json::Value::as_str)
         .filter(|password| (8..=32).contains(&password.chars().count()))
     else {
-        return registration_validation_error("password", "length", &request_locale(&state));
+        return registration_validation_error("password", "length", &locale);
     };
     let Some(captcha) = request
         .get("captcha")
@@ -2378,12 +2385,12 @@ async fn handle_register(
         .and_then(serde_json::Value::as_str)
         .filter(|captcha| !captcha.trim().is_empty())
     else {
-        return registration_validation_error("captcha", "required", &request_locale(&state));
+        return registration_validation_error("captcha", "required", &locale);
     };
     match verify_registration_captcha(&state, &headers, captcha).await {
         Ok(true) => {}
         Ok(false) => {
-            return registration_validation_error("captcha", "invalid", &request_locale(&state));
+            return registration_validation_error("captcha", "invalid", &locale);
         }
         Err(response) => return response,
     }
@@ -2407,11 +2414,7 @@ async fn handle_register(
             .and_then(serde_json::Value::as_str)
             .filter(|name| !name.is_empty())
         else {
-            return registration_validation_error(
-                "player_name",
-                "required",
-                &request_locale(&state),
-            );
+            return registration_validation_error("player_name", "required", &locale);
         };
         let rule = match database.option(prefix, "player_name_rule").await {
             Ok(value) => value.unwrap_or_else(|| "official".to_owned()),
@@ -2446,7 +2449,7 @@ async fn handle_register(
             }
         };
         if !valid_player_name(name, &rule, &custom_rule, min_length, max_length) {
-            return registration_validation_error("player_name", "format", &request_locale(&state));
+            return registration_validation_error("player_name", "format", &locale);
         }
         player_name = Some(name);
         name
@@ -2456,7 +2459,7 @@ async fn handle_register(
             .and_then(serde_json::Value::as_str)
             .filter(|nickname| !nickname.is_empty() && nickname.chars().count() <= 255)
         else {
-            return registration_validation_error("nickname", "required", &request_locale(&state));
+            return registration_validation_error("nickname", "required", &locale);
         };
         nickname
     };
@@ -2508,11 +2511,11 @@ async fn handle_register(
         .await
     {
         Ok(crate::database::UserRegistrationOutcome::EmailExists) => {
-            registration_validation_error("email", "unique", &request_locale(&state))
+            registration_validation_error("email", "unique", &locale)
         }
         Ok(crate::database::UserRegistrationOutcome::PlayerNameExists) => login_result(
             1,
-            if request_locale(&state).starts_with("zh") {
+            if locale.starts_with("zh") {
                 "该角色名已被占用"
             } else {
                 "The player name is already registered."
@@ -2521,7 +2524,7 @@ async fn handle_register(
         ),
         Ok(crate::database::UserRegistrationOutcome::IpLimit) => login_result(
             1,
-            &if request_locale(&state).starts_with("zh") {
+            &if locale.starts_with("zh") {
                 format!("你在本站注册的账号已达到上限 {max_registrations_per_ip} 个，无法继续注册")
             } else {
                 format!("You can't register more than {max_registrations_per_ip} accounts.")
@@ -2529,6 +2532,13 @@ async fn handle_register(
             None,
         ),
         Ok(crate::database::UserRegistrationOutcome::Registered(uid)) => {
+            let requested_locale = body_locale
+                .or_else(|| explicit_request_locale().and_then(|locale| normalize_locale(&locale)));
+            if let Some(locale) = requested_locale {
+                if let Err(error) = database.update_user_locale(prefix, uid, locale).await {
+                    tracing::warn!(%error, user_id = uid, "failed to save registration locale");
+                }
+            }
             let now_epoch = jsonwebtoken::get_current_timestamp();
             let claims = crate::auth::WebSessionClaims {
                 sub: uid.to_string(),
@@ -2545,7 +2555,7 @@ async fn handle_register(
                     return unavailable();
                 }
             };
-            let message = if request_locale(&state).starts_with("zh") {
+            let message = if locale.starts_with("zh") {
                 "注册成功，正在跳转..."
             } else {
                 "Your account was registered. Redirecting..."
@@ -2623,6 +2633,7 @@ struct LoginRequest {
     keep: Option<bool>,
     captcha: Option<String>,
     redirect_to: Option<String>,
+    lang: Option<String>,
 }
 
 async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -2633,15 +2644,19 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         Ok(request) => request,
         Err(_) => return validation_error("identification", &request_locale(&state)),
     };
+    let body_locale = request.lang.as_deref().and_then(normalize_locale);
+    let locale = body_locale
+        .map(str::to_owned)
+        .unwrap_or_else(|| request_locale(&state));
     let Some(identification) = request
         .identification
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned())
     else {
-        return validation_error("identification", &request_locale(&state));
+        return validation_error("identification", &locale);
     };
     let Some(password) = request.password.filter(|value| !value.is_empty()) else {
-        return validation_error("password", &request_locale(&state));
+        return validation_error("password", &locale);
     };
     let failures = login_failure_count(&state, &identification);
     if failures > 3 {
@@ -2656,7 +2671,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         if !captcha_valid {
             return login_result(
                 1,
-                if request_locale(&state).starts_with("zh") {
+                if locale.starts_with("zh") {
                     "验证码无效。"
                 } else {
                     "The CAPTCHA is invalid."
@@ -2666,7 +2681,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     }
     if !(6..=32).contains(&password.chars().count()) {
-        return validation_error("password", &request_locale(&state));
+        return validation_error("password", &locale);
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -2683,7 +2698,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     let credential = match credential {
         Ok(Some(credential)) => credential,
         Ok(None) => {
-            let message = if request_locale(&state).starts_with("zh") {
+            let message = if locale.starts_with("zh") {
                 "用户不存在"
             } else {
                 "No such user."
@@ -2720,7 +2735,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
             entry.1 = now;
             entry.0
         };
-        let message = if request_locale(&state).starts_with("zh") {
+        let message = if locale.starts_with("zh") {
             "密码错误"
         } else {
             "Wrong password."
@@ -2754,7 +2769,9 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
             return unavailable();
         }
     };
-    if let Some(locale) = explicit_request_locale().and_then(|locale| normalize_locale(&locale)) {
+    let requested_locale = body_locale
+        .or_else(|| explicit_request_locale().and_then(|locale| normalize_locale(&locale)));
+    if let Some(locale) = requested_locale {
         if let Err(error) = database
             .update_user_locale(&state.config.database.table_prefix, credential.uid, locale)
             .await
@@ -2769,7 +2786,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&identification);
 
-    let message = if request_locale(&state).starts_with("zh") {
+    let message = if locale.starts_with("zh") {
         "登录成功，欢迎回来"
     } else {
         "Logged in successfully."
@@ -14681,7 +14698,8 @@ mod tests {
                             "email": email,
                             "password": "secure pass 123",
                             "player_name": player_name,
-                            "captcha": captcha
+                            "captcha": captcha,
+                            "lang": "en"
                         })
                         .to_string(),
                     ))
@@ -16815,6 +16833,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(registered_user.1, "NewGuy");
+        assert_eq!(
+            crate::database::DatabasePool::Sqlite(pool.clone())
+                .user_locale("", registered_user.0)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("en")
+        );
         assert_eq!(registered_user.2, 73);
         assert_eq!(registered_user.3, "203.0.113.40");
         assert_eq!(registered_user.4, 0);
@@ -18587,7 +18613,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/auth/login?lang=zh_TW")
+                    .uri("/auth/login?lang=en")
                     .header("cookie", captcha_cookie)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -18596,7 +18622,8 @@ mod tests {
                             "password": "correct horse",
                             "keep": true,
                             "captcha": captcha_answer,
-                            "redirect_to": "/skinlib"
+                            "redirect_to": "/skinlib",
+                            "lang": "zh_TW"
                         })
                         .to_string(),
                     ))
