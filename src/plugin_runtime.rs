@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.2.0";
+const HOST_API_VERSION: &str = "1.3.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -34,6 +34,8 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "player.added",
     "player.renamed",
     "player.deleted",
+    "player.owner.updated",
+    "player.textures.updated",
     "texture.uploaded",
     "texture.renamed",
     "texture.deleted",
@@ -645,6 +647,20 @@ mod tests {
     #[test]
     fn plugin_events_are_allowlisted_bounded_json_objects() {
         assert!(validate_plugin_event("user.logged-in", br#"{"user_id":7}"#).is_ok());
+        assert!(
+            validate_plugin_event(
+                "player.owner.updated",
+                br#"{"player_id":11,"previous_user_id":7,"user_id":8}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "player.textures.updated",
+                br#"{"user_id":8,"player_id":11,"skin_texture_id":12,"cape_texture_id":0}"#
+            )
+            .is_ok()
+        );
         assert!(
             validate_plugin_event(
                 "user.profile.updated",

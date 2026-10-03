@@ -69,6 +69,20 @@ async fn emit_plugin_event(state: &AppState, name: &str, payload: serde_json::Va
         .await;
 }
 
+async fn emit_player_textures_updated(state: &AppState, player: &PlayerRecord) {
+    emit_plugin_event(
+        state,
+        "player.textures.updated",
+        serde_json::json!({
+            "user_id": player.uid,
+            "player_id": player.pid,
+            "skin_texture_id": player.tid_skin,
+            "cape_texture_id": player.tid_cape,
+        }),
+    )
+    .await;
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", any(live))
@@ -4857,7 +4871,17 @@ async fn web_set_player_textures(
             texture_request_id(request.get("cape")),
         )
         .await;
-    player_texture_response(result, &state.config.locale, false)
+    match result {
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
+            emit_player_textures_updated(&state, &player).await;
+            player_texture_response(
+                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+                &state.config.locale,
+                false,
+            )
+        }
+        result => player_texture_response(result, &state.config.locale, false),
+    }
 }
 
 async fn web_clear_player_textures(
@@ -4891,7 +4915,17 @@ async fn web_clear_player_textures(
             clear_type("cape"),
         )
         .await;
-    player_texture_response(result, &state.config.locale, true)
+    match result {
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
+            emit_player_textures_updated(&state, &player).await;
+            player_texture_response(
+                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+                &state.config.locale,
+                true,
+            )
+        }
+        result => player_texture_response(result, &state.config.locale, true),
+    }
 }
 
 async fn web_delete_player(
@@ -7386,7 +7420,17 @@ async fn api_set_player_textures(
             cape,
         )
         .await;
-    player_texture_response(result, &state.config.locale, false)
+    match result {
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
+            emit_player_textures_updated(&state, &player).await;
+            player_texture_response(
+                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+                &state.config.locale,
+                false,
+            )
+        }
+        result => player_texture_response(result, &state.config.locale, false),
+    }
 }
 
 async fn api_clear_player_textures(
@@ -7426,7 +7470,17 @@ async fn api_clear_player_textures(
             clear_type("cape"),
         )
         .await;
-    player_texture_response(result, &state.config.locale, true)
+    match result {
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
+            emit_player_textures_updated(&state, &player).await;
+            player_texture_response(
+                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+                &state.config.locale,
+                true,
+            )
+        }
+        result => player_texture_response(result, &state.config.locale, true),
+    }
 }
 
 fn texture_request_id(value: Option<&serde_json::Value>) -> Option<i64> {
@@ -9862,6 +9916,12 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user email");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": target_uid, "action": "email"}),
+            )
+            .await;
             admin_user_success(AdminUserMutation::Email, &state.config.locale, None)
         }
         AdminUserMutation::Verification => {
@@ -9897,6 +9957,12 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user nickname");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": target_uid, "action": "nickname"}),
+            )
+            .await;
             admin_user_success(
                 AdminUserMutation::Nickname,
                 &state.config.locale,
@@ -9935,6 +10001,12 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user password");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.profile.updated",
+                serde_json::json!({"user_id": target_uid, "action": "password"}),
+            )
+            .await;
             admin_user_success(AdminUserMutation::Password, &state.config.locale, None)
         }
         AdminUserMutation::Score => {
@@ -9991,7 +10063,15 @@ async fn apply_admin_user_mutation(
             .delete_user(&state.config.database.table_prefix, target_uid)
             .await
         {
-            Ok(true) => admin_user_success(AdminUserMutation::Delete, &state.config.locale, None),
+            Ok(true) => {
+                emit_plugin_event(
+                    state,
+                    "user.deleted",
+                    serde_json::json!({"user_id": target_uid}),
+                )
+                .await;
+                admin_user_success(AdminUserMutation::Delete, &state.config.locale, None)
+            }
             Ok(false) => StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
                 tracing::error!(%error, target_uid, "failed to delete user");
@@ -10478,6 +10558,17 @@ async fn apply_admin_player_mutation(
                 tracing::error!(%error, pid, "failed to rename managed player");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "player.renamed",
+                serde_json::json!({
+                    "user_id": player.uid,
+                    "player_id": pid,
+                    "previous_name": player.name,
+                    "name": name,
+                }),
+            )
+            .await;
             admin_player_success(AdminPlayerMutation::Name, &state.config.locale, name, None)
         }
         AdminPlayerMutation::Owner => {
@@ -10506,6 +10597,16 @@ async fn apply_admin_player_mutation(
                 tracing::error!(%error, pid, "failed to transfer player ownership");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "player.owner.updated",
+                serde_json::json!({
+                    "player_id": pid,
+                    "previous_user_id": player.uid,
+                    "user_id": uid,
+                }),
+            )
+            .await;
             admin_player_success(
                 AdminPlayerMutation::Owner,
                 &state.config.locale,
@@ -10555,6 +10656,17 @@ async fn apply_admin_player_mutation(
                 tracing::error!(%error, pid, "failed to update managed player texture");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "player.textures.updated",
+                serde_json::json!({
+                    "user_id": player.uid,
+                    "player_id": pid,
+                    "skin_texture_id": if texture_type == "skin" { tid } else { player.tid_skin },
+                    "cape_texture_id": if texture_type == "cape" { tid } else { player.tid_cape },
+                }),
+            )
+            .await;
             admin_player_success(
                 AdminPlayerMutation::Texture,
                 &state.config.locale,
@@ -10563,12 +10675,24 @@ async fn apply_admin_player_mutation(
             )
         }
         AdminPlayerMutation::Delete => match database.delete_admin_player(prefix, pid).await {
-            Ok(true) => admin_player_success(
-                AdminPlayerMutation::Delete,
-                &state.config.locale,
-                &player.name,
-                None,
-            ),
+            Ok(true) => {
+                emit_plugin_event(
+                    state,
+                    "player.deleted",
+                    serde_json::json!({
+                        "user_id": player.uid,
+                        "player_id": pid,
+                        "name": player.name,
+                    }),
+                )
+                .await;
+                admin_player_success(
+                    AdminPlayerMutation::Delete,
+                    &state.config.locale,
+                    &player.name,
+                    None,
+                )
+            }
             Ok(false) => StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
                 tracing::error!(%error, pid, "failed to delete managed player");
