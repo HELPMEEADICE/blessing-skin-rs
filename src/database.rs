@@ -8239,7 +8239,11 @@ mod tests {
 #[cfg(test)]
 mod language_line_tests {
     use super::DatabasePool;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{
+        mysql::{MySqlConnectOptions, MySqlPoolOptions},
+        postgres::{PgConnectOptions, PgPoolOptions},
+        sqlite::SqlitePoolOptions,
+    };
 
     #[tokio::test]
     async fn language_line_crud_preserves_other_locales_and_paginates() {
@@ -8293,5 +8297,193 @@ mod language_line_tests {
         let (rows, total) = database.language_lines_page("bs_", 1, 10).await.unwrap();
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+
+    fn configured_compatibility_url(variable: &str) -> Option<String> {
+        match std::env::var(variable) {
+            Ok(url) if !url.trim().is_empty() => Some(url),
+            Ok(_) => panic!("{variable} must not be empty"),
+            Err(_)
+                if std::env::var("BS_REQUIRE_DATABASE_COMPAT").is_ok_and(|value| value == "1") =>
+            {
+                panic!("{variable} is required by BS_REQUIRE_DATABASE_COMPAT")
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn execute_legacy_fixture_sql(
+        database: &DatabasePool,
+        sql: &str,
+    ) -> Result<(), sqlx::Error> {
+        match database {
+            DatabasePool::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            DatabasePool::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            DatabasePool::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn verifies_legacy_schema_read_write(database: DatabasePool) {
+        let prefix = format!(
+            "bs_migtest_{}_{}_",
+            std::process::id(),
+            rand::random::<u32>()
+        );
+        let statements = [
+            format!(
+                "CREATE TABLE {prefix}users (uid BIGINT PRIMARY KEY, email VARCHAR(100) NOT NULL, nickname VARCHAR(50) NOT NULL DEFAULT '', locale VARCHAR(255), score BIGINT NOT NULL DEFAULT 0, avatar BIGINT NOT NULL DEFAULT 0, password VARCHAR(255) NOT NULL, ip VARCHAR(45) NOT NULL DEFAULT '', permission INTEGER NOT NULL DEFAULT 0, last_sign_at TIMESTAMP NOT NULL, register_at TIMESTAMP NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, is_dark_mode BOOLEAN NOT NULL DEFAULT FALSE)"
+            ),
+            format!(
+                "CREATE TABLE {prefix}players (pid BIGINT PRIMARY KEY, uid BIGINT NOT NULL, name VARCHAR(50) NOT NULL, tid_skin BIGINT NOT NULL DEFAULT -1, tid_cape BIGINT NOT NULL DEFAULT 0, last_modified TIMESTAMP NOT NULL)"
+            ),
+            format!(
+                "CREATE TABLE {prefix}textures (tid BIGINT PRIMARY KEY, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size BIGINT NOT NULL, uploader BIGINT NOT NULL, public BOOLEAN NOT NULL DEFAULT FALSE, upload_at TIMESTAMP NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
+            ),
+            format!(
+                "CREATE TABLE {prefix}options (id BIGINT PRIMARY KEY, option_name VARCHAR(50) NOT NULL, option_value TEXT NOT NULL)"
+            ),
+        ];
+        for statement in &statements {
+            execute_legacy_fixture_sql(&database, statement)
+                .await
+                .unwrap();
+        }
+
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}users (uid, email, nickname, locale, score, avatar, password, ip, permission, last_sign_at, register_at, verified, is_dark_mode) VALUES (7, 'legacy@example.test', 'Legacy Alex', 'en', 42, 11, 'legacy-password-hash', '127.0.0.1', 0, '2026-09-30 12:00:00', '2025-01-02 03:04:05', TRUE, FALSE)"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}players (pid, uid, name, tid_skin, tid_cape, last_modified) VALUES (3, 7, 'Alex', 11, 0, '2026-09-30 12:01:00')"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Legacy skin', 'alex', '0123456789abcdef0123456789abcdef', 128, 7, TRUE, '2026-09-30 12:00:00', 3)"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}options (id, option_name, option_value) VALUES (1, 'site_name', 'Legacy Skin')"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let stats = database.admin_dashboard_stats(&prefix).await.unwrap();
+        assert_eq!(
+            (stats.users, stats.players, stats.textures, stats.storage),
+            (1, 1, 1, 128)
+        );
+        let profile = database
+            .player_profile(&prefix, "Alex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.skin_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            database
+                .texture_id_by_hash(&prefix, "0123456789abcdef0123456789abcdef")
+                .await
+                .unwrap(),
+            Some(11)
+        );
+        assert_eq!(
+            database
+                .option(&prefix, "site_name")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Legacy Skin")
+        );
+
+        database
+            .update_user_text(&prefix, 7, "nickname", "Migrated Alex")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .user_profile(&prefix, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .nickname,
+            "Migrated Alex"
+        );
+        database
+            .set_option(&prefix, "site_name", "Rust-backed Legacy Skin")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .option(&prefix, "site_name")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Rust-backed Legacy Skin")
+        );
+
+        for suffix in ["options", "textures", "players", "users"] {
+            execute_legacy_fixture_sql(
+                &database,
+                &format!("DROP TABLE IF EXISTS {prefix}{suffix}"),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_legacy_database_compatibility_when_configured() {
+        let Some(url) = configured_compatibility_url("BS_TEST_MYSQL_URL") else {
+            return;
+        };
+        let options = url
+            .parse::<MySqlConnectOptions>()
+            .expect("valid MySQL test URL");
+        let pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("MySQL test database is reachable");
+        verifies_legacy_schema_read_write(DatabasePool::MySql(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_database_compatibility_when_configured() {
+        let Some(url) = configured_compatibility_url("BS_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let options = url
+            .parse::<PgConnectOptions>()
+            .expect("valid PostgreSQL test URL");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("PostgreSQL test database is reachable");
+        verifies_legacy_schema_read_write(DatabasePool::Postgres(pool)).await;
     }
 }
