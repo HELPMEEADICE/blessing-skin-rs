@@ -5,7 +5,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{Html, IntoResponse, Response},
 };
 use serde_json::Value;
@@ -263,45 +263,51 @@ struct AdminSettingChoice {
     selected: bool,
 }
 
-pub async fn options_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    render_page(&state, &headers, "general").await
-}
-pub async fn score_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    render_page(&state, &headers, "score").await
-}
-pub async fn customize_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    render_page(&state, &headers, "customize").await
-}
-pub async fn resource_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    render_page(&state, &headers, "resource").await
-}
-pub async fn save_options(
+pub async fn options_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
     body: Bytes,
 ) -> Response {
-    save_page(&state, &headers, "general", body).await
+    dispatch_page(&state, &headers, "general", method, body).await
 }
-pub async fn save_score(
+pub async fn score_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
     body: Bytes,
 ) -> Response {
-    save_page(&state, &headers, "score", body).await
+    dispatch_page(&state, &headers, "score", method, body).await
 }
-pub async fn save_customize(
+pub async fn customize_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
     body: Bytes,
 ) -> Response {
-    save_page(&state, &headers, "customize", body).await
+    dispatch_page(&state, &headers, "customize", method, body).await
 }
-pub async fn save_resource(
+pub async fn resource_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
     body: Bytes,
 ) -> Response {
-    save_page(&state, &headers, "resource", body).await
+    dispatch_page(&state, &headers, "resource", method, body).await
+}
+
+async fn dispatch_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    section: &str,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    if method == Method::POST {
+        save_page(state, headers, section, body).await
+    } else {
+        render_page(state, headers, section).await
+    }
 }
 
 async fn render_page(state: &AppState, headers: &HeaderMap, section: &str) -> Response {

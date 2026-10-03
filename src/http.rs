@@ -13,7 +13,7 @@ use axum::{
         DefaultBodyLimit, Form, Multipart, OriginalUri, Path as RoutePath, Query, RawQuery, State,
     },
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{
             CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_MODIFIED_SINCE,
             IF_NONE_MATCH, LAST_MODIFIED, LOCATION, SET_COOKIE,
@@ -65,10 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/", any(api_root))
         .route("/", get(home))
         .route("/setup", get(setup_welcome))
-        .route(
-            "/setup/database",
-            get(setup_database_page).post(setup_database_save),
-        )
+        .route("/setup/database", any(setup_database_dispatch))
         .route("/setup/info", get(setup_info_page))
         .route("/setup/finish", post(setup_finish))
         .route("/auth/login", get(login_page).post(handle_login))
@@ -202,19 +199,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/admin/options",
-            get(crate::admin_settings::options_page).post(crate::admin_settings::save_options),
+            any(crate::admin_settings::options_dispatch),
         )
-        .route(
-            "/admin/score",
-            get(crate::admin_settings::score_page).post(crate::admin_settings::save_score),
-        )
+        .route("/admin/score", any(crate::admin_settings::score_dispatch))
         .route(
             "/admin/customize",
-            get(crate::admin_settings::customize_page).post(crate::admin_settings::save_customize),
+            any(crate::admin_settings::customize_dispatch),
         )
         .route(
             "/admin/resource",
-            get(crate::admin_settings::resource_page).post(crate::admin_settings::save_resource),
+            any(crate::admin_settings::resource_dispatch),
         )
         .route("/skinlib", get(skinlib_page))
         .route("/skinlib/upload", get(texture_upload_page))
@@ -5955,6 +5949,67 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
     )
 }
 
+async fn setup_database_dispatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    if method == Method::GET {
+        return setup_database_page(State(state), headers).await;
+    }
+
+    let mut fields = uri
+        .query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
+    if is_json {
+        if let Ok(serde_json::Value::Object(values)) =
+            serde_json::from_slice::<serde_json::Value>(&body)
+        {
+            for (key, value) in values {
+                fields.insert(
+                    key,
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                );
+            }
+        }
+    } else {
+        for (key, value) in form_urlencoded::parse(&body) {
+            fields.insert(key.into_owned(), value.into_owned());
+        }
+    }
+    let mut take = |key: &str| fields.remove(key).unwrap_or_default();
+    let form = SetupDatabaseRequest {
+        csrf: take("csrf"),
+        driver: take("type"),
+        host: take("host"),
+        port: take("port"),
+        username: take("username"),
+        password: take("password"),
+        database: take("db"),
+        prefix: take("prefix"),
+    };
+    setup_database_save(state, headers, form).await
+}
+
 async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if setup_is_locked(&state) {
         return render_setup_page(
@@ -6023,9 +6078,9 @@ async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) 
 }
 
 async fn setup_database_save(
-    State(state): State<AppState>,
+    state: AppState,
     headers: HeaderMap,
-    Form(form): Form<SetupDatabaseRequest>,
+    form: SetupDatabaseRequest,
 ) -> Response {
     if setup_is_locked(&state) {
         return render_setup_page(
@@ -13536,7 +13591,7 @@ mod tests {
                 Request::post("/setup/database")
                     .header("cookie", &setup_cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from(database_form))
+                    .body(Body::from(database_form.clone()))
                     .unwrap(),
             )
             .await
@@ -13550,6 +13605,25 @@ mod tests {
         )
         .unwrap();
         assert!(database_saved_html.contains("connection succeeded"));
+        let database_updated_with_put = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/setup/database?{database_form}"))
+                    .header("cookie", &setup_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(database_updated_with_put.status(), StatusCode::OK);
+        let database_updated_html = String::from_utf8(
+            to_bytes(database_updated_with_put.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(database_updated_html.contains("connection succeeded"));
         let saved_settings = dotenvy::from_path_iter(&setup_env)
             .unwrap()
             .collect::<Result<std::collections::HashMap<_, _>, _>>()
@@ -15317,6 +15391,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(localized_site_name, "Settings Integration");
+        for method in ["PUT", "PATCH", "DELETE", "OPTIONS"] {
+            let settings_fallback = session_request(
+                &app,
+                &registered_cookie,
+                method,
+                "/admin/options",
+                Some(r#"{"values":{"site_name":"must not be saved"}}"#),
+            )
+            .await;
+            assert_eq!(settings_fallback.status(), StatusCode::OK, "{method}");
+            let settings_fallback_html = String::from_utf8(
+                to_bytes(settings_fallback.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(settings_fallback_html.contains(r#"data-section="general""#));
+        }
+        let localized_site_name_after_fallbacks: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'site_name_en'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(localized_site_name_after_fallbacks, "Settings Integration");
         let localized_home = session_request(&app, &registered_cookie, "GET", "/", None).await;
         let localized_home = String::from_utf8(
             to_bytes(localized_home.into_body(), usize::MAX)
