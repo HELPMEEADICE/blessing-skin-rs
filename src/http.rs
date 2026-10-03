@@ -755,8 +755,12 @@ fn login_failure_count(state: &AppState, identification: &str) -> u32 {
 
 async fn login_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<LoginPageQuery>,
 ) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let site_name = match &state.database {
         Some(database) => {
             let prefix = &state.config.database.table_prefix;
@@ -897,7 +901,10 @@ struct RegisterPage {
     frontend_globals_b64: String,
 }
 
-async fn register_page(State(state): State<AppState>) -> Response {
+async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -999,7 +1006,10 @@ async fn register_page(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn forgot_page(State(state): State<AppState>) -> Response {
+async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let site_name = site_name(&state).await;
     let Some(database) = &state.database else {
         return unavailable();
@@ -1062,6 +1072,9 @@ async fn forgot_page(State(state): State<AppState>) -> Response {
 }
 
 async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -1200,10 +1213,14 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
 
 async fn reset_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RoutePath(uid): RoutePath<String>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
 ) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let Some(uid) = uid.parse::<i64>().ok() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1281,11 +1298,15 @@ async fn reset_page(
 
 async fn handle_password_reset(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RoutePath(uid): RoutePath<String>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let Some(uid) = uid.parse::<i64>().ok() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2059,6 +2080,9 @@ async fn handle_register(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     if state.session_key.is_none() {
         tracing::error!("APP_KEY is required to create a web login session");
         return unavailable();
@@ -2334,6 +2358,9 @@ struct LoginRequest {
 }
 
 async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
+        return response;
+    }
     let request: LoginRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return validation_error("identification", &state.config.locale),
@@ -5808,6 +5835,28 @@ async fn logout(State(state): State<AppState>) -> Response {
         response.headers_mut().insert(SET_COOKIE, value);
     }
     response
+}
+
+async fn authenticated_guest_redirect(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let user_id = session_user_id(state, headers)?;
+    let database = state.database.as_ref()?;
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(_)) => {
+            let mut response = StatusCode::FOUND.into_response();
+            response
+                .headers_mut()
+                .insert(LOCATION, HeaderValue::from_static("/user"));
+            Some(response)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, user_id, "could not verify authenticated guest redirect");
+            None
+        }
+    }
 }
 
 pub(crate) fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
@@ -14770,6 +14819,37 @@ mod tests {
         assert_eq!(globals["base_url"], "http://localhost");
         assert_eq!(globals["extra"]["redirectTo"], "/skinlib");
         assert_eq!(globals["i18n"]["auth"]["login"], "Log In");
+
+        for (method, path, body) in [
+            ("GET", "/auth/login", None),
+            ("GET", "/auth/register", None),
+            ("GET", "/auth/forgot", None),
+            ("GET", "/auth/reset/7?signature=expired", None),
+            ("POST", "/auth/login", Some("{}")),
+            ("POST", "/auth/register", Some("{}")),
+            ("POST", "/auth/forgot", Some("{}")),
+            ("POST", "/auth/reset/7?signature=expired", Some("{}")),
+        ] {
+            let response = session_request(&app, &unbound_cookie, method, path, body).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{method} {path}");
+            assert_eq!(response.headers().get(LOCATION).unwrap(), "/user");
+        }
+        let stale_now = jsonwebtoken::get_current_timestamp();
+        let stale_claims = crate::auth::WebSessionClaims {
+            sub: "999".to_owned(),
+            iat: stale_now,
+            exp: stale_now + 3600,
+        };
+        let stale_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &stale_claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        let stale_cookie = format!("blessing_skin_session={stale_token}");
+        let stale_session_login =
+            session_request(&app, &stale_cookie, "GET", "/auth/login", None).await;
+        assert_eq!(stale_session_login.status(), StatusCode::OK);
 
         let forgot_page = app
             .clone()
