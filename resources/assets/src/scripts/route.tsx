@@ -56,6 +56,8 @@ const routes: Route[] = [
   {
     path: 'admin',
     module: [() => import('../views/admin/Dashboard')],
+    react: () => import('../views/admin/DashboardPage'),
+    el: '#admin-dashboard-app',
   },
   {
     path: 'admin/users',

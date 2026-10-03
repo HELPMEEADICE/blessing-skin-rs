@@ -369,7 +369,7 @@ pub struct PlayerProfile {
     pub last_modified: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, serde::Serialize)]
 pub struct AdminDashboardStats {
     pub users: i64,
     pub players: i64,

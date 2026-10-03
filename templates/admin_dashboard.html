@@ -19,8 +19,16 @@
     .chart svg{display:block;width:100%;height:auto;overflow:visible}
     .chart-labels{display:flex;justify-content:space-between;color:#667085;font-size:.8rem}
   </style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
-<body><main>
+<body>
+{% if frontend_script_available %}
+  <div id="admin-dashboard-app"></div>
+  <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+{% else %}
+  <main>
   <header><h1>{{ site_name }}</h1><a href="/user">{% if locale.starts_with("zh") %}返回用户中心{% else %}User dashboard{% endif %}</a></header>
   <h2>{% if locale.starts_with("zh") %}管理后台概览{% else %}Admin overview{% endif %}</h2>
   <nav aria-label="{% if locale.starts_with("zh") %}管理导航{% else %}Admin navigation{% endif %}">
@@ -62,7 +70,8 @@
     <article class="chart"><h2 id="users-chart-title">{% if locale.starts_with("zh") %}用户注册{% else %}User Registration{% endif %}</h2><div id="chart-users-registration" role="img" aria-labelledby="users-chart-title"></div></article>
     <article class="chart"><h2 id="textures-chart-title">{% if locale.starts_with("zh") %}材质上传{% else %}Texture Uploads{% endif %}</h2><div id="chart-textures-upload" role="img" aria-labelledby="textures-chart-title"></div></article>
   </section>
-</main><script>
+</main>
+  <script>
   document.getElementById('notification-receiver').addEventListener('change', event => {
     const target = event.currentTarget.value;
     document.getElementById('notification-uid').hidden = target !== 'uid';
@@ -128,5 +137,7 @@ async function loadAdminCharts(){
   render('chart-textures-upload',1,'#6f42c1');
 }
 loadAdminCharts().catch(()=>{});
-</script></body>
+</script>
+{% endif %}
+</body>
 </html>

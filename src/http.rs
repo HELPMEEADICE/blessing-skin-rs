@@ -2405,6 +2405,11 @@ struct AdminDashboardPage {
     site_name: String,
     locale: String,
     stats: AdminDashboardStats,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -3248,10 +3253,27 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
             return unavailable();
         }
     };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin",
+        serde_json::json!({ "dashboard_stats": &stats }),
+        i18n,
+    );
     let page = AdminDashboardPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         stats,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14058,19 +14080,26 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(admin_dashboard.contains("Users"));
-        assert!(admin_dashboard.contains("Players"));
-        assert!(admin_dashboard.contains("Textures"));
-        assert!(admin_dashboard.contains("Storage"));
-        assert!(admin_dashboard.contains("chart-users-registration"));
-        assert!(admin_dashboard.contains("notification-form"));
-        assert!(admin_dashboard.contains("/admin/i18n"));
-        assert!(admin_dashboard.contains("chart-textures-upload"));
-        assert!(admin_dashboard.contains("fetch('/admin/chart'"));
-        assert!(admin_dashboard.contains(">4<"));
-        assert!(admin_dashboard.contains(">2<"));
-        assert!(admin_dashboard.contains(">1<"));
-        assert!(admin_dashboard.contains(">8<"));
+        assert!(admin_dashboard.contains(r#"id="admin-dashboard-app""#));
+        assert!(admin_dashboard.contains("http://localhost/app/style.012abcd.css"));
+        assert!(admin_dashboard.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_admin_globals = admin_dashboard
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let admin_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_admin_globals)
+            .unwrap();
+        let admin_globals: serde_json::Value =
+            serde_json::from_slice(&admin_globals_bytes).unwrap();
+        assert_eq!(admin_globals["route"], "admin");
+        assert_eq!(admin_globals["extra"]["dashboard_stats"]["users"], 4);
+        assert_eq!(admin_globals["extra"]["dashboard_stats"]["players"], 2);
+        assert_eq!(admin_globals["extra"]["dashboard_stats"]["textures"], 1);
+        assert_eq!(admin_globals["extra"]["dashboard_stats"]["storage"], 8);
         let admin_chart = session_request(&app, &admin_cookie, "GET", "/admin/chart", None).await;
         assert_eq!(admin_chart.status(), StatusCode::OK);
         let admin_chart: serde_json::Value =
