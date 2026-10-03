@@ -9,9 +9,21 @@
     h1 { font-size:1.6rem;margin:0 0 .4rem } p { color:#667085;margin:0 0 1.5rem } label { display:block;font-weight:600;margin:1rem 0 .4rem }
     input { border:1px solid #c9ced6;border-radius:4px;box-sizing:border-box;font:inherit;padding:.7rem;width:100% }
     button { background:#007bff;border:0;border-radius:4px;color:white;cursor:pointer;font:inherit;margin-top:1.3rem;padding:.75rem;width:100% } #error { color:#b42318;min-height:1.4rem }
+    .site-intro { box-sizing:border-box;max-width:420px;padding:0 2rem;width:calc(100% - 2rem) }
+    .site-intro h1 { font-size:1.6rem;margin:0 0 .4rem } .site-intro p { color:#667085;margin:0 }
+    .site-intro { box-sizing:border-box;max-width:420px;padding:0 2rem;width:calc(100% - 2rem) }
+    .site-intro h1 { font-size:1.6rem;margin:0 0 .4rem } .site-intro p { color:#667085;margin:0 }
   </style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
-<body><main><h1>{{ title }}</h1><p>{{ prompt }}</p>
+<body>
+{% if frontend_script_available %}
+<header class="site-intro"><h1>{{ title }}</h1><p>{{ prompt }}</p></header>
+<main><p class="text-muted" role="status">{% if locale.starts_with("zh") %}正在加载邮箱验证表单…{% else %}Loading email verification form…{% endif %}</p></main>
+{% else %}
+<main><h1>{{ title }}</h1><p>{{ prompt }}</p>
   <form id="verify-form" action="{{ action_url }}">
     <label for="email">{{ email_label }}</label><input id="email" type="email" autocomplete="email" maxlength="100" required>
     <div id="error" role="alert"></div><button type="submit">{{ submit_label }}</button>
@@ -22,4 +34,7 @@
     event.preventDefault();const form=event.currentTarget;const error=document.getElementById('error');const button=form.querySelector('button');button.disabled=true;error.textContent='';
     try{const response=await fetch(form.action,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({email:document.getElementById('email').value})});const result=await response.json();if(response.ok&&result.code===0){window.location.href=result.data?.redirectTo||'/auth/login';return;}error.textContent=result.message||'Unable to verify email.';}catch(_){error.textContent='Unable to connect to the server.';}button.disabled=false;
   });
-</script></body></html>
+</script>
+{% endif %}
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
+</body></html>

@@ -456,6 +456,11 @@ struct EmailVerificationPage {
     action_url: String,
     email_label: String,
     submit_label: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -1380,8 +1385,20 @@ async fn verify_email_page(
         }
     }
     let chinese = state.config.locale.starts_with("zh");
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        &format!("auth/verify/{uid}"),
+        serde_json::json!({}),
+        i18n,
+    );
     let page = EmailVerificationPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         title: if chinese {
             "邮箱验证"
@@ -1403,6 +1420,11 @@ async fn verify_email_page(
             "Verify email"
         }
         .to_owned(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12395,9 +12417,9 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        AdminPluginsPage, BindEmailPage, ForgotPage, PasswordResetPage, RegisterPage, Rgba,
-        RgbaImage, content_etag, parse_legacy_datetime, render_cape_preview, render_skin_avatar,
-        render_skin_preview, router, valid_texture_hash,
+        AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, PasswordResetPage,
+        RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_cape_preview,
+        render_skin_avatar, render_skin_preview, router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -12756,6 +12778,29 @@ mod tests {
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
+    }
+
+    #[test]
+    fn email_verification_page_keeps_inline_fallback_without_frontend_bundle() {
+        let page = EmailVerificationPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            title: "Email Verification".to_owned(),
+            prompt: "Enter your account email address.".to_owned(),
+            action_url: "/auth/verify/7?signature=abc".to_owned(),
+            email_label: "Email".to_owned(),
+            submit_label: "Verify email".to_owned(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains(r#"id="verify-form""#));
+        assert!(html.contains("action=\"/auth/verify/7?signature=abc\""));
         assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
@@ -14650,7 +14695,25 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(verification_html.contains("Verify email"));
+        assert!(verification_html.contains("Email Verification"));
+        assert!(verification_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(verification_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_verification_globals = verification_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let verification_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_verification_globals)
+            .unwrap();
+        let verification_globals: serde_json::Value =
+            serde_json::from_slice(&verification_globals_bytes).unwrap();
+        assert_eq!(
+            verification_globals["route"],
+            format!("auth/verify/{}", registered_user.0)
+        );
         let tampered_verification = app
             .clone()
             .oneshot(

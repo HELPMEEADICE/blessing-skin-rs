@@ -140,6 +140,11 @@ const routes: Route[] = [
     el: 'main',
   },
   {
+    path: 'auth/verify/(\\d+)',
+    react: () => import('../views/auth/VerifyEmail'),
+    el: 'main',
+  },
+  {
     path: 'skinlib',
     react: () => import('../views/skinlib/SkinLibrary'),
     el: '.content-wrapper',
