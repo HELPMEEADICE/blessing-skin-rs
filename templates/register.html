@@ -13,9 +13,19 @@
     input[type=text], input[type=email], input[type=password] { border: 1px solid #c9ced6; border-radius: 4px; box-sizing: border-box; font: inherit; padding: .7rem; width: 100%; }
     button { background: #007bff; border: 0; border-radius: 4px; color: white; cursor: pointer; font: inherit; margin-top: 1.3rem; padding: .75rem; width: 100%; }
     #error { color: #b42318; min-height: 1.4rem; }
+    .site-intro { box-sizing: border-box; max-width: 440px; padding: 0 2rem; width: calc(100% - 2rem); }
+    .site-intro h1 { font-size: 1.6rem; margin: 0 0 .4rem; }
+    .site-intro p { color: #667085; margin: 0; }
   </style>
+  <meta name="csrf-token" content="">
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
+  {% if frontend_script_available %}
+  <header class="site-intro"><h1>{{ site_name }}</h1><p>{{ prompt }}</p></header>
+  <main><p class="text-muted" role="status">{% if locale.starts_with("zh") %}正在加载注册表单…{% else %}Loading registration form…{% endif %}</p></main>
+  {% else %}
   <main>
     <h1>{{ site_name }}</h1>
     <p>{{ prompt }}</p>
@@ -85,5 +95,7 @@
       button.disabled = false;
     });
   </script>
+  {% endif %}
+  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>

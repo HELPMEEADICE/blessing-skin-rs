@@ -833,6 +833,11 @@ struct RegisterPage {
     player_name_registration: bool,
     use_recaptcha: bool,
     recaptcha_sitekey: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 async fn register_page(State(state): State<AppState>) -> Response {
@@ -877,6 +882,22 @@ async fn register_page(State(state): State<AppState>) -> Response {
         }
     };
     let chinese = state.config.locale.starts_with("zh");
+    let use_recaptcha = !recaptcha_secret.is_empty();
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "auth/register",
+        serde_json::json!({
+            "player": player_name_registration,
+            "recaptcha": if use_recaptcha { recaptcha_sitekey.as_str() } else { "" },
+            "invisible": false,
+        }),
+        i18n,
+    );
     let page = RegisterPage {
         site_name,
         locale: state.config.locale.clone(),
@@ -904,8 +925,13 @@ async fn register_page(State(state): State<AppState>) -> Response {
         captcha_label: if chinese { "验证码" } else { "CAPTCHA" }.to_owned(),
         submit_label: if chinese { "注册" } else { "Register" }.to_owned(),
         player_name_registration,
-        use_recaptcha: !recaptcha_secret.is_empty(),
+        use_recaptcha,
         recaptcha_sitekey,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12305,7 +12331,7 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        AdminPluginsPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
+        AdminPluginsPage, RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
         render_cape_preview, render_skin_avatar, render_skin_preview, router, valid_texture_hash,
     };
 
@@ -12665,6 +12691,35 @@ mod tests {
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
+    }
+
+    #[test]
+    fn registration_page_keeps_inline_fallback_without_frontend_bundle() {
+        let page = RegisterPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            title: "Register".to_owned(),
+            prompt: "Create an account.".to_owned(),
+            email_label: "Email".to_owned(),
+            account_label: "Player name".to_owned(),
+            password_label: "Password".to_owned(),
+            captcha_label: "CAPTCHA".to_owned(),
+            submit_label: "Register".to_owned(),
+            player_name_registration: true,
+            use_recaptcha: false,
+            recaptcha_sitekey: String::new(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains(r#"id="register-form""#));
+        assert!(html.contains("/auth/captcha"));
+        assert!(html.contains("Player name"));
         assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
@@ -13677,8 +13732,23 @@ mod tests {
             .await
             .unwrap();
         let register_html = String::from_utf8(register_html.to_vec()).unwrap();
-        assert!(register_html.contains("Player name"));
-        assert!(register_html.contains("/auth/captcha"));
+        assert!(register_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(register_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_register_globals = register_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let register_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_register_globals)
+            .unwrap();
+        let register_globals: serde_json::Value =
+            serde_json::from_slice(&register_globals_bytes).unwrap();
+        assert_eq!(register_globals["route"], "auth/register");
+        assert_eq!(register_globals["extra"]["player"], true);
+        assert_eq!(register_globals["extra"]["invisible"], false);
         sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('register_with_player_name','true'), ('user_initial_score','73'), ('regs_per_ip','2')")
             .execute(&pool)
             .await
