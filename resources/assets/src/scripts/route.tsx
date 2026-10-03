@@ -25,6 +25,11 @@ const routes: Route[] = [
     el: '#setup-info-app',
   },
   {
+    path: 'setup/finish',
+    react: () => import('../views/setup/Finish'),
+    el: '#setup-finish-app',
+  },
+  {
     path: 'home',
     react: () => import('../views/Home'),
     el: '#home-app',

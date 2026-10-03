@@ -2632,6 +2632,9 @@ struct SetupInfoPage {
 #[template(path = "setup_finish.html")]
 struct SetupFinishPage {
     locale: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -6330,13 +6333,19 @@ async fn setup_finish(
     )
     .await
     {
-        Ok(()) => render_setup_page(
-            &SetupFinishPage {
-                locale: state.config.locale.clone(),
-            },
-            &headers,
-            None,
-        ),
+        Ok(()) => {
+            let assets = setup_page_assets(&state, "setup/finish", serde_json::json!({})).await;
+            render_setup_page(
+                &SetupFinishPage {
+                    locale: state.config.locale.clone(),
+                    frontend_script_available: assets.frontend_script_available,
+                    frontend_script: assets.frontend_script,
+                    frontend_globals_b64: assets.frontend_globals_b64,
+                },
+                &headers,
+                None,
+            )
+        }
         Err(crate::installer::InstallError::AlreadyInstalled) => render_setup_page(
             &SetupLockedPage {
                 locale: state.config.locale.clone(),
@@ -13789,6 +13798,22 @@ mod tests {
         )
         .unwrap();
         assert!(installed_html.contains("Installation complete"));
+        assert!(installed_html.contains("id=\"setup-finish-app\""));
+        assert!(installed_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_installed_globals = installed_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let installed_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_installed_globals)
+            .unwrap();
+        let installed_globals: serde_json::Value =
+            serde_json::from_slice(&installed_globals_bytes).unwrap();
+        assert_eq!(installed_globals["route"], "setup/finish");
+        assert_eq!(installed_globals["extra"], serde_json::json!({}));
         assert!(finish_storage.join("install.lock").exists());
         let installed_admin = match &finish_database {
             crate::database::DatabasePool::Sqlite(pool) => {
