@@ -75,8 +75,25 @@ const routes: Route[] = [
     el: '.content > .container-fluid',
   },
   {
+    path: 'admin/options',
+    react: () => import('../views/admin/Settings'),
+    el: '#admin-settings-app',
+  },
+  {
+    path: 'admin/score',
+    react: () => import('../views/admin/Settings'),
+    el: '#admin-settings-app',
+  },
+  {
     path: 'admin/customize',
     module: [() => import('../views/admin/Customization')],
+    react: () => import('../views/admin/Settings'),
+    el: '#admin-settings-app',
+  },
+  {
+    path: 'admin/resource',
+    react: () => import('../views/admin/Settings'),
+    el: '#admin-settings-app',
   },
   {
     path: 'admin/i18n',

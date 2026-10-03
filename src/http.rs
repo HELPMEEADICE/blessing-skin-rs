@@ -599,7 +599,7 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
         )
     }
 }
-async fn frontend_entrypoint(
+pub(crate) async fn frontend_entrypoint(
     app_dir: &std::path::Path,
     bundle: &str,
     extension: &str,
@@ -634,7 +634,10 @@ async fn frontend_entrypoint(
     Some(format!("{}/app/{filename}", app_url.trim_end_matches('/')))
 }
 
-async fn load_frontend_translations(app_dir: &std::path::Path, locale: &str) -> serde_json::Value {
+pub(crate) async fn load_frontend_translations(
+    app_dir: &std::path::Path,
+    locale: &str,
+) -> serde_json::Value {
     let valid_locale = |candidate: &str| {
         !candidate.is_empty()
             && candidate
@@ -660,7 +663,7 @@ async fn load_frontend_translations(app_dir: &std::path::Path, locale: &str) -> 
     serde_json::json!({})
 }
 
-fn encode_frontend_globals(
+pub(crate) fn encode_frontend_globals(
     state: &AppState,
     site_name: &str,
     route: &str,
@@ -14472,10 +14475,58 @@ mod tests {
         )
         .unwrap();
         assert!(settings_html.contains("data-section=\"general\""));
-        for settings_path in ["/admin/score", "/admin/customize", "/admin/resource"] {
+        assert!(settings_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(settings_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_settings_globals = settings_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let settings_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_settings_globals)
+            .unwrap();
+        let settings_globals: serde_json::Value =
+            serde_json::from_slice(&settings_globals_bytes).unwrap();
+        assert_eq!(settings_globals["route"], "admin/options");
+        assert_eq!(settings_globals["extra"]["settings"]["section"], "general");
+        assert!(
+            settings_globals["extra"]["settings"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field["key"] == "site_name")
+        );
+        for (settings_path, section) in [
+            ("/admin/score", "score"),
+            ("/admin/customize", "customize"),
+            ("/admin/resource", "resource"),
+        ] {
             let section_page =
                 session_request(&app, &registered_cookie, "GET", settings_path, None).await;
             assert_eq!(section_page.status(), StatusCode::OK, "{settings_path}");
+            let section_html = String::from_utf8(
+                to_bytes(section_page.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(section_html.contains(r#"id="admin-settings-app""#));
+            let encoded = section_html
+                .split("atob('")
+                .nth(1)
+                .unwrap()
+                .split("')")
+                .next()
+                .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let globals: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            assert_eq!(globals["route"], format!("admin/{section}"));
+            assert_eq!(globals["extra"]["settings"]["section"], section);
         }
         let saved_settings = session_request(
             &app,

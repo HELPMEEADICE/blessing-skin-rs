@@ -239,8 +239,14 @@ struct AdminSettingsPage {
     locale: String,
     section: String,
     fields: Vec<AdminSettingField>,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
+#[derive(serde::Serialize)]
 struct AdminSettingField {
     key: String,
     label: String,
@@ -250,6 +256,7 @@ struct AdminSettingField {
     choices: Vec<AdminSettingChoice>,
 }
 
+#[derive(serde::Serialize)]
 struct AdminSettingChoice {
     value: String,
     label: String,
@@ -368,13 +375,40 @@ async fn render_page(state: &AppState, headers: &HeaderMap, section: &str) -> Re
             }
         })
         .collect();
-    let section_title = section_title(&locale, section);
+    let title = section_title(&locale, section);
+    let site_name = http::site_name(state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet =
+        http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script =
+        http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = http::load_frontend_translations(&app_dir, &locale).await;
+    let route = match section {
+        "general" => "admin/options",
+        "score" => "admin/score",
+        "customize" => "admin/customize",
+        "resource" => "admin/resource",
+        _ => "admin/options",
+    };
+    let extra = serde_json::json!({
+        "settings": {
+            "section": section,
+            "title": &title,
+            "fields": &fields,
+        }
+    });
+    let frontend_globals_b64 = http::encode_frontend_globals(state, &site_name, route, extra, i18n);
     let page = AdminSettingsPage {
-        site_name: http::site_name(state).await,
-        title: section_title,
+        site_name,
+        title,
         locale,
         section: section.to_owned(),
         fields,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
