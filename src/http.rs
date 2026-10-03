@@ -422,6 +422,11 @@ struct ForgotPage {
     submit_label: String,
     use_recaptcha: bool,
     recaptcha_sitekey: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -959,6 +964,21 @@ async fn forgot_page(State(state): State<AppState>) -> Response {
         }
     };
     let chinese = state.config.locale.starts_with("zh");
+    let use_recaptcha = !recaptcha_secret.is_empty();
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "auth/forgot",
+        serde_json::json!({
+            "recaptcha": if use_recaptcha { recaptcha_sitekey.as_str() } else { "" },
+            "invisible": false,
+        }),
+        i18n,
+    );
     let page = ForgotPage {
         site_name,
         locale: state.config.locale.clone(),
@@ -972,8 +992,13 @@ async fn forgot_page(State(state): State<AppState>) -> Response {
         email_label: if chinese { "邮箱" } else { "Email" }.to_owned(),
         captcha_label: if chinese { "验证码" } else { "CAPTCHA" }.to_owned(),
         submit_label: if chinese { "发送重置邮件" } else { "Send reset email" }.to_owned(),
-        use_recaptcha: !recaptcha_secret.is_empty(),
+        use_recaptcha,
         recaptcha_sitekey,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12331,8 +12356,9 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        AdminPluginsPage, RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
-        render_cape_preview, render_skin_avatar, render_skin_preview, router, valid_texture_hash,
+        AdminPluginsPage, ForgotPage, RegisterPage, Rgba, RgbaImage, content_etag,
+        parse_legacy_datetime, render_cape_preview, render_skin_avatar, render_skin_preview,
+        router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -12691,6 +12717,31 @@ mod tests {
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
+    }
+
+    #[test]
+    fn forgot_page_keeps_inline_fallback_without_frontend_bundle() {
+        let page = ForgotPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            title: "Forgot Password".to_owned(),
+            prompt: "Enter your account email.".to_owned(),
+            email_label: "Email".to_owned(),
+            captcha_label: "CAPTCHA".to_owned(),
+            submit_label: "Send reset email".to_owned(),
+            use_recaptcha: false,
+            recaptcha_sitekey: String::new(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains(r#"id="forgot-form""#));
+        assert!(html.contains("/auth/captcha"));
         assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
@@ -13715,7 +13766,22 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(forgot_page.contains("/auth/forgot"));
+        assert!(forgot_page.contains("http://localhost/app/style.012abcd.css"));
+        assert!(forgot_page.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_forgot_globals = forgot_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let forgot_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_forgot_globals)
+            .unwrap();
+        let forgot_globals: serde_json::Value =
+            serde_json::from_slice(&forgot_globals_bytes).unwrap();
+        assert_eq!(forgot_globals["route"], "auth/forgot");
+        assert_eq!(forgot_globals["extra"]["invisible"], false);
 
         let register_page = app
             .clone()
