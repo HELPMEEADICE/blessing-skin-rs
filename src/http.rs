@@ -2568,6 +2568,11 @@ struct AdminStatusPage {
     locale: String,
     groups: Vec<AdminStatusGroup>,
     wasm_plugins: Vec<String>,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -2696,11 +2701,13 @@ struct AdminReportsPage {
     frontend_globals_b64: String,
 }
 
+#[derive(serde::Serialize)]
 struct AdminStatusGroup {
     title: String,
     fields: Vec<AdminStatusField>,
 }
 
+#[derive(serde::Serialize)]
 struct AdminStatusField {
     label: String,
     value: String,
@@ -3560,11 +3567,34 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             ],
         },
     ];
+    let site_name = site_name(&state).await;
+    let wasm_plugins = state.wasm_plugins.clone();
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/status",
+        serde_json::json!({
+            "admin_status": {
+                "groups": &groups,
+                "wasm_plugins": &wasm_plugins,
+            }
+        }),
+        i18n,
+    );
     let page = AdminStatusPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         groups,
-        wasm_plugins: state.wasm_plugins.clone(),
+        wasm_plugins,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14352,6 +14382,29 @@ mod tests {
         assert!(status_html.contains("Rust / Axum / Tokio"));
         assert!(status_html.contains("SQLite"));
         assert!(status_html.contains("No WASM plugins loaded"));
+        assert!(status_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(status_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_status_globals = status_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let status_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_status_globals)
+            .unwrap();
+        let status_globals: serde_json::Value =
+            serde_json::from_slice(&status_globals_bytes).unwrap();
+        assert_eq!(status_globals["route"], "admin/status");
+        assert_eq!(
+            status_globals["extra"]["admin_status"]["groups"][2]["fields"][0]["value"],
+            "SQLite"
+        );
+        assert_eq!(
+            status_globals["extra"]["admin_status"]["wasm_plugins"],
+            serde_json::json!([])
+        );
 
         let translation_page =
             session_request(&app, &admin_cookie, "GET", "/admin/i18n", None).await;

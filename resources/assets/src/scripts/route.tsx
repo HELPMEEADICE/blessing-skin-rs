@@ -116,6 +116,11 @@ const routes: Route[] = [
     el: '.content > .container-fluid',
   },
   {
+    path: 'admin/status',
+    react: () => import('../views/admin/SystemStatus'),
+    el: '#admin-status-app',
+  },
+  {
     path: 'admin/update',
     module: [() => import('../views/admin/Update')],
   },

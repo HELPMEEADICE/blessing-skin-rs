@@ -15,8 +15,10 @@
     th{width:35%;background:#f8f9fa}
     @media(max-width:640px){main{margin:1rem;padding:1rem}th,td{padding:.45rem}}
   </style>
+  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
-<body><main>
+<body><main id="admin-status-app">
   <header>
     <h1>{% if locale.starts_with("zh") %}系统状态{% else %}System status{% endif %} - {{ site_name }}</h1>
     <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a>
@@ -41,5 +43,7 @@
       </tbody></table>
     {% endif %}
   </section>
-</main></body>
+</main>
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
+</body>
 </html>
