@@ -32,6 +32,7 @@ cargo build --locked --release
 | `DB_CONNECTION` | `sqlite`、`mysql`、`mariadb`、`pgsql`、`postgres` 或 `postgresql`，默认 `mysql` |
 | `DB_DATABASE` | SQLite 文件路径；MySQL/PostgreSQL 数据库名 |
 | `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD` | MySQL/PostgreSQL 连接参数 |
+| `DB_SOCKET` | 可选的 MySQL/MariaDB Unix socket 路径；设定后通过该 socket 连接 |
 | `DB_PREFIX` | 旧表前缀，只允许 ASCII 字母、数字和下划线 |
 | `DB_FOREIGN_KEYS` | SQLite 中设为 `false` 或 `0` 可关闭外键检查 |
 | `STORAGE_PATH` | 默认 `storage`；Passport 公钥默认从此目录的 `oauth-public.key` 读取 |

@@ -266,12 +266,14 @@ impl DatabaseConfig {
                 let port = parse_port("DB_PORT", 3306);
                 let username = env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned());
                 let database = env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned());
-                let options = MySqlConnectOptions::new()
-                    .host(&host)
-                    .port(port)
-                    .username(&username)
-                    .password(&env::var("DB_PASSWORD").unwrap_or_default())
-                    .database(&database);
+                let options = mysql_connect_options(
+                    &host,
+                    port,
+                    &username,
+                    &env::var("DB_PASSWORD").unwrap_or_default(),
+                    &database,
+                    env::var("DB_SOCKET").ok().as_deref(),
+                );
                 (
                     DatabaseConnection::MySql(options),
                     "MySQL/MariaDB",
@@ -316,6 +318,26 @@ impl DatabaseConfig {
     }
 }
 
+fn mysql_connect_options(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+    socket: Option<&str>,
+) -> MySqlConnectOptions {
+    let options = MySqlConnectOptions::new()
+        .host(host)
+        .port(port)
+        .username(username)
+        .password(password)
+        .database(database);
+    match socket.filter(|path| !path.trim().is_empty()) {
+        Some(path) => options.socket(path),
+        None => options,
+    }
+}
+
 fn parse_setup_port(value: &str, default: u16) -> Result<u16, ConfigError> {
     if value.trim().is_empty() {
         return Ok(default);
@@ -344,7 +366,8 @@ fn valid_table_prefix(prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatabaseConfig, DatabaseConnection, valid_table_prefix};
+    use super::{DatabaseConfig, DatabaseConnection, mysql_connect_options, valid_table_prefix};
+    use std::path::Path;
 
     #[test]
     fn accepts_empty_and_simple_prefixes() {
@@ -391,6 +414,25 @@ mod tests {
     fn rejects_sql_identifiers_with_special_characters() {
         assert!(!valid_table_prefix("x; DROP TABLE users"));
         assert!(!valid_table_prefix("bs-skin_"));
+    }
+
+    #[test]
+    fn honors_legacy_mysql_socket_and_ignores_empty_values() {
+        let options = mysql_connect_options(
+            "127.0.0.1",
+            3306,
+            "blessing",
+            "secret",
+            "blessingskin",
+            Some("/run/mysqld/mysqld.sock"),
+        );
+        assert_eq!(
+            options.get_socket().map(|path| path.as_path()),
+            Some(Path::new("/run/mysqld/mysqld.sock"))
+        );
+
+        let options = mysql_connect_options("localhost", 3306, "user", "", "skin", Some(" "));
+        assert!(options.get_socket().is_none());
     }
 }
 fn load_passport_public_key(storage: &std::path::Path) -> Option<Vec<u8>> {
