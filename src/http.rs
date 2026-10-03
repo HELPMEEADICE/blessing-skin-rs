@@ -2473,16 +2473,50 @@ struct HomePage {
     locale: String,
     title: String,
     login: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 async fn home(State(state): State<AppState>) -> Response {
     let site_name = site_name(&state).await;
     let chinese = state.config.locale.starts_with("zh");
+    let title = if chinese { "皮肤站" } else { "Skin Server" }.to_owned();
+    let login = if chinese { "登录" } else { "Log in" }.to_owned();
+    let browse_skinlib = if chinese {
+        "浏览皮肤库"
+    } else {
+        "Browse skin library"
+    };
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "home",
+        serde_json::json!({
+            "home": {
+                "title": &title,
+                "login": &login,
+                "browse_skinlib": browse_skinlib,
+            }
+        }),
+        i18n,
+    );
     let page = HomePage {
         site_name,
         locale: state.config.locale.clone(),
-        title: if chinese { "皮肤站" } else { "Skin Server" }.to_owned(),
-        login: if chinese { "登录" } else { "Log in" }.to_owned(),
+        title,
+        login,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12417,9 +12451,9 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, PasswordResetPage,
-        RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_cape_preview,
-        render_skin_avatar, render_skin_preview, router, valid_texture_hash,
+        AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
+        PasswordResetPage, RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
+        render_cape_preview, render_skin_avatar, render_skin_preview, router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -12519,6 +12553,28 @@ mod tests {
         let id = cookie.split_once('=').unwrap().1.to_owned();
         let answer = challenges.lock().unwrap().get(&id).unwrap().0.clone();
         (cookie, answer)
+    }
+
+    #[test]
+    fn home_page_keeps_public_links_without_a_frontend_bundle() {
+        let page = HomePage {
+            site_name: "Example Skin".to_owned(),
+            locale: "en".to_owned(),
+            title: "Skin Server".to_owned(),
+            login: "Log in".to_owned(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains("id=\"home-app\""));
+        assert!(html.contains("href=\"/auth/login\""));
+        assert!(html.contains("Browse skin library"));
+        assert!(html.contains("href=\"/skinlib\""));
+        assert!(!html.contains("window.blessing"));
     }
 
     #[test]
