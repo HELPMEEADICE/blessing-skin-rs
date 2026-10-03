@@ -439,6 +439,11 @@ struct PasswordResetPage {
     action_url: String,
     password_label: String,
     submit_label: String,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -1178,8 +1183,20 @@ async fn reset_page(
         }
     };
     let chinese = state.config.locale.starts_with("zh");
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        &format!("auth/reset/{uid}"),
+        serde_json::json!({}),
+        i18n,
+    );
     let page = PasswordResetPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         title: if chinese {
             "重设密码"
@@ -1200,6 +1217,11 @@ async fn reset_page(
             "Reset password"
         }
         .to_owned(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12356,9 +12378,9 @@ mod tests {
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        AdminPluginsPage, ForgotPage, RegisterPage, Rgba, RgbaImage, content_etag,
-        parse_legacy_datetime, render_cape_preview, render_skin_avatar, render_skin_preview,
-        router, valid_texture_hash,
+        AdminPluginsPage, ForgotPage, PasswordResetPage, RegisterPage, Rgba, RgbaImage,
+        content_etag, parse_legacy_datetime, render_cape_preview, render_skin_avatar,
+        render_skin_preview, router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -12717,6 +12739,31 @@ mod tests {
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
+    }
+
+    #[test]
+    fn password_reset_page_keeps_inline_fallback_without_frontend_bundle() {
+        let page = PasswordResetPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            title: "Reset Password".to_owned(),
+            prompt: "Reset your password here.".to_owned(),
+            action_url: "/auth/reset/7?expires=123&signature=abc".to_owned(),
+            password_label: "New password".to_owned(),
+            submit_label: "Reset password".to_owned(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains(r#"id="reset-form""#));
+        assert!(html.contains("expires=123"));
+        assert!(html.contains("signature=abc"));
+        assert!(html.contains("Unable to reset password."));
         assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
@@ -14799,6 +14846,24 @@ mod tests {
         )
         .unwrap();
         assert!(reset_html.contains("reset your password here"));
+        assert!(reset_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(reset_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_reset_globals = reset_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let reset_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_reset_globals)
+            .unwrap();
+        let reset_globals: serde_json::Value =
+            serde_json::from_slice(&reset_globals_bytes).unwrap();
+        assert_eq!(
+            reset_globals["route"],
+            format!("auth/reset/{}", registered_user.0)
+        );
         let reset = app
             .clone()
             .oneshot(
