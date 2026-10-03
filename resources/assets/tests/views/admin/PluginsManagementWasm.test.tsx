@@ -52,37 +52,34 @@ test('renders and manages Rust WASM components', async () => {
   ).toBeInTheDocument()
 })
 
-test(
-  'links migrated component documentation and configuration under app base URL',
-  async () => {
-    blessing.extra = { wasm_plugins: true, can_upload: false }
-    blessing.base_url = 'https://example.test/skin'
-    fetch.get.mockResolvedValue([
-      {
-        name: 'sample',
-        title: 'sample',
-        description: 'Enabled; will load on next startup',
-        version: 'WASM host API 1.5.0',
-        enabled: true,
-        loaded: true,
-        on_disk: true,
-        readme: true,
-        config: true,
-      },
-    ])
+test('links migrated component documentation and configuration under app base URL', async () => {
+  blessing.extra = { wasm_plugins: true, can_upload: false }
+  blessing.base_url = 'https://example.test/skin'
+  fetch.get.mockResolvedValue([
+    {
+      name: 'sample',
+      title: 'sample',
+      description: 'Enabled; will load on next startup',
+      version: 'WASM host API 1.5.0',
+      enabled: true,
+      loaded: true,
+      on_disk: true,
+      readme: true,
+      config: true,
+    },
+  ])
 
-    const { findByRole } = render(<PluginsManagement />)
+  const { findByRole } = render(<PluginsManagement />)
 
-    expect(await findByRole('link', { name: 'Readme' })).toHaveAttribute(
-      'href',
-      'https://example.test/skin/admin/plugins/readme/sample',
-    )
-    expect(await findByRole('link', { name: 'Configure' })).toHaveAttribute(
-      'href',
-      'https://example.test/skin/admin/plugins/config/sample',
-    )
-  },
-)
+  expect(await findByRole('link', { name: 'Readme' })).toHaveAttribute(
+    'href',
+    'https://example.test/skin/admin/plugins/readme/sample',
+  )
+  expect(await findByRole('link', { name: 'Configure' })).toHaveAttribute(
+    'href',
+    'https://example.test/skin/admin/plugins/config/sample',
+  )
+})
 
 test('uploads one WASM component for super administrators', async () => {
   blessing.extra = { wasm_plugins: true, can_upload: true }

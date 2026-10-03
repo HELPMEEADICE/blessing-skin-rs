@@ -210,7 +210,11 @@ const WasmPlugins: React.FC = () => {
                     {plugin.readme && (
                       <a
                         className="btn btn-default btn-sm mr-2 mb-1"
-                        href={`${blessing.base_url}/admin/plugins/readme/${encodeURIComponent(plugin.name)}`}
+                        href={`${
+                          blessing.base_url
+                        }/admin/plugins/readme/${encodeURIComponent(
+                          plugin.name,
+                        )}`}
                       >
                         {say('Readme', '说明')}
                       </a>
@@ -218,7 +222,11 @@ const WasmPlugins: React.FC = () => {
                     {plugin.enabled && plugin.config && (
                       <a
                         className="btn btn-default btn-sm mr-2 mb-1"
-                        href={`${blessing.base_url}/admin/plugins/config/${encodeURIComponent(plugin.name)}`}
+                        href={`${
+                          blessing.base_url
+                        }/admin/plugins/config/${encodeURIComponent(
+                          plugin.name,
+                        )}`}
                       >
                         {say('Configure', '配置')}
                       </a>
