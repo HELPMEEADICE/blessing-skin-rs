@@ -4,10 +4,12 @@ export type Plugin = {
   title: string
   description: string
   author: string
-  installed: string | false
+  installed: boolean
+  installed_version?: string
   can_update?: boolean
-  dependencies: {
-    all: Record<string, string>
-    unsatisfied: Record<string, string>
-  }
+}
+
+export type PluginMarketResponse = {
+  configured: boolean
+  plugins: Plugin[]
 }

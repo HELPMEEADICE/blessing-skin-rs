@@ -183,6 +183,14 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/update/download", post(web_admin_update_download))
         .route("/admin/plugins/data", get(web_admin_plugins_data))
         .route(
+            "/admin/plugins/market/list",
+            get(web_admin_plugins_market_list),
+        )
+        .route(
+            "/admin/plugins/market/download",
+            post(web_admin_plugins_market_download).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/admin/plugins/manage",
             get(web_admin_plugins_page).post(web_admin_plugins_manage),
         )
@@ -2787,6 +2795,34 @@ struct AdminPluginWgetRequest {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct AdminPluginMarketDownloadRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WasmPluginRegistryManifest {
+    schema_version: u32,
+    plugins: Vec<WasmPluginRegistryEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WasmPluginRegistryEntry {
+    name: String,
+    version: String,
+    title: String,
+    description: String,
+    author: String,
+    download_url: String,
+    sha256: String,
+}
+#[derive(Deserialize, Serialize)]
+struct WasmPluginMarketMetadata {
+    version: String,
+    sha256: String,
+}
 #[derive(Template)]
 #[template(path = "admin_users.html")]
 struct AdminUsersPage {
@@ -4051,7 +4087,9 @@ async fn web_admin_plugins_manage(
         }
         "delete" => {
             let mut deleted = false;
-            for path in [&enabled, &disabled] {
+            let metadata =
+                wasm_plugin_market_metadata_path(&state.config.plugins_dir, &request.name);
+            for path in [&enabled, &disabled, &metadata] {
                 match std::fs::remove_file(path) {
                     Ok(()) => deleted = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4086,6 +4124,330 @@ async fn web_admin_plugins_manage(
     }
 }
 
+async fn web_admin_plugins_market_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 2 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let entries = match fetch_wasm_plugin_registry(&state).await {
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
+            return Json(serde_json::json!({ "configured": false, "plugins": [] })).into_response();
+        }
+        Err(error) => {
+            tracing::warn!(error = ?error, "could not load configured WASM plugin registry");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "message": "The configured WASM plugin registry is unavailable or invalid."
+                })),
+            )
+                .into_response();
+        }
+    };
+    let plugins = entries
+        .into_iter()
+        .map(|entry| {
+            let enabled = state
+                .config
+                .plugins_dir
+                .join(format!("{}.wasm", entry.name))
+                .is_file();
+            let disabled = state
+                .config
+                .plugins_dir
+                .join(format!("{}.wasm.disabled", entry.name))
+                .is_file();
+            let loaded = state
+                .wasm_plugins
+                .iter()
+                .any(|plugin| plugin == &format!("{}.wasm", entry.name));
+            let installed = enabled || disabled || loaded;
+            let installed_version = read_wasm_plugin_market_metadata(&state, &entry.name)
+                .map(|metadata| metadata.version);
+            let can_update = installed
+                && installed_version
+                    .as_ref()
+                    .is_none_or(|version| version != &entry.version);
+            serde_json::json!({
+                "name": entry.name,
+                "version": entry.version,
+                "title": entry.title,
+                "description": entry.description,
+                "author": entry.author,
+                "installed": installed,
+                "installed_version": installed_version,
+                "can_update": can_update,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({ "configured": true, "plugins": plugins })).into_response()
+}
+
+async fn web_admin_plugins_market_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 2 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if body.len() > 8 * 1024 {
+        return admin_plugin_result(1, "Invalid plugin request.");
+    }
+    let request = match serde_json::from_slice::<AdminPluginMarketDownloadRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return admin_plugin_result(1, "Invalid plugin request."),
+    };
+    if !crate::plugin_runtime::valid_plugin_name(&request.name) {
+        return admin_plugin_result(1, "Invalid plugin name.");
+    }
+    let entries = match fetch_wasm_plugin_registry(&state).await {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return admin_plugin_result(1, "The WASM plugin registry is not configured."),
+        Err(error) => {
+            tracing::warn!(error = ?error, "could not load configured WASM plugin registry");
+            return admin_plugin_result(
+                1,
+                "The configured WASM plugin registry is unavailable or invalid.",
+            );
+        }
+    };
+    let Some(entry) = entries.into_iter().find(|entry| entry.name == request.name) else {
+        return admin_plugin_result(1, "Plugin not found in the configured WASM registry.");
+    };
+    let (filename, bytes) = match fetch_remote_wasm_component(&entry.download_url).await {
+        Ok(component) => component,
+        Err(error) => {
+            tracing::warn!(error = ?error, plugin = %entry.name, "WASM market component download failed");
+            return admin_plugin_result(1, "Could not download the WASM component.");
+        }
+    };
+    if filename != format!("{}.wasm", entry.name) {
+        return admin_plugin_result(
+            1,
+            "The registry component filename does not match its plugin name.",
+        );
+    }
+    let expected_sha256 = entry.sha256.to_ascii_lowercase();
+    if hex::encode(Sha256::digest(&bytes)) != expected_sha256 {
+        return admin_plugin_result(
+            1,
+            "The downloaded component does not match its SHA-256 checksum.",
+        );
+    }
+    install_wasm_market_component(&state, filename, bytes, &entry.version, &expected_sha256).await
+}
+async fn install_wasm_market_component(
+    state: &AppState,
+    filename: String,
+    bytes: Vec<u8>,
+    version: &str,
+    sha256: &str,
+) -> Response {
+    let Some(name) = filename.strip_suffix(".wasm") else {
+        return admin_plugin_result(1, "Only .wasm components are supported.");
+    };
+    if !crate::plugin_runtime::valid_plugin_name(name) {
+        return admin_plugin_result(1, "Invalid plugin name.");
+    }
+    if let Err(error) = crate::plugin_runtime::PluginRuntime::validate_component_bytes(&bytes) {
+        tracing::warn!(%error, plugin = %filename, "rejected invalid WASM plugin market component");
+        return admin_plugin_result(1, "The file is not a valid Blessing Skin WASM component.");
+    }
+
+    let enabled = state.config.plugins_dir.join(&filename);
+    let disabled = state
+        .config
+        .plugins_dir
+        .join(format!("{name}.wasm.disabled"));
+    if enabled.exists() && disabled.exists() {
+        return admin_plugin_result(1, "Conflicting enabled and disabled plugin files exist.");
+    }
+    let existing_path = if enabled.exists() {
+        Some(enabled.clone())
+    } else if disabled.exists() {
+        Some(disabled.clone())
+    } else {
+        None
+    };
+    if let Some(path) = existing_path {
+        if let Some(metadata) = read_wasm_plugin_market_metadata(state, name)
+            && metadata.version == version
+            && metadata.sha256.eq_ignore_ascii_case(sha256)
+        {
+            return admin_plugin_result(0, "This plugin version is already installed.");
+        }
+        let plugin_dir = state.config.plugins_dir.clone();
+        let name = name.to_owned();
+        let write_result = tokio::task::spawn_blocking(move || {
+            replace_component_file(&plugin_dir, &name, &path, &bytes)
+        })
+        .await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, plugin = %filename, "failed to replace WASM market component");
+                return unavailable();
+            }
+            Err(error) => {
+                tracing::error!(%error, plugin = %filename, "WASM market update task failed");
+                return unavailable();
+            }
+        }
+    } else {
+        let response = store_wasm_component(state, filename.clone(), bytes).await;
+        if !response.status().is_success() {
+            return response;
+        }
+    }
+
+    let plugin_dir = state.config.plugins_dir.clone();
+    let name = name.to_owned();
+    let version = version.to_owned();
+    let sha256 = sha256.to_ascii_lowercase();
+    match tokio::task::spawn_blocking(move || {
+        write_wasm_plugin_market_metadata(&plugin_dir, &name, &version, &sha256)
+    })
+    .await
+    {
+        Ok(Ok(())) => admin_plugin_result(
+            0,
+            "WASM component installed or updated. Restart the service to load it.",
+        ),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "could not save WASM plugin market version metadata");
+            admin_plugin_result(
+                0,
+                "Component installed or updated, but version metadata could not be saved. Restart the service.",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "WASM plugin market metadata task failed");
+            admin_plugin_result(
+                0,
+                "Component installed or updated, but version metadata could not be saved. Restart the service.",
+            )
+        }
+    }
+}
+
+fn wasm_plugin_market_metadata_path(
+    plugins_dir: &std::path::Path,
+    name: &str,
+) -> std::path::PathBuf {
+    plugins_dir.join(format!("{name}.wasm.market.json"))
+}
+
+fn read_wasm_plugin_market_metadata(
+    state: &AppState,
+    name: &str,
+) -> Option<WasmPluginMarketMetadata> {
+    let path = wasm_plugin_market_metadata_path(&state.config.plugins_dir, name);
+    let metadata = std::fs::read(path).ok()?;
+    let metadata = serde_json::from_slice::<WasmPluginMarketMetadata>(&metadata).ok()?;
+    (!metadata.version.trim().is_empty()
+        && metadata.sha256.len() == 64
+        && metadata.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(metadata)
+}
+
+fn write_wasm_plugin_market_metadata(
+    plugins_dir: &std::path::Path,
+    name: &str,
+    version: &str,
+    sha256: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(plugins_dir)?;
+    let sequence = WASM_PLUGIN_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = plugins_dir.join(format!(
+        ".{name}.market-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let destination = wasm_plugin_market_metadata_path(plugins_dir, name);
+    match std::fs::remove_file(&destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = serde_json::to_vec(&WasmPluginMarketMetadata {
+        version: version.to_owned(),
+        sha256: sha256.to_ascii_lowercase(),
+    })
+    .map_err(std::io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(&metadata).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn replace_component_file(
+    plugins_dir: &std::path::Path,
+    name: &str,
+    destination: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let sequence = WASM_PLUGIN_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = plugins_dir.join(format!(
+        ".{name}.component-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let backup = plugins_dir.join(format!(
+        ".{name}.component-{}-{sequence}.bak",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(destination, &backup) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, destination) {
+        let restore = std::fs::rename(&backup, destination);
+        let _ = std::fs::remove_file(&temporary);
+        return restore.and(Err(error));
+    }
+    if let Err(error) = std::fs::remove_file(backup) {
+        tracing::warn!(%error, plugin = name, "could not remove previous WASM component backup");
+    }
+    Ok(())
+}
+
+static WASM_PLUGIN_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 async fn web_admin_plugins_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4367,6 +4729,26 @@ fn public_download_ip(ip: IpAddr) -> bool {
 async fn fetch_remote_wasm_component(
     raw_url: &str,
 ) -> Result<(String, Vec<u8>), RemoteComponentError> {
+    let (url, bytes) =
+        fetch_remote_public_resource(raw_url, crate::plugin_runtime::COMPONENT_FILE_LIMIT).await?;
+    let filename = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|filename| !filename.is_empty())
+        .ok_or(RemoteComponentError::InvalidFilename)?;
+    let Some(name) = filename.strip_suffix(".wasm") else {
+        return Err(RemoteComponentError::InvalidFilename);
+    };
+    if !crate::plugin_runtime::valid_plugin_name(name) {
+        return Err(RemoteComponentError::InvalidFilename);
+    }
+    Ok((filename.to_owned(), bytes))
+}
+
+async fn fetch_remote_public_resource(
+    raw_url: &str,
+    max_bytes: u64,
+) -> Result<(reqwest::Url, Vec<u8>), RemoteComponentError> {
     let mut url = reqwest::Url::parse(raw_url).map_err(|_| RemoteComponentError::InvalidUrl)?;
     for redirect_count in 0..=5 {
         if !safe_remote_component_url(&url) {
@@ -4421,20 +4803,9 @@ async fn fetch_remote_wasm_component(
         }
         if response
             .content_length()
-            .is_some_and(|length| length > crate::plugin_runtime::COMPONENT_FILE_LIMIT)
+            .is_some_and(|length| length > max_bytes)
         {
             return Err(RemoteComponentError::TooLarge);
-        }
-        let filename = url
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .filter(|filename| !filename.is_empty())
-            .ok_or(RemoteComponentError::InvalidFilename)?;
-        let Some(name) = filename.strip_suffix(".wasm") else {
-            return Err(RemoteComponentError::InvalidFilename);
-        };
-        if !crate::plugin_runtime::valid_plugin_name(name) {
-            return Err(RemoteComponentError::InvalidFilename);
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -4442,16 +4813,68 @@ async fn fetch_remote_wasm_component(
             .await
             .map_err(|_| RemoteComponentError::Request)?
         {
-            if bytes.len().saturating_add(chunk.len())
-                > crate::plugin_runtime::COMPONENT_FILE_LIMIT as usize
-            {
+            if bytes.len().saturating_add(chunk.len()) > max_bytes as usize {
                 return Err(RemoteComponentError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);
         }
-        return Ok((filename.to_owned(), bytes));
+        return Ok((url, bytes));
     }
     Err(RemoteComponentError::TooManyRedirects)
+}
+
+async fn fetch_wasm_plugin_registry(
+    state: &AppState,
+) -> Result<Option<Vec<WasmPluginRegistryEntry>>, RemoteComponentError> {
+    let Some(url) = state.config.wasm_plugin_registry_url.as_deref() else {
+        return Ok(None);
+    };
+    let (_, bytes) = fetch_remote_public_resource(url, 1024 * 1024).await?;
+    parse_wasm_plugin_registry(&bytes)
+        .map(Some)
+        .map_err(|_| RemoteComponentError::InvalidFilename)
+}
+
+fn parse_wasm_plugin_registry(
+    bytes: &[u8],
+) -> Result<Vec<WasmPluginRegistryEntry>, serde_json::Error> {
+    let manifest: WasmPluginRegistryManifest = serde_json::from_slice(bytes)?;
+    if manifest.schema_version != 1 || manifest.plugins.len() > 500 {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported WASM plugin registry manifest",
+        )));
+    }
+    let mut names = std::collections::HashSet::new();
+    for entry in &manifest.plugins {
+        let component_url = reqwest::Url::parse(&entry.download_url);
+        let filename_matches = component_url.as_ref().is_ok_and(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .is_some_and(|filename| filename == format!("{}.wasm", entry.name))
+                && safe_remote_component_url(url)
+        });
+        if !crate::plugin_runtime::valid_plugin_name(&entry.name)
+            || entry.name.len() > 128
+            || !names.insert(entry.name.as_str())
+            || entry.version.trim().is_empty()
+            || entry.version.len() > 128
+            || entry.title.trim().is_empty()
+            || entry.title.len() > 200
+            || entry.description.len() > 4096
+            || entry.author.trim().is_empty()
+            || entry.author.len() > 200
+            || entry.sha256.len() != 64
+            || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !filename_matches
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid WASM plugin registry entry",
+            )));
+        }
+    }
+    Ok(manifest.plugins)
 }
 fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, std::io::Error> {
     let mut plugins = std::collections::BTreeMap::<String, (bool, bool)>::new();
@@ -13787,6 +14210,94 @@ mod tests {
     }
 
     #[test]
+    fn wasm_plugin_registry_v1_validates_metadata_urls_hashes_and_unique_names() {
+        let good_entry = serde_json::json!({
+            "name": "demo-plugin",
+            "version": "1.2.3",
+            "title": "Demo plugin",
+            "description": "A test plugin.",
+            "author": "Blessing Skin",
+            "download_url": "https://plugins.example.com/releases/demo-plugin.wasm",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let manifest = |plugins: Vec<serde_json::Value>| {
+            serde_json::json!({ "schema_version": 1, "plugins": plugins }).to_string()
+        };
+        assert_eq!(
+            super::parse_wasm_plugin_registry(manifest(vec![good_entry.clone()]).as_bytes())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            super::parse_wasm_plugin_registry(
+                manifest(vec![good_entry.clone(), good_entry.clone()]).as_bytes()
+            )
+            .is_err()
+        );
+
+        let mut bad_hash = good_entry.clone();
+        bad_hash["sha256"] = serde_json::json!("not-a-hash");
+        assert!(super::parse_wasm_plugin_registry(manifest(vec![bad_hash]).as_bytes()).is_err());
+
+        let mut unsafe_url = good_entry.clone();
+        unsafe_url["download_url"] =
+            serde_json::json!("https://127.0.0.1/releases/demo-plugin.wasm");
+        assert!(super::parse_wasm_plugin_registry(manifest(vec![unsafe_url]).as_bytes()).is_err());
+
+        let mut mismatched_name = good_entry;
+        mismatched_name["download_url"] =
+            serde_json::json!("https://plugins.example.com/releases/other.wasm");
+        assert!(
+            super::parse_wasm_plugin_registry(manifest(vec![mismatched_name]).as_bytes()).is_err()
+        );
+
+        let unsupported_version = serde_json::json!({ "schema_version": 2, "plugins": [] });
+        assert!(
+            super::parse_wasm_plugin_registry(unsupported_version.to_string().as_bytes()).is_err()
+        );
+    }
+    #[test]
+    fn replaces_wasm_market_component_without_leaving_partial_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "blessing-wasm-market-update-{}",
+            super::setup_csrf_token()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("demo-plugin.wasm");
+        std::fs::write(&destination, b"old component").unwrap();
+
+        super::replace_component_file(&directory, "demo-plugin", &destination, b"new component")
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new component");
+        let remaining = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining,
+            vec![std::ffi::OsString::from("demo-plugin.wasm")]
+        );
+
+        super::write_wasm_plugin_market_metadata(
+            &directory,
+            "demo-plugin",
+            "1.2.3",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let metadata = std::fs::read(super::wasm_plugin_market_metadata_path(
+            &directory,
+            "demo-plugin",
+        ))
+        .unwrap();
+        let metadata: super::WasmPluginMarketMetadata = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(metadata.version, "1.2.3");
+        assert_eq!(metadata.sha256, "a".repeat(64));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
     fn remote_wasm_download_requires_public_https_urls() {
         for raw in [
             "http://example.com/plugin.wasm",
@@ -14448,6 +14959,7 @@ mod tests {
             },
             textures_dir: PathBuf::new(),
             plugins_dir: PathBuf::new(),
+            wasm_plugin_registry_url: None,
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
             passport_private_key: None,
@@ -15141,6 +15653,7 @@ mod tests {
             },
             textures_dir: texture_test_dir.clone(),
             plugins_dir: PathBuf::new(),
+            wasm_plugin_registry_url: None,
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
             passport_private_key: None,

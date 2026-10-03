@@ -9,11 +9,13 @@ interface Props {
   onUpdate(): void
 }
 
-const Row: React.FC<Props> = (props) => {
-  const { plugin, isInstalling } = props
-
-  const allDeps = Object.entries(plugin.dependencies.all)
-  const unsatisfied = Object.keys(plugin.dependencies.unsatisfied)
+const Row: React.FC<Props> = ({
+  plugin,
+  isInstalling,
+  onInstall,
+  onUpdate,
+}) => {
+  const chinese = blessing.locale.startsWith('zh')
 
   return (
     <tr>
@@ -23,35 +25,17 @@ const Row: React.FC<Props> = (props) => {
         </div>
         <div>{plugin.name}</div>
       </td>
-      <td style={{ width: '37%' }}>{plugin.description}</td>
-      <td>{plugin.author}</td>
-      <td>{plugin.version}</td>
-      <td style={{ width: '100px' }}>
-        {allDeps.length === 0 ? (
-          <i>{t('admin.noDependencies')}</i>
-        ) : (
-          <div className="d-flex flex-column">
-            {allDeps.map(([name, constraint]) => {
-              const classes = [
-                'mb-1',
-                'badge',
-                `bg-${unsatisfied.includes(name) ? 'red' : 'green'}`,
-              ]
-              return (
-                <span key={name} className={classes.join(' ')}>
-                  {name}: {constraint}
-                </span>
-              )
-            })}
-          </div>
-        )}
+      <td style={{ width: '42%' }}>{plugin.description}</td>
+      <td>
+        <div>{plugin.author}</div>
+        <small>{plugin.version}</small>
       </td>
-      <td style={{ width: '12%' }}>
+      <td style={{ width: '14%' }}>
         {plugin.can_update ? (
           <button
             className="btn btn-success"
             disabled={isInstalling}
-            onClick={props.onUpdate}
+            onClick={onUpdate}
           >
             {isInstalling ? (
               <>
@@ -65,11 +49,15 @@ const Row: React.FC<Props> = (props) => {
               </>
             )}
           </button>
+        ) : plugin.installed ? (
+          <span className="badge bg-green">
+            {chinese ? '已安装' : 'Installed'}
+          </span>
         ) : (
           <button
-            className="btn btn-default"
-            disabled={props.isInstalling || !!plugin.installed}
-            onClick={props.onInstall}
+            className="btn btn-success"
+            disabled={isInstalling}
+            onClick={onInstall}
           >
             {isInstalling ? (
               <>

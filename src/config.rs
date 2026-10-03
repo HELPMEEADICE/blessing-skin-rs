@@ -11,6 +11,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub textures_dir: PathBuf,
     pub plugins_dir: PathBuf,
+    pub wasm_plugin_registry_url: Option<String>,
     pub app_url: String,
     pub passport_public_key: Option<Vec<u8>>,
     pub passport_private_key: Option<Vec<u8>>,
@@ -106,6 +107,9 @@ impl Config {
             database: DatabaseConfig::from_env(table_prefix)?,
             textures_dir,
             plugins_dir,
+            wasm_plugin_registry_url: env::var("WASM_PLUGIN_REGISTRY_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             app_url: env::var("APP_URL").unwrap_or_else(|_| "http://localhost".to_owned()),
             passport_public_key,
             passport_private_key: load_passport_key(

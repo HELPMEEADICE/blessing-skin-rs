@@ -39,6 +39,7 @@ cargo build --locked --release
 | `PUBLIC_PATH`                                      | 默认 `public`；前端静态资源从此目录的 `app/` 子目录提供                                                                |
 | `TEXTURES_DIR`                                     | 默认 `$STORAGE_PATH/textures`；请指向旧站实际纹理目录                                                                  |
 | `PLUGINS_DIR`                                      | 默认 `$STORAGE_PATH/plugins`；只扫描 `.wasm` 组件，不运行 PHP 插件                                                     |
+| `WASM_PLUGIN_REGISTRY_URL`                         | 可选；管理员插件市场使用的可信版本 1 JSON 清单 URL，必须为公网 HTTPS；未设置时市场安装功能关闭                         |
 | `APP_URL`                                          | 对外站点 URL，默认 `http://localhost`                                                                                  |
 | `APP_LOCALE`                                       | 默认 `zh_CN`                                                                                                           |
 | `APP_KEY`                                          | 可选；新安装会在 `$STORAGE_PATH/app.key` 生成，用于签发网页登录 session。切换时用户需要重新登录                        |
@@ -47,7 +48,7 @@ cargo build --locked --release
 | `PWD_METHOD`, `SALT`                               | 兼容旧密码格式所需设置；保留旧站的原值                                                                                 |
 | `MAIL_MAILER`                                      | `smtp`、`log` 或 `array`；其余 SMTP 参数沿用 `MAIL_*`                                                                  |
 
-Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 已提供 Passport `/oauth/token` 的 password/refresh_token 授权、登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。
+Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 已提供 Passport `/oauth/token` 的 password/refresh_token 授权、登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。WASM 插件市场需要通过 `WASM_PLUGIN_REGISTRY_URL` 显式配置可信注册表，契约见 [plugin-registry-v1.md](plugin-registry-v1.md)；注册表不可用时市场安装会失败关闭。
 
 官方发行包包含 `public/app` 下的旧站前端 bundle；从源码部署时，可运行 `yarn install --frozen-lockfile` 和 `yarn build` 生成这些资源。Rust 服务通过 `PUBLIC_PATH/app` 提供它们。
 
