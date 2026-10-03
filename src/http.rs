@@ -14198,7 +14198,18 @@ fn render_skin_preview(skin: &RgbaImage, is_alex: bool, height: u32) -> DynamicI
 }
 
 fn render_cape_preview(cape: &RgbaImage, height: u32) -> DynamicImage {
-    let front = image::imageops::crop_imm(cape, 1, 1, 10, 16).to_image();
+    // The legacy renderer scales cape texture coordinates by the source HD ratio
+    // (width / 64), so a 128x64 cape uses a 20x32 front face starting at (2, 2).
+    let hd_ratio = (cape.width() / 64).max(1);
+    let crop_x = hd_ratio.min(cape.width().saturating_sub(1));
+    let crop_y = hd_ratio.min(cape.height().saturating_sub(1));
+    let crop_width = (10 * hd_ratio)
+        .min(cape.width().saturating_sub(crop_x))
+        .max(1);
+    let crop_height = (16 * hd_ratio)
+        .min(cape.height().saturating_sub(crop_y))
+        .max(1);
+    let front = image::imageops::crop_imm(cape, crop_x, crop_y, crop_width, crop_height).to_image();
     let width = (height.saturating_mul(10) / 16).max(1);
     DynamicImage::ImageRgba8(image::imageops::resize(
         &front,
@@ -15580,10 +15591,19 @@ mod tests {
         assert_eq!((skin_preview.width(), skin_preview.height()), (200, 200));
         assert!(skin_preview.pixels().any(|(_, _, pixel)| pixel[3] > 0));
 
-        let cape = RgbaImage::from_pixel(64, 32, Rgba([10, 120, 30, 255]));
+        let mut cape = RgbaImage::from_pixel(64, 32, Rgba([0, 0, 0, 255]));
+        for y in 1..17 {
+            for x in 1..11 {
+                cape.put_pixel(x, y, Rgba([10, 120, 30, 255]));
+            }
+        }
         let cape_preview = render_cape_preview(&cape, 160);
         assert_eq!((cape_preview.width(), cape_preview.height()), (100, 160));
         assert_eq!(cape_preview.get_pixel(0, 0), Rgba([10, 120, 30, 255]));
+
+        let cape_hd = image::imageops::resize(&cape, 128, 64, image::imageops::FilterType::Nearest);
+        let cape_hd_preview = render_cape_preview(&cape_hd, 160);
+        assert_eq!(cape_preview, cape_hd_preview);
     }
 
     #[test]
