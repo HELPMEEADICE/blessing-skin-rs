@@ -56,6 +56,11 @@ use crate::{
 
 tokio::task_local! {
     static REQUEST_LOCALE: String;
+    static REQUEST_QUERY_LOCALE: Option<String>;
+}
+
+fn explicit_request_locale() -> Option<String> {
+    REQUEST_QUERY_LOCALE.try_with(Clone::clone).ok().flatten()
 }
 
 pub(crate) fn request_locale(state: &AppState) -> String {
@@ -110,13 +115,31 @@ fn browser_preferred_locale(headers: &HeaderMap) -> Option<&'static str> {
     candidates.first().map(|(_, _, locale)| *locale)
 }
 
-fn select_request_locale(state: &AppState, request: &axum::extract::Request) -> String {
-    let query_locale = request.uri().query().and_then(|query| {
+fn requested_query_locale(request: &axum::extract::Request) -> Option<String> {
+    request.uri().query().and_then(|query| {
         form_urlencoded::parse(query.as_bytes())
             .find(|(key, _)| key == "lang")
             .map(|(_, value)| value.into_owned())
             .filter(|value| !value.trim().is_empty())
-    });
+    })
+}
+
+fn is_user_facing_web_path(path: &str) -> bool {
+    path == "/"
+        || path == "/auth"
+        || path.starts_with("/auth/")
+        || path == "/user"
+        || path.starts_with("/user/")
+        || path == "/admin"
+        || path.starts_with("/admin/")
+        || path == "/skinlib"
+        || path.starts_with("/skinlib/")
+        || path.starts_with("/texture/")
+}
+
+fn select_request_locale(state: &AppState, request: &axum::extract::Request) -> String {
+    let query_locale = requested_query_locale(request);
+
     let cookie_locale = request
         .headers()
         .get(COOKIE)
@@ -144,12 +167,46 @@ async fn detect_locale_preference(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let locale = select_request_locale(&state, &request);
     let path = request.uri().path();
-    let should_set_cookie = path != "/api" && !path.starts_with("/api/");
-    let mut response = REQUEST_LOCALE
-        .scope(locale.clone(), next.run(request))
-        .await;
+    let is_api = path == "/api" || path.starts_with("/api/");
+    let query_locale = requested_query_locale(&request);
+    let mut locale = select_request_locale(&state, &request);
+    if !is_api && is_user_facing_web_path(path) {
+        if let (Some(user_id), Some(database)) = (
+            session_user_id(&state, request.headers()),
+            state.database.as_ref(),
+        ) {
+            if let Some(requested) = query_locale.as_deref() {
+                if let Some(requested) = normalize_locale(requested) {
+                    if let Err(error) = database
+                        .update_user_locale(&state.config.database.table_prefix, user_id, requested)
+                        .await
+                    {
+                        tracing::warn!(%error, user_id, "failed to save authenticated user locale");
+                    }
+                    locale = requested.to_owned();
+                }
+            } else {
+                match database
+                    .user_locale(&state.config.database.table_prefix, user_id)
+                    .await
+                {
+                    Ok(Some(user_locale)) => {
+                        if let Some(user_locale) = normalize_locale(&user_locale) {
+                            locale = user_locale.to_owned();
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, user_id, "failed to load authenticated user locale");
+                    }
+                }
+            }
+        }
+    }
+    let should_set_cookie = !is_api;
+    let response = REQUEST_LOCALE.scope(locale.clone(), next.run(request));
+    let mut response = REQUEST_QUERY_LOCALE.scope(query_locale, response).await;
     if should_set_cookie {
         if let Ok(cookie) = HeaderValue::from_str(&format!(
             "locale={locale}; Path=/; Max-Age=7200; SameSite=Lax"
@@ -2697,6 +2754,15 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
             return unavailable();
         }
     };
+    if let Some(locale) = explicit_request_locale().and_then(|locale| normalize_locale(&locale)) {
+        if let Err(error) = database
+            .update_user_locale(&state.config.database.table_prefix, credential.uid, locale)
+            .await
+        {
+            tracing::warn!(%error, user_id = credential.uid, "failed to save login locale");
+        }
+    }
+
     state
         .login_failures
         .lock()
@@ -16449,6 +16515,54 @@ mod tests {
         let already_bound = session_request(&app, &unbound_cookie, "GET", "/auth/bind", None).await;
         assert_eq!(already_bound.status(), StatusCode::SEE_OTHER);
         assert_eq!(already_bound.headers().get("location").unwrap(), "/user");
+
+        let locale_change = app
+            .clone()
+            .oneshot(
+                Request::get("/user/profile?lang=zh_TW")
+                    .header("cookie", &unbound_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locale_change.status(), StatusCode::OK);
+        assert!(
+            locale_change
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie.to_str().unwrap().starts_with("locale=zh_TW;"))
+        );
+        assert_eq!(
+            crate::database::DatabasePool::Sqlite(pool.clone())
+                .user_locale("", 9)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zh_TW")
+        );
+
+        let stored_user_locale = app
+            .clone()
+            .oneshot(
+                Request::get("/user/profile")
+                    .header("cookie", format!("{unbound_cookie}; locale=en"))
+                    .header("accept-language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_user_locale.status(), StatusCode::OK);
+        let stored_user_locale_html = String::from_utf8(
+            to_bytes(stored_user_locale.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(stored_user_locale_html.contains("<html lang=\"zh_TW\">"));
         let homepage = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -18473,7 +18587,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/auth/login")
+                    .uri("/auth/login?lang=zh_TW")
                     .header("cookie", captcha_cookie)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -18514,6 +18628,17 @@ mod tests {
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["code"], 0);
         assert_eq!(result["data"]["redirectTo"], "/skinlib");
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>("SELECT locale FROM users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zh_TW")
+        );
+        let restore_login_locale =
+            session_request(&app, &cookie, "GET", "/user/profile?lang=en", None).await;
+        assert_eq!(restore_login_locale.status(), StatusCode::OK);
 
         let dashboard = app
             .clone()

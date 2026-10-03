@@ -4727,6 +4727,67 @@ impl DatabasePool {
         Ok(())
     }
 
+    pub async fn user_locale(&self, prefix: &str, uid: i64) -> Result<Option<String>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("SELECT locale FROM {prefix}users WHERE uid = $1 LIMIT 1"),
+            _ => format!("SELECT locale FROM {prefix}users WHERE uid = ? LIMIT 1"),
+        };
+        match self {
+            Self::Sqlite(pool) => sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_optional(pool)
+                .await
+                .map(Option::flatten),
+            Self::MySql(pool) => sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .fetch_optional(pool)
+                .await
+                .map(Option::flatten),
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
+                    .bind(uid)
+                    .fetch_optional(pool)
+                    .await
+                    .map(Option::flatten)
+            }
+        }
+    }
+
+    pub async fn update_user_locale(
+        &self,
+        prefix: &str,
+        uid: i64,
+        locale: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!("UPDATE {prefix}users SET locale = $1 WHERE uid = $2"),
+            _ => format!("UPDATE {prefix}users SET locale = ? WHERE uid = ?"),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(locale)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(locale)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(locale)
+                    .bind(uid)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn credentials_by_user_id(
         &self,
         prefix: &str,
@@ -7991,6 +8052,18 @@ mod tests {
         assert_eq!(user.email, "alex@example.test");
         assert_eq!(user.nickname, "Alex User");
         assert_eq!(user.locale.as_deref(), Some("zh_CN"));
+        assert_eq!(
+            database.user_locale("bs_", 7).await.unwrap().as_deref(),
+            Some("zh_CN")
+        );
+        database
+            .update_user_locale("bs_", 7, "ru_RU")
+            .await
+            .unwrap();
+        assert_eq!(
+            database.user_locale("bs_", 7).await.unwrap().as_deref(),
+            Some("ru_RU")
+        );
         assert_eq!(user.score, 37);
         assert_eq!(user.avatar, 11);
         assert!(user.verified);
