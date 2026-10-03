@@ -22,11 +22,12 @@ jobs:
         run: python -m unittest tools.test_compat_compare
 
   legacy-db-compat:
-    name: Legacy MySQL and PostgreSQL table compatibility
+    name: Legacy MySQL, MariaDB, and PostgreSQL table compatibility
     runs-on: ubuntu-24.04
     env:
       BS_REQUIRE_DATABASE_COMPAT: '1'
       BS_TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306/blessing_skin_test
+      BS_TEST_MARIADB_URL: mysql://root:root@127.0.0.1:3307/blessing_skin_test
       BS_TEST_POSTGRES_URL: postgres://postgres:root@127.0.0.1:5432/blessing_skin_test
     services:
       mysql:
@@ -38,6 +39,16 @@ jobs:
           - 3306:3306
         options: >-
           --health-cmd "mysqladmin ping --host=127.0.0.1 --user=root --password=root"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: blessing_skin_test
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
           --health-interval 10s --health-timeout 5s --health-retries 10
       postgres:
         image: postgres:16
@@ -52,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify old schema reads and writes on MySQL and PostgreSQL
+      - name: Verify old schema reads and writes on MySQL, MariaDB, and PostgreSQL
         run: cargo test --locked legacy_database_compatibility -- --test-threads=1
   build:
     name: ${{ matrix.name }}

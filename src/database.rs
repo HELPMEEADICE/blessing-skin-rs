@@ -8472,6 +8472,22 @@ mod language_line_tests {
     }
 
     #[tokio::test]
+    async fn mariadb_legacy_database_compatibility_when_configured() {
+        let Some(url) = configured_compatibility_url("BS_TEST_MARIADB_URL") else {
+            return;
+        };
+        let options = url
+            .parse::<MySqlConnectOptions>()
+            .expect("valid MariaDB test URL");
+        let pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("MariaDB test database is reachable");
+        verifies_legacy_schema_read_write(DatabasePool::MySql(pool)).await;
+    }
+
+    #[tokio::test]
     async fn postgres_legacy_database_compatibility_when_configured() {
         let Some(url) = configured_compatibility_url("BS_TEST_POSTGRES_URL") else {
             return;
