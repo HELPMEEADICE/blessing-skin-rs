@@ -138,6 +138,11 @@ struct OAuthAuthorizePage {
     scopes: Vec<String>,
     auth_token: String,
     client_id: i64,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 #[derive(Serialize)]
 struct PassportAccessTokenClaims {
@@ -344,13 +349,39 @@ pub async fn authorize(
             );
         }
     };
+    let site_name = crate::http::site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet =
+        crate::http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script =
+        crate::http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = crate::http::load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = crate::http::encode_frontend_globals(
+        &state,
+        &site_name,
+        "oauth/authorize",
+        serde_json::json!({
+            "oauth": {
+                "auth_token": &auth_token,
+                "client_id": client_id,
+                "client_name": &client.name,
+                "scopes": &scopes,
+            }
+        }),
+        i18n,
+    );
     let page = OAuthAuthorizePage {
-        site_name: crate::http::site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         client_name: client.name,
         scopes,
         auth_token,
         client_id,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -1781,7 +1812,10 @@ mod integration_tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -1898,6 +1932,10 @@ mod integration_tests {
         ));
         std::fs::create_dir_all(&install_storage).unwrap();
         std::fs::write(install_storage.join("install.lock"), b"").unwrap();
+        let frontend_app = install_storage.join("app");
+        std::fs::create_dir_all(&frontend_app).unwrap();
+        std::fs::write(frontend_app.join("app.012abcd.js"), b"// test bundle").unwrap();
+        std::fs::write(frontend_app.join("style.012abcd.css"), b"/* test styles */").unwrap();
         let config = Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
@@ -1932,7 +1970,7 @@ mod integration_tests {
             mail_limits: Default::default(),
             storage_dir: install_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
-            public_dir: std::path::PathBuf::from("public"),
+            public_dir: install_storage.clone(),
             wasm_plugins: Vec::new(),
         });
 
@@ -2165,6 +2203,21 @@ mod integration_tests {
         .unwrap();
         assert!(page_html.contains("Third-party app"));
         assert!(page_html.contains("Plugin.Custom"));
+        assert!(page_html.contains("https://skin.example.test/app/app.012abcd.js"));
+        assert!(page_html.contains("https://skin.example.test/app/style.012abcd.css"));
+        let encoded_globals = page_html
+            .split_once("atob('")
+            .unwrap()
+            .1
+            .split_once(char::from(39))
+            .unwrap()
+            .0;
+        let globals: Value =
+            serde_json::from_slice(&STANDARD.decode(encoded_globals).unwrap()).unwrap();
+        assert_eq!(globals["route"], "oauth/authorize");
+        assert_eq!(globals["extra"]["oauth"]["client_id"], 3);
+        assert_eq!(globals["extra"]["oauth"]["client_name"], "Third-party app");
+        assert_eq!(globals["extra"]["oauth"]["scopes"][1], "Plugin.Custom");
         let authorize_token = hidden_input_value(&page_html, "auth_token");
         let authorize_form = form(&[
             ("auth_token", &authorize_token),

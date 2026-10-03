@@ -145,6 +145,11 @@ const routes: Route[] = [
     el: 'main',
   },
   {
+    path: 'oauth/authorize',
+    react: () => import('../views/auth/OAuthAuthorize'),
+    el: '#oauth-authorize-app',
+  },
+  {
     path: 'skinlib',
     react: () => import('../views/skinlib/SkinLibrary'),
     el: '.content-wrapper',
