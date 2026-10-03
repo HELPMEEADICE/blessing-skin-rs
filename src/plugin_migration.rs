@@ -330,17 +330,10 @@ impl bindings::exports::blessing_skin::plugin::lifecycle::Guest for Component {
         if !host_api_version.starts_with("1.") {
             return Err(format!("unsupported host API: {host_api_version}"));
         }
-        bindings::blessing_skin::plugin::host::log(
-            "info".to_owned(),
-            "plugin initialized".to_owned(),
-        )?;
-        let first_run = bindings::blessing_skin::plugin::state::get("initialized".to_owned())?
-            .is_none();
+        bindings::blessing_skin::plugin::host::log("info", "plugin initialized")?;
+        let first_run = bindings::blessing_skin::plugin::state::get("initialized")?.is_none();
         if first_run {
-            bindings::blessing_skin::plugin::state::set(
-                "initialized".to_owned(),
-                b"true".to_vec(),
-            )?;
+            bindings::blessing_skin::plugin::state::set("initialized", b"true")?;
         }
         Ok(())
     }
@@ -351,8 +344,8 @@ impl bindings::exports::blessing_skin::plugin::lifecycle::Guest for Component {
 impl bindings::exports::blessing_skin::plugin::events::Guest for Component {
     fn handle(name: String, payload: Vec<u8>) -> Result<(), String> {
         bindings::blessing_skin::plugin::host::log(
-            "debug".to_owned(),
-            format!("received event {name} with {} JSON bytes", payload.len()),
+            "debug",
+            &format!("received event {name} with {} JSON bytes", payload.len()),
         )?;
         Ok(())
     }
@@ -366,7 +359,7 @@ impl bindings::exports::blessing_skin::plugin::documentation::Guest for Componen
 
 impl bindings::exports::blessing_skin::plugin::configuration::Guest for Component {
     fn get() -> Result<Option<String>, String> {
-        let Some(value) = bindings::blessing_skin::plugin::state::get("configuration".to_owned())? else {
+        let Some(value) = bindings::blessing_skin::plugin::state::get("configuration")? else {
             return Ok(Some("{}".to_owned()));
         };
         let value = String::from_utf8(value)
@@ -375,10 +368,7 @@ impl bindings::exports::blessing_skin::plugin::configuration::Guest for Componen
     }
 
     fn set(configuration: String) -> Result<(), String> {
-        bindings::blessing_skin::plugin::state::set(
-            "configuration".to_owned(),
-            configuration.into_bytes(),
-        )
+        bindings::blessing_skin::plugin::state::set("configuration", configuration.as_bytes())
     }
 }
 
@@ -573,8 +563,8 @@ mod tests {
         assert!(source.contains("blessing_skin::plugin::events::Guest"));
         assert!(source.contains("blessing_skin::plugin::documentation::Guest"));
         assert!(source.contains("blessing_skin::plugin::configuration::Guest"));
-        assert!(source.contains("state::get(\"configuration\".to_owned())"));
-        assert!(source.contains("configuration.into_bytes()"));
+        assert!(source.contains("state::get(\"configuration\")"));
+        assert!(source.contains("configuration.as_bytes()"));
         assert!(output.join("migration-report.json").is_file());
         assert!(write_scaffold(&output, &report, &json).is_err());
         fs::remove_dir_all(root).unwrap();

@@ -6553,7 +6553,13 @@ async fn setup_database_save(
                 .await;
         }
     };
-    if let Err(error) = pool.ping().await {
+    let ping_result = pool.ping().await;
+    match &pool {
+        DatabasePool::Sqlite(pool) => pool.close().await,
+        DatabasePool::MySql(pool) => pool.close().await,
+        DatabasePool::Postgres(pool) => pool.close().await,
+    }
+    if let Err(error) = ping_result {
         tracing::warn!(%error, driver = %form.driver, "database ping failed during setup");
         let message = setup_message(
             &state,
@@ -6563,7 +6569,6 @@ async fn setup_database_save(
         return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY)
             .await;
     }
-    drop(pool);
     let env_file = state.env_file.clone();
     let entries = vec![
         ("DB_CONNECTION", form.driver.clone()),
