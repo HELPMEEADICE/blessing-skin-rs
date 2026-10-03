@@ -24,6 +24,6 @@ test('renders consent details and native approve and deny forms', () => {
   expect(getByText('Plugin.Custom')).toBeInTheDocument()
   expect(getAllByRole('button')).toHaveLength(2)
   expect(getAllByDisplayValue('signed-token')).toHaveLength(2)
-  expect(getByDisplayValue('42')).toBeInTheDocument()
+  expect(getAllByDisplayValue('42')).toHaveLength(2)
   expect(getByDisplayValue('DELETE')).toBeInTheDocument()
 })
