@@ -14143,76 +14143,8 @@ async fn preview_for_texture(
     )
 }
 
-fn render_skin_preview(skin: &RgbaImage, is_alex: bool, height: u32) -> DynamicImage {
-    let mut character = RgbaImage::from_pixel(64, 128, Rgba([0, 0, 0, 0]));
-    draw_skin_part(
-        &mut character,
-        skin,
-        (8, 8),
-        Some((40, 8)),
-        (16, 0),
-        8,
-        8,
-        4,
-    );
-    draw_skin_part(
-        &mut character,
-        skin,
-        (20, 20),
-        Some((20, 36)),
-        (16, 32),
-        8,
-        12,
-        4,
-    );
-
-    let arm_width = if is_alex { 3 } else { 4 };
-    let arm_pixels = arm_width * 4;
-    let arm_left_x = 16_i64 - i64::from(arm_pixels);
-    let arm_right_x = 48;
-    let (left_arm_base, left_arm_overlay) = if skin.height() >= 64 {
-        ((36, 52), Some((52, 52)))
-    } else {
-        ((44, 20), None)
-    };
-    let mut left_arm = skin_part(skin, left_arm_base, left_arm_overlay, arm_width, 12);
-    if skin.height() < 64 {
-        left_arm = image::imageops::flip_horizontal(&left_arm);
-    }
-    draw_scaled_skin_part(&mut character, &left_arm, (arm_left_x, 32), 4);
-    let right_arm = skin_part(
-        skin,
-        (44, 20),
-        (skin.height() >= 64).then_some((44, 36)),
-        arm_width,
-        12,
-    );
-    draw_scaled_skin_part(&mut character, &right_arm, (arm_right_x, 32), 4);
-
-    let left_leg = if skin.height() >= 64 {
-        skin_part(skin, (20, 52), Some((4, 52)), 4, 12)
-    } else {
-        image::imageops::flip_horizontal(&skin_part(skin, (4, 20), None, 4, 12))
-    };
-    let right_leg = skin_part(
-        skin,
-        (4, 20),
-        (skin.height() >= 64).then_some((4, 36)),
-        4,
-        12,
-    );
-    draw_scaled_skin_part(&mut character, &left_leg, (16, 80), 4);
-    draw_scaled_skin_part(&mut character, &right_leg, (32, 80), 4);
-
-    let mut square = RgbaImage::from_pixel(256, 256, Rgba([0, 0, 0, 0]));
-    let character =
-        image::imageops::resize(&character, 128, 256, image::imageops::FilterType::Nearest);
-    image::imageops::overlay(&mut square, &character, 64, 0);
-    DynamicImage::ImageRgba8(square).resize_exact(
-        height,
-        height,
-        image::imageops::FilterType::Nearest,
-    )
+fn render_skin_preview(skin: &RgbaImage, is_alex: bool, _height: u32) -> DynamicImage {
+    crate::skin_renderer::render_preview(skin, is_alex)
 }
 
 fn render_cape_preview(cape: &RgbaImage, height: u32) -> DynamicImage {
@@ -14235,52 +14167,6 @@ fn render_cape_preview(cape: &RgbaImage, height: u32) -> DynamicImage {
         height,
         image::imageops::FilterType::Nearest,
     ))
-}
-
-fn draw_skin_part(
-    destination: &mut RgbaImage,
-    source: &RgbaImage,
-    base: (u32, u32),
-    overlay: Option<(u32, u32)>,
-    position: (i64, i64),
-    width: u32,
-    height: u32,
-    scale: u32,
-) {
-    let part = skin_part(source, base, overlay, width, height);
-    draw_scaled_skin_part(destination, &part, position, scale);
-}
-
-fn skin_part(
-    source: &RgbaImage,
-    base: (u32, u32),
-    overlay: Option<(u32, u32)>,
-    width: u32,
-    height: u32,
-) -> RgbaImage {
-    let mut part = image::imageops::crop_imm(source, base.0, base.1, width, height).to_image();
-    if let Some((x, y)) =
-        overlay.filter(|(x, y)| x + width <= source.width() && y + height <= source.height())
-    {
-        let layer = image::imageops::crop_imm(source, x, y, width, height).to_image();
-        image::imageops::overlay(&mut part, &layer, 0, 0);
-    }
-    part
-}
-
-fn draw_scaled_skin_part(
-    destination: &mut RgbaImage,
-    part: &RgbaImage,
-    position: (i64, i64),
-    scale: u32,
-) {
-    let part = image::imageops::resize(
-        part,
-        part.width() * scale,
-        part.height() * scale,
-        image::imageops::FilterType::Nearest,
-    );
-    image::imageops::overlay(destination, &part, position.0, position.1);
 }
 
 async fn avatar_by_player(
@@ -14532,80 +14418,7 @@ fn render_skin_avatar(skin: &RgbaImage, three_d: bool) -> DynamicImage {
     if skin.width() < 64 || skin.height() < 32 {
         return default_avatar(three_d);
     }
-    if !three_d {
-        let mut face = image::imageops::crop_imm(skin, 8, 8, 8, 8).to_image();
-        let hat = image::imageops::crop_imm(skin, 40, 8, 8, 8).to_image();
-        image::imageops::overlay(&mut face, &hat, 0, 0);
-        return DynamicImage::ImageRgba8(face);
-    }
-
-    let mut canvas = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
-    let right = textured_head_face(skin, (16, 8), Some((48, 8)));
-    let top = textured_head_face(skin, (8, 0), Some((40, 0)));
-    let front = textured_head_face(skin, (8, 8), Some((40, 8)));
-    draw_textured_quad(&mut canvas, &right, (43.0, 24.0), (11.0, -7.0), (0.0, 30.0));
-    draw_textured_quad(&mut canvas, &top, (13.0, 24.0), (30.0, 0.0), (11.0, -7.0));
-    draw_textured_quad(&mut canvas, &front, (13.0, 24.0), (30.0, 0.0), (0.0, 30.0));
-    DynamicImage::ImageRgba8(canvas)
-}
-
-fn textured_head_face(
-    skin: &RgbaImage,
-    base: (u32, u32),
-    overlay: Option<(u32, u32)>,
-) -> RgbaImage {
-    let mut face = image::imageops::crop_imm(skin, base.0, base.1, 8, 8).to_image();
-    if let Some((x, y)) = overlay {
-        let hat = image::imageops::crop_imm(skin, x, y, 8, 8).to_image();
-        image::imageops::overlay(&mut face, &hat, 0, 0);
-    }
-    face
-}
-
-fn draw_textured_quad(
-    destination: &mut RgbaImage,
-    texture: &RgbaImage,
-    origin: (f32, f32),
-    axis_u: (f32, f32),
-    axis_v: (f32, f32),
-) {
-    let determinant = axis_u.0 * axis_v.1 - axis_u.1 * axis_v.0;
-    if determinant.abs() < f32::EPSILON {
-        return;
-    }
-    for y in 0..destination.height() {
-        for x in 0..destination.width() {
-            let dx = x as f32 + 0.5 - origin.0;
-            let dy = y as f32 + 0.5 - origin.1;
-            let u = (dx * axis_v.1 - dy * axis_v.0) / determinant;
-            let v = (axis_u.0 * dy - axis_u.1 * dx) / determinant;
-            if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
-                let sx = (u * texture.width() as f32) as u32;
-                let sy = (v * texture.height() as f32) as u32;
-                let foreground = texture.get_pixel(sx.min(7), sy.min(7));
-                let background = destination.get_pixel(x, y);
-                let alpha = u32::from(foreground[3]);
-                if alpha == 255 {
-                    destination.put_pixel(x, y, *foreground);
-                } else if alpha > 0 {
-                    let background_alpha = u32::from(background[3]);
-                    let inverse_alpha = 255 - alpha;
-                    let output_alpha = alpha + (background_alpha * inverse_alpha + 127) / 255;
-                    let mut blended = [0_u8; 4];
-                    for channel in 0..3 {
-                        let front = u32::from(foreground[channel]) * alpha;
-                        let back =
-                            (u32::from(background[channel]) * background_alpha * inverse_alpha
-                                + 127)
-                                / 255;
-                        blended[channel] = ((front + back) / output_alpha.max(1)).min(255) as u8;
-                    }
-                    blended[3] = output_alpha.min(255) as u8;
-                    destination.put_pixel(x, y, Rgba(blended));
-                }
-            }
-        }
-    }
+    crate::skin_renderer::render_avatar(skin, three_d)
 }
 
 async fn serve_texture(state: &AppState, hash: &str, request_headers: &HeaderMap) -> Response {
@@ -15625,7 +15438,7 @@ mod tests {
     fn renders_square_skin_and_aspect_preserving_cape_previews() {
         let skin = RgbaImage::from_pixel(64, 64, Rgba([40, 80, 120, 255]));
         let skin_preview = render_skin_preview(&skin, true, 200);
-        assert_eq!((skin_preview.width(), skin_preview.height()), (200, 200));
+        assert!(skin_preview.width() > 300 && skin_preview.height() > 300);
         assert!(skin_preview.pixels().any(|(_, _, pixel)| pixel[3] > 0));
 
         let mut cape = RgbaImage::from_pixel(64, 32, Rgba([0, 0, 0, 255]));
@@ -15644,25 +15457,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_skin_avatar_uses_the_legacy_default_image() {
+        let skin = RgbaImage::new(8, 8);
+        for three_d in [false, true] {
+            assert_eq!(
+                render_skin_avatar(&skin, three_d).to_rgba8(),
+                super::default_avatar(three_d).to_rgba8()
+            );
+        }
+    }
+
+    #[test]
     fn renders_skin_face_and_isometric_avatar_layers() {
         let mut skin = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
-        for y in 8..16 {
-            for x in 8..16 {
+        for y in 0..16 {
+            for x in 0..32 {
                 skin.put_pixel(x, y, Rgba([220, 30, 40, 255]));
             }
         }
-        for y in 8..16 {
-            for x in 40..48 {
-                skin.put_pixel(x, y, Rgba([0, 0, 0, 0]));
-            }
-        }
         let flat = render_skin_avatar(&skin, false);
-        assert_eq!((flat.width(), flat.height()), (8, 8));
-        assert_eq!(flat.get_pixel(0, 0), Rgba([220, 30, 40, 255]));
+        assert!(flat.width() > 100 && flat.height() > 100);
+        assert!(flat.pixels().any(|(_, _, pixel)| pixel[0] >= 150
+            && pixel[1] < 100
+            && pixel[2] < 100
+            && pixel[3] > 0));
 
         let isometric = render_skin_avatar(&skin, true);
-        assert_eq!((isometric.width(), isometric.height()), (64, 64));
-        assert_eq!(isometric.get_pixel(20, 30), Rgba([220, 30, 40, 255]));
+        assert!(isometric.width() > 100 && isometric.height() > 100);
+        assert!(isometric.pixels().any(|(_, _, pixel)| pixel[0] >= 150
+            && pixel[1] < 100
+            && pixel[2] < 100
+            && pixel[3] > 0));
         assert!(isometric.pixels().any(|(_, _, pixel)| pixel[3] > 0));
     }
 
@@ -20007,9 +19832,9 @@ mod tests {
             .unwrap();
         let decoded_skin_preview =
             image::load_from_memory_with_format(&skin_preview_bytes, ImageFormat::Png).unwrap();
-        assert_eq!(
-            (decoded_skin_preview.width(), decoded_skin_preview.height()),
-            (200, 200)
+        assert!(
+            decoded_skin_preview.width() > 400 && decoded_skin_preview.height() > 400,
+            "expected the PHP-compatible two-view skin preview canvas"
         );
         let cached_skin_preview = app
             .clone()

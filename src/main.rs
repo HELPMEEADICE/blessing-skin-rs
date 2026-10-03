@@ -9,6 +9,7 @@ mod installer;
 mod mailer;
 mod oauth;
 mod plugin_runtime;
+mod skin_renderer;
 
 use std::{
     collections::HashMap,
