@@ -9932,6 +9932,16 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to toggle user verification");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.verification.updated",
+                serde_json::json!({
+                    "user_id": target_uid,
+                    "previous_verified": target.verified,
+                    "verified": !target.verified,
+                }),
+            )
+            .await;
             admin_user_success(AdminUserMutation::Verification, &state.config.locale, None)
         }
         AdminUserMutation::Nickname => {
@@ -10030,6 +10040,16 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user score");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.score.updated",
+                serde_json::json!({
+                    "user_id": target_uid,
+                    "previous_score": target.score,
+                    "score": score,
+                }),
+            )
+            .await;
             admin_user_success(AdminUserMutation::Score, &state.config.locale, None)
         }
         AdminUserMutation::Permission => {
@@ -10057,6 +10077,16 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user permission");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.permission.updated",
+                serde_json::json!({
+                    "user_id": target_uid,
+                    "previous_permission": target.permission,
+                    "permission": permission,
+                }),
+            )
+            .await;
             admin_user_success(AdminUserMutation::Permission, &state.config.locale, None)
         }
         AdminUserMutation::Delete => match database

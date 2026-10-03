@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.3.0";
+const HOST_API_VERSION: &str = "1.4.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -31,6 +31,9 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.profile.updated",
     "user.avatar.updated",
     "user.deleted",
+    "user.verification.updated",
+    "user.permission.updated",
+    "user.score.updated",
     "player.added",
     "player.renamed",
     "player.deleted",
@@ -647,6 +650,27 @@ mod tests {
     #[test]
     fn plugin_events_are_allowlisted_bounded_json_objects() {
         assert!(validate_plugin_event("user.logged-in", br#"{"user_id":7}"#).is_ok());
+        assert!(
+            validate_plugin_event(
+                "user.verification.updated",
+                br#"{"user_id":7,"previous_verified":false,"verified":true}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "user.permission.updated",
+                br#"{"user_id":7,"previous_permission":0,"permission":1}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "user.score.updated",
+                br#"{"user_id":7,"previous_score":10,"score":12}"#
+            )
+            .is_ok()
+        );
         assert!(
             validate_plugin_event(
                 "player.owner.updated",

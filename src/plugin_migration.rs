@@ -314,7 +314,7 @@ fn write_scaffold(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"Rust/WASM port scaffold for a legacy Blessing Skin plugin\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nwit-bindgen = \"0.62\"\n\n[profile.release]\nlto = true\nopt-level = \"s\"\ncodegen-units = 1\npanic = \"abort\"\n"
     );
     let readme = format!(
-        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports versioned logging and plugin-scoped key/value state, and exports an optional event handler. State is binary data stored in the Rust-only `wasm_plugin_state` table; one plugin may keep at most 256 keys, 64 KiB per value, and 1 MiB total. Host API version 1.3 checkpoints state after initialization, successful event callbacks, and successful shutdown. The host does not grant filesystem, network, raw database, or WASI access.\n"
+        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports versioned logging and plugin-scoped key/value state, and exports an optional event handler. State is binary data stored in the Rust-only `wasm_plugin_state` table; one plugin may keep at most 256 keys, 64 KiB per value, and 1 MiB total. Host API version 1.4 checkpoints state after initialization, successful event callbacks, and successful shutdown. The host does not grant filesystem, network, raw database, or WASI access.\n"
     );
     let source = r#"mod bindings {
     wit_bindgen::generate!({
@@ -517,7 +517,7 @@ mod tests {
         let source = fs::read_to_string(output.join("src/lib.rs")).unwrap();
         let readme = fs::read_to_string(output.join("README.md")).unwrap();
         assert!(manifest.contains("name = \"fancy-addon-plugin\""));
-        assert!(readme.contains("Host API version 1.3"));
+        assert!(readme.contains("Host API version 1.4"));
         assert!(wit.contains("blessing-skin:plugin@1.0.0"));
         assert!(wit.contains("interface host"));
         assert!(wit.contains("interface state"));
