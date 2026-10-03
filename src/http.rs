@@ -53,6 +53,22 @@ use crate::{
     image_cache::{CachedImage, ImageCacheKey},
 };
 
+async fn emit_plugin_event(state: &AppState, name: &str, payload: serde_json::Value) {
+    let payload = match serde_json::to_vec(&payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, event = name, "could not serialize WASM plugin event payload");
+            return;
+        }
+    };
+    state
+        .wasm_runtime
+        .lock()
+        .await
+        .dispatch_event(name, &payload)
+        .await;
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", any(live))
@@ -2240,6 +2256,12 @@ async fn handle_register(
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 response.headers_mut().insert(SET_COOKIE, value);
             }
+            emit_plugin_event(
+                &state,
+                "user.registered",
+                serde_json::json!({"user_id": uid}),
+            )
+            .await;
             response
         }
         Err(error) => {
@@ -2452,6 +2474,12 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     match HeaderValue::from_str(&cookie) {
         Ok(value) => {
             response.headers_mut().insert(SET_COOKIE, value);
+            emit_plugin_event(
+                &state,
+                "user.logged-in",
+                serde_json::json!({"user_id": credential.uid}),
+            )
+            .await;
             response
         }
         Err(error) => {
@@ -4677,6 +4705,12 @@ async fn web_add_player(
         .await
     {
         Ok(crate::database::PlayerAddOutcome::Added(player)) => {
+            emit_plugin_event(
+                &state,
+                "player.added",
+                serde_json::json!({"user_id": user.uid, "player_id": player.pid, "name": player.name}),
+            )
+            .await;
             let message = if state.config.locale.starts_with("zh") {
                 format!("成功添加了角色 {}", player.name)
             } else {
@@ -4886,15 +4920,23 @@ async fn web_delete_player(
         .delete_player(prefix, user.uid, player_id, return_score, score_reward)
         .await
     {
-        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => login_result(
-            0,
-            &if state.config.locale.starts_with("zh") {
-                format!("角色 {name} 已被删除")
-            } else {
-                format!("Player {name} was deleted successfully.")
-            },
-            None,
-        ),
+        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => {
+            emit_plugin_event(
+                &state,
+                "player.deleted",
+                serde_json::json!({"user_id": user.uid, "player_id": player_id, "name": name}),
+            )
+            .await;
+            login_result(
+                0,
+                &if state.config.locale.starts_with("zh") {
+                    format!("角色 {name} 已被删除")
+                } else {
+                    format!("Player {name} was deleted successfully.")
+                },
+                None,
+            )
+        }
         Ok(crate::database::PlayerDeleteOutcome::Forbidden) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -7503,6 +7545,12 @@ async fn api_add_player(
         .await
     {
         Ok(crate::database::PlayerAddOutcome::Added(player)) => {
+            emit_plugin_event(
+                &state,
+                "player.added",
+                serde_json::json!({"user_id": identity.user_id, "player_id": player.pid, "name": player.name}),
+            )
+            .await;
             let message = if state.config.locale.starts_with("zh") {
                 format!("成功添加了角色 {}", player.name)
             } else {
@@ -7582,15 +7630,23 @@ async fn api_delete_player(
         )
         .await
     {
-        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => login_result(
-            0,
-            &if state.config.locale.starts_with("zh") {
+        Ok(crate::database::PlayerDeleteOutcome::Deleted(name)) => {
+            emit_plugin_event(
+                &state,
+                "player.deleted",
+                serde_json::json!({"user_id": identity.user_id, "player_id": player_id, "name": name}),
+            )
+            .await;
+            login_result(
+                0,
+                &if state.config.locale.starts_with("zh") {
                 format!("角色 {name} 已被删除")
             } else {
                 format!("Player {name} was deleted successfully.")
             },
             None,
-        ),
+            )
+        }
         Ok(crate::database::PlayerDeleteOutcome::Forbidden) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -13472,6 +13528,7 @@ mod tests {
                 path
             },
             wasm_plugins: Vec::new(),
+            wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let login_before_install = app
             .clone()
@@ -13815,6 +13872,7 @@ mod tests {
             env_file: finish_env.clone(),
             public_dir: finish_public.clone(),
             wasm_plugins: Vec::new(),
+            wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let finish_page = finish_app
             .clone()
@@ -14177,6 +14235,7 @@ mod tests {
             env_file: std::path::PathBuf::from(".env"),
             public_dir: public_dir.clone(),
             wasm_plugins: Vec::new(),
+            wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let setup_page = app
             .clone()

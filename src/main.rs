@@ -39,6 +39,7 @@ pub struct AppState {
     pub mail_limits: Arc<Mutex<HashMap<String, Instant>>>,
     pub image_cache: Arc<image_cache::ImageCache>,
     pub wasm_plugins: Vec<String>,
+    pub wasm_runtime: Arc<tokio::sync::Mutex<plugin_runtime::PluginRuntime>>,
 }
 
 #[tokio::main]
@@ -80,13 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let mut plugins = plugin_runtime::PluginRuntime::load(
+    let plugins = plugin_runtime::PluginRuntime::load(
         &config.plugins_dir,
         database.clone(),
         &config.database.table_prefix,
     )
     .await?;
     let wasm_plugins = plugins.loaded_plugin_names();
+    let wasm_runtime = Arc::new(tokio::sync::Mutex::new(plugins));
 
     let session_key = config
         .app_key
@@ -125,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mail_limits: Arc::new(Mutex::new(HashMap::new())),
         image_cache: image_cache::ImageCache::shared(),
         wasm_plugins,
+        wasm_runtime: wasm_runtime.clone(),
     });
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "Blessing Skin Rust service listening");
@@ -132,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    plugins.shutdown().await;
+    wasm_runtime.lock().await.shutdown().await;
     Ok(())
 }
 

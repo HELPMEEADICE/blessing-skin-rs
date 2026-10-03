@@ -12,10 +12,11 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.1.0";
+const HOST_API_VERSION: &str = "1.2.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
+const PLUGIN_EVENTS_INTERFACE: &str = "blessing-skin:plugin/events@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const PLUGIN_LOG_MESSAGE_LIMIT: usize = 4 * 1024;
@@ -23,6 +24,13 @@ const PLUGIN_STATE_KEY_LIMIT: usize = 128;
 const PLUGIN_STATE_VALUE_LIMIT: usize = 64 * 1024;
 const PLUGIN_STATE_ENTRY_LIMIT: usize = 256;
 const PLUGIN_STATE_TOTAL_LIMIT: usize = 1024 * 1024;
+const PLUGIN_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
+const PLUGIN_EVENT_NAMES: &[&str] = &[
+    "user.logged-in",
+    "user.registered",
+    "player.added",
+    "player.deleted",
+];
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 
 struct PluginStore {
@@ -36,6 +44,7 @@ struct LoadedPlugin {
     store: Store<PluginStore>,
     instance: Instance,
     lifecycle: ComponentExportIndex,
+    events: Option<ComponentExportIndex>,
 }
 
 pub struct PluginRuntime {
@@ -45,6 +54,14 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
+    pub fn shared_empty() -> std::sync::Arc<tokio::sync::Mutex<Self>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(Self {
+            plugins: Vec::new(),
+            database: None,
+            table_prefix: String::new(),
+        }))
+    }
+
     pub async fn load(
         directory: &Path,
         database: Option<DatabasePool>,
@@ -270,11 +287,27 @@ impl PluginRuntime {
                 )
             })?;
         instance.get_typed_func::<(), ()>(&mut store, &shutdown_export)?;
+        let events = instance.get_export_index(&mut store, None, PLUGIN_EVENTS_INTERFACE);
+        if let Some(events_export) = &events {
+            let handle_export = instance
+                .get_export_index(&mut store, Some(events_export), "handle")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin events interface is missing handle",
+                    )
+                })?;
+            instance.get_typed_func::<(String, Vec<u8>), (Result<(), String>,)>(
+                &mut store,
+                &handle_export,
+            )?;
+        }
         self.plugins.push(LoadedPlugin {
             path: path.to_owned(),
             store,
             instance,
             lifecycle,
+            events,
         });
         tracing::info!(plugin = %path.display(), host_api = HOST_API_VERSION, "WASM plugin initialized");
         Ok(())
@@ -298,10 +331,91 @@ impl PluginRuntime {
         self.plugins.clear();
     }
 
+    pub async fn dispatch_event(&mut self, name: &str, payload: &[u8]) {
+        if let Err(error) = validate_plugin_event(name, payload) {
+            tracing::warn!(%error, event = name, size = payload.len(), "ignored invalid WASM plugin event");
+            return;
+        }
+
+        let (database, table_prefix) = (self.database.clone(), self.table_prefix.clone());
+        for plugin in &mut self.plugins {
+            let previous_state = plugin.store.data().state.clone();
+            let result = invoke_plugin_event(plugin, name, payload);
+            match result {
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Some(database) = &database {
+                        if let Err(error) =
+                            persist_plugin_state(database, &table_prefix, plugin).await
+                        {
+                            plugin.store.data_mut().state = previous_state;
+                            tracing::warn!(%error, plugin = %plugin.path.display(), event = name, "WASM plugin event state checkpoint failed; guest state was rolled back");
+                        }
+                    }
+                }
+                Err(error) => {
+                    plugin.store.data_mut().state = previous_state;
+                    tracing::warn!(%error, plugin = %plugin.path.display(), event = name, "WASM plugin event failed; continuing without its changes");
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn loaded_count(&self) -> usize {
         self.plugins.len()
     }
+}
+
+fn validate_plugin_event(name: &str, payload: &[u8]) -> Result<(), String> {
+    if !PLUGIN_EVENT_NAMES.contains(&name) {
+        return Err("unsupported plugin event name".into());
+    }
+    if payload.len() > PLUGIN_EVENT_PAYLOAD_LIMIT {
+        return Err(format!(
+            "plugin event payload exceeds {PLUGIN_EVENT_PAYLOAD_LIMIT} bytes"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| "plugin event payload must be UTF-8 JSON".to_owned())?;
+    if !value.is_object() {
+        return Err("plugin event payload must be a JSON object".into());
+    }
+    Ok(())
+}
+
+fn invoke_plugin_event(
+    plugin: &mut LoadedPlugin,
+    name: &str,
+    payload: &[u8],
+) -> Result<bool, String> {
+    let Some(events) = plugin.events.as_ref() else {
+        return Ok(false);
+    };
+    let handle_export = plugin
+        .instance
+        .get_export_index(&mut plugin.store, Some(events), "handle")
+        .ok_or_else(|| "missing plugin event handler".to_owned())?;
+    let handle = plugin
+        .instance
+        .get_typed_func::<(String, Vec<u8>), (Result<(), String>,)>(
+            &mut plugin.store,
+            &handle_export,
+        )
+        .map_err(|error| error.to_string())?;
+    plugin
+        .store
+        .set_fuel(COMPONENT_FUEL)
+        .map_err(|error| error.to_string())?;
+    let previous_state = plugin.store.data().state.clone();
+    let (result,) = handle
+        .call(&mut plugin.store, (name.to_owned(), payload.to_vec()))
+        .map_err(|error| error.to_string())?;
+    if let Err(message) = result {
+        plugin.store.data_mut().state = previous_state;
+        return Err(format!("plugin rejected event: {message}"));
+    }
+    Ok(plugin.store.data().state != previous_state)
 }
 
 fn validate_plugin_state_key(key: &str) -> Result<(), String> {
@@ -488,9 +602,10 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore,
-        StoreLimitsBuilder, checkpoint_plugin_state, log_plugin_message, plugin_state_delete,
-        plugin_state_get, plugin_state_set, validated_plugin_state,
+        PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT,
+        PluginRuntime, PluginStore, StoreLimitsBuilder, checkpoint_plugin_state,
+        log_plugin_message, plugin_state_delete, plugin_state_get, plugin_state_set,
+        validate_plugin_event, validated_plugin_state,
     };
     use std::{
         collections::HashMap,
@@ -512,6 +627,18 @@ mod tests {
     #[test]
     fn component_validation_rejects_non_component_bytes() {
         assert!(PluginRuntime::validate_component_bytes(b"not a wasm component").is_err());
+    }
+
+    #[test]
+    fn plugin_events_are_allowlisted_bounded_json_objects() {
+        assert!(validate_plugin_event("user.logged-in", br#"{"user_id":7}"#).is_ok());
+        assert!(validate_plugin_event("unsupported", b"{}").is_err());
+        assert!(validate_plugin_event("player.added", b"[]").is_err());
+        assert!(validate_plugin_event("player.deleted", b"not json").is_err());
+        assert!(
+            validate_plugin_event("player.added", &vec![b' '; PLUGIN_EVENT_PAYLOAD_LIMIT + 1])
+                .is_err()
+        );
     }
 
     #[test]

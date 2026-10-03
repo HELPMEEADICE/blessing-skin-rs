@@ -314,7 +314,7 @@ fn write_scaffold(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"Rust/WASM port scaffold for a legacy Blessing Skin plugin\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nwit-bindgen = \"0.62\"\n\n[profile.release]\nlto = true\nopt-level = \"s\"\ncodegen-units = 1\npanic = \"abort\"\n"
     );
     let readme = format!(
-        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports versioned logging and plugin-scoped key/value state. State is binary data stored in the Rust-only `wasm_plugin_state` table; one plugin may keep at most 256 keys, 64 KiB per value, and 1 MiB total. Host API version 1.1 checkpoints state after initialization and successful shutdown. The host does not grant filesystem, network, raw database, or WASI access.\n"
+        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports versioned logging and plugin-scoped key/value state, and exports an optional event handler. State is binary data stored in the Rust-only `wasm_plugin_state` table; one plugin may keep at most 256 keys, 64 KiB per value, and 1 MiB total. Host API version 1.2 checkpoints state after initialization, successful event callbacks, and successful shutdown. The host does not grant filesystem, network, raw database, or WASI access.\n"
     );
     let source = r#"mod bindings {
     wit_bindgen::generate!({
@@ -348,6 +348,16 @@ impl bindings::exports::blessing_skin::plugin::lifecycle::Guest for Component {
     fn shutdown() {}
 }
 
+impl bindings::exports::blessing_skin::plugin::events::Guest for Component {
+    fn handle(name: String, payload: Vec<u8>) -> Result<(), String> {
+        bindings::blessing_skin::plugin::host::log(
+            "debug".to_owned(),
+            format!("received event {name} with {} JSON bytes", payload.len()),
+        )?;
+        Ok(())
+    }
+}
+
 bindings::export!(Component with_types_in bindings);
 "#;
     let wit = r#"package blessing-skin:plugin@1.0.0;
@@ -367,10 +377,15 @@ interface lifecycle {
     shutdown: func();
 }
 
+interface events {
+    handle: func(name: string, payload: list<u8>) -> result<_, string>;
+}
+
 world plugin {
     import host;
     import state;
     export lifecycle;
+    export events;
 }
 "#;
     let files = [
@@ -504,6 +519,9 @@ mod tests {
         assert!(wit.contains("blessing-skin:plugin@1.0.0"));
         assert!(wit.contains("interface host"));
         assert!(wit.contains("interface state"));
+        assert!(wit.contains("interface events"));
+        assert!(wit.contains("handle: func(name: string, payload: list<u8>)"));
+        assert!(wit.contains("export events;"));
         assert!(wit.contains("get: func(key: string) -> result<option<list<u8>>, string>"));
         assert!(wit.contains("import host;"));
         assert!(wit.contains("import state;"));
@@ -511,6 +529,7 @@ mod tests {
         assert!(source.contains("blessing_skin::plugin::host::log"));
         assert!(source.contains("blessing_skin::plugin::state::get"));
         assert!(source.contains("blessing_skin::plugin::state::set"));
+        assert!(source.contains("blessing_skin::plugin::events::Guest"));
         assert!(output.join("migration-report.json").is_file());
         assert!(write_scaffold(&output, &report, &json).is_err());
         fs::remove_dir_all(root).unwrap();
