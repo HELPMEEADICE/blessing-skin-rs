@@ -10291,6 +10291,20 @@ fn valid_texture_dimensions(texture_type: &str, width: u32, height: u32) -> bool
         }
 }
 
+fn normalize_skin_dimensions(skin: &RgbaImage, texture_type: &str) -> Option<RgbaImage> {
+    if !valid_texture_dimensions(texture_type, skin.width(), skin.height()) {
+        return None;
+    }
+
+    let hd_ratio = skin.width() / 64;
+    let height = skin.height() / hd_ratio;
+    Some(if hd_ratio == 1 {
+        skin.clone()
+    } else {
+        image::imageops::resize(skin, 64, height, image::imageops::FilterType::Nearest)
+    })
+}
+
 fn upload_size_error(locale: &str, texture_type: &str, width: u32, height: u32) -> Response {
     let message = if locale.starts_with("zh") {
         let label = if texture_type == "cape" {
@@ -14070,7 +14084,7 @@ async fn preview_for_texture(
             request_headers,
         );
     }
-    let source = match tokio::fs::read(path).await {
+    let mut source = match tokio::fs::read(path).await {
         Ok(bytes) => match image::load_from_memory_with_format(&bytes, ImageFormat::Png) {
             Ok(image) => image.to_rgba8(),
             Err(error) => {
@@ -14084,9 +14098,13 @@ async fn preview_for_texture(
         }
     };
     let is_cape = texture.texture_type == "cape";
-    if (is_cape && (source.width() < 12 || source.height() < 17))
-        || (!is_cape && (source.width() != 64 || (source.height() != 64 && source.height() != 32)))
-    {
+    if is_cape {
+        if source.width() < 12 || source.height() < 17 {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+    } else if let Some(normalized) = normalize_skin_dimensions(&source, &texture.texture_type) {
+        source = normalized;
+    } else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let format = if use_png {
@@ -14456,9 +14474,8 @@ async fn render_avatar_response(
                     if let Ok(bytes) = tokio::fs::read(path).await {
                         source_skin = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
                             .ok()
-                            .filter(|image| {
-                                image.width() == 64
-                                    && (image.height() == 64 || image.height() == 32)
+                            .and_then(|image| {
+                                normalize_skin_dimensions(&image.to_rgba8(), &source.texture_type)
                             });
                     }
                     if source_skin.is_some() {
@@ -14470,7 +14487,7 @@ async fn render_avatar_response(
     }
 
     let image = match source_skin {
-        Some(skin) => render_skin_avatar(&skin.to_rgba8(), three_d),
+        Some(skin) => render_skin_avatar(&skin, three_d),
         None => default_avatar(three_d),
     };
     let image = image.resize_exact(size, size, image::imageops::FilterType::Nearest);
@@ -14792,8 +14809,8 @@ mod tests {
     use super::{
         AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
         PasswordResetPage, PluginConfigurationPage, RegisterPage, Rgba, RgbaImage, content_etag,
-        merge_frontend_language_lines, parse_legacy_datetime, public_download_ip,
-        render_cape_preview, render_skin_avatar, render_skin_preview, router,
+        merge_frontend_language_lines, normalize_skin_dimensions, parse_legacy_datetime,
+        public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview, router,
         safe_remote_component_url, valid_texture_hash,
     };
 
@@ -15582,6 +15599,26 @@ mod tests {
             super::texture_privacy_score_diff(&private_texture, 0, 10, 3, true),
             40
         );
+    }
+
+    #[test]
+    fn normalizes_hd_skin_dimensions_for_preview_and_avatar_rendering() {
+        for (texture_type, height) in [("steve", 32), ("steve", 64), ("alex", 64)] {
+            let base = RgbaImage::from_fn(64, height, |x, y| {
+                Rgba([(x * 3) as u8, (y * 5) as u8, (x + y) as u8, 255])
+            });
+            let hd = image::imageops::resize(
+                &base,
+                128,
+                height * 2,
+                image::imageops::FilterType::Nearest,
+            );
+            assert_eq!(
+                normalize_skin_dimensions(&hd, texture_type).as_ref(),
+                Some(&base)
+            );
+        }
+        assert!(normalize_skin_dimensions(&RgbaImage::new(128, 96), "steve").is_none());
     }
 
     #[test]
