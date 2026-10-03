@@ -2623,6 +2623,9 @@ struct SetupInfoPage {
     csrf: String,
     site_name: String,
     error: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -6214,12 +6217,23 @@ async fn setup_info_page(State(state): State<AppState>, headers: HeaderMap) -> R
         .flatten()
         .unwrap_or_else(|| "Blessing Skin".to_owned());
     let csrf = setup_csrf_for_page(&headers);
+    let extra = serde_json::json!({
+        "setup_info": {
+            "csrf": &csrf,
+            "site_name": &site_name,
+            "error": "",
+        }
+    });
+    let assets = setup_page_assets(&state, "setup/info", extra).await;
     render_setup_page(
         &SetupInfoPage {
             locale: state.config.locale.clone(),
             csrf: csrf.clone(),
             site_name,
             error: String::new(),
+            frontend_script_available: assets.frontend_script_available,
+            frontend_script: assets.frontend_script,
+            frontend_globals_b64: assets.frontend_globals_b64,
         },
         &headers,
         Some(&csrf),
@@ -6251,7 +6265,8 @@ async fn setup_finish(
                 "安装表单已过期，请刷新页面后重试。",
             ),
             StatusCode::FORBIDDEN,
-        );
+        )
+        .await;
     }
     let validation_error = if !form.email.contains('@')
         || form.email.len() > 100
@@ -6302,7 +6317,8 @@ async fn setup_finish(
             &form.site_name,
             error,
             StatusCode::BAD_REQUEST,
-        );
+        )
+        .await;
     }
     match crate::installer::install_with_details(
         &state.config,
@@ -6354,6 +6370,7 @@ async fn setup_finish(
                 message,
                 StatusCode::BAD_REQUEST,
             )
+            .await
         }
     }
 }
@@ -6401,7 +6418,7 @@ async fn setup_database_error(
     response
 }
 
-fn setup_info_error(
+async fn setup_info_error(
     state: &AppState,
     headers: &HeaderMap,
     site_name: &str,
@@ -6409,12 +6426,23 @@ fn setup_info_error(
     status: StatusCode,
 ) -> Response {
     let csrf = setup_csrf_for_page(&headers);
+    let extra = serde_json::json!({
+        "setup_info": {
+            "csrf": &csrf,
+            "site_name": site_name,
+            "error": &error,
+        }
+    });
+    let assets = setup_page_assets(state, "setup/info", extra).await;
     let mut response = render_setup_page(
         &SetupInfoPage {
             locale: state.config.locale.clone(),
             csrf: csrf.clone(),
             site_name: site_name.to_owned(),
             error,
+            frontend_script_available: assets.frontend_script_available,
+            frontend_script: assets.frontend_script,
+            frontend_globals_b64: assets.frontend_globals_b64,
         },
         headers,
         Some(&csrf),
@@ -13603,6 +13631,14 @@ mod tests {
             std::env::temp_dir().join(format!("blessing-skin-finish-db-{finish_token}.sqlite"));
         let finish_storage =
             std::env::temp_dir().join(format!("blessing-skin-finish-storage-{finish_token}"));
+        let finish_public =
+            std::env::temp_dir().join(format!("blessing-skin-finish-public-{finish_token}"));
+        std::fs::create_dir_all(finish_public.join("app")).unwrap();
+        std::fs::write(
+            finish_public.join("app/app.012abcd.js"),
+            b"window.setup = true;",
+        )
+        .unwrap();
         let finish_env =
             std::env::temp_dir().join(format!("blessing-skin-finish-env-{finish_token}"));
         let mut finish_config = config.clone();
@@ -13634,7 +13670,7 @@ mod tests {
             mail_limits: Default::default(),
             storage_dir: finish_storage.clone(),
             env_file: finish_env.clone(),
-            public_dir: PathBuf::from("public"),
+            public_dir: finish_public.clone(),
             wasm_plugins: Vec::new(),
         });
         let finish_page = finish_app
@@ -13653,6 +13689,78 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+        let finish_page_html = String::from_utf8(
+            to_bytes(finish_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(finish_page_html.contains("id=\"setup-info-app\""));
+        assert!(finish_page_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_finish_globals = finish_page_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let finish_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_finish_globals)
+            .unwrap();
+        let finish_globals: serde_json::Value =
+            serde_json::from_slice(&finish_globals_bytes).unwrap();
+        assert_eq!(finish_globals["route"], "setup/info");
+        assert_eq!(
+            finish_globals["extra"]["setup_info"]["csrf"],
+            finish_cookie.split_once('=').unwrap().1
+        );
+        let invalid_finish_form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", finish_cookie.split_once('=').unwrap().1)
+            .append_pair("email", "first-admin@example.test")
+            .append_pair("nickname", "First admin")
+            .append_pair("password", "correct horse")
+            .append_pair("password_confirmation", "different horse")
+            .append_pair("site_name", "Rust Skin")
+            .finish();
+        let invalid_finish = finish_app
+            .clone()
+            .oneshot(
+                Request::post("/setup/finish")
+                    .header("cookie", &finish_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(invalid_finish_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_finish.status(), StatusCode::BAD_REQUEST);
+        let invalid_finish_html = String::from_utf8(
+            to_bytes(invalid_finish.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(invalid_finish_html.contains("The passwords do not match."));
+        assert!(invalid_finish_html.contains("http://localhost/app/app.012abcd.js"));
+        let invalid_finish_globals = invalid_finish_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let invalid_finish_globals = base64::engine::general_purpose::STANDARD
+            .decode(invalid_finish_globals)
+            .unwrap();
+        let invalid_finish_globals: serde_json::Value =
+            serde_json::from_slice(&invalid_finish_globals).unwrap();
+        assert_eq!(invalid_finish_globals["route"], "setup/info");
+        assert_eq!(
+            invalid_finish_globals["extra"]["setup_info"]["error"],
+            "The passwords do not match."
+        );
         let finish_form = form_urlencoded::Serializer::new(String::new())
             .append_pair("csrf", finish_cookie.split_once('=').unwrap().1)
             .append_pair("email", "first-admin@example.test")
@@ -13711,6 +13819,7 @@ mod tests {
             pool.close().await;
         }
         std::fs::remove_dir_all(&finish_storage).unwrap();
+        std::fs::remove_dir_all(&finish_public).unwrap();
         std::fs::remove_file(&finish_database_file).unwrap();
         if finish_env.exists() {
             std::fs::remove_file(&finish_env).unwrap();
