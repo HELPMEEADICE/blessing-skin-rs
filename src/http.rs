@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/user", get(web_dashboard))
         .route("/user/reports", get(web_user_reports))
+        .route("/user/reports/list", get(web_user_report_list))
         .route("/user/oauth/manage", get(oauth_manage_page))
         .route("/user/notifications/{id}", post(web_read_notification))
         .route("/user/email-verification", post(send_verification_email))
@@ -337,6 +338,11 @@ struct AdminTranslationsPage {
 }
 
 #[derive(Deserialize, Default)]
+struct UserReportsQuery {
+    page: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
 struct AdminTranslationsQuery {
     page: Option<i64>,
     added: Option<i64>,
@@ -361,8 +367,14 @@ struct UserReportsPage {
     reports: Vec<UserReportView>,
     current_page: i64,
     last_page: i64,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
+#[derive(Serialize)]
 struct UserReportView {
     id: i64,
     tid: i64,
@@ -3916,7 +3928,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
 async fn web_user_reports(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AdminReportListQuery>,
+    Query(query): Query<UserReportsQuery>,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -3927,20 +3939,14 @@ async fn web_user_reports(
     };
     const PER_PAGE: i64 = 10;
     let current_page = query.page.unwrap_or(1).max(1);
-    let filters = ReportSearchFilters {
-        reporter: Some(user.uid),
-        ..Default::default()
-    };
-    let (items, total) = match database
-        .report_management_items(
-            &state.config.database.table_prefix,
-            &filters,
-            "report_at",
-            true,
-            current_page,
-            PER_PAGE,
-        )
-        .await
+    let (reports, total) = match user_report_page_data(
+        database,
+        &state.config.database.table_prefix,
+        user.uid,
+        current_page,
+        PER_PAGE,
+    )
+    .await
     {
         Ok(result) => result,
         Err(error) => {
@@ -3948,6 +3954,104 @@ async fn web_user_reports(
             return unavailable();
         }
     };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "user/reports",
+        serde_json::json!({}),
+        i18n,
+    );
+    let page = UserReportsPage {
+        site_name,
+        locale: state.config.locale.clone(),
+        reports,
+        current_page,
+        last_page: total
+            .saturating_add(PER_PAGE - 1)
+            .div_euclid(PER_PAGE)
+            .max(1),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render user report history");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_user_report_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UserReportsQuery>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    const PER_PAGE: i64 = 10;
+    let page = query.page.unwrap_or(1).max(1);
+    let (reports, total) = match user_report_page_data(
+        database,
+        &state.config.database.table_prefix,
+        user.uid,
+        page,
+        PER_PAGE,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, user_id = user.uid, "failed to load user report list");
+            return unavailable();
+        }
+    };
+    let last_page = total
+        .saturating_add(PER_PAGE - 1)
+        .div_euclid(PER_PAGE)
+        .max(1);
+    let offset = page.saturating_sub(1).saturating_mul(PER_PAGE);
+    let from = (!reports.is_empty()).then_some(offset + 1);
+    let to = (!reports.is_empty()).then_some(offset + reports.len() as i64);
+    Json(serde_json::json!({
+        "current_page": page,
+        "data": reports,
+        "last_page": last_page,
+        "per_page": PER_PAGE,
+        "from": from,
+        "to": to,
+        "total": total,
+    }))
+    .into_response()
+}
+
+async fn user_report_page_data(
+    database: &DatabasePool,
+    prefix: &str,
+    user_id: i64,
+    page: i64,
+    per_page: i64,
+) -> Result<(Vec<UserReportView>, i64), sqlx::Error> {
+    let filters = ReportSearchFilters {
+        reporter: Some(user_id),
+        ..Default::default()
+    };
+    let (items, total) = database
+        .report_management_items(prefix, &filters, "report_at", true, page, per_page)
+        .await?;
     let reports = items
         .into_iter()
         .map(|report| UserReportView {
@@ -3959,23 +4063,7 @@ async fn web_user_reports(
             report_at: report.report_at,
         })
         .collect();
-    let page = UserReportsPage {
-        site_name: site_name(&state).await,
-        locale: state.config.locale.clone(),
-        reports,
-        current_page,
-        last_page: total
-            .saturating_add(PER_PAGE - 1)
-            .div_euclid(PER_PAGE)
-            .max(1),
-    };
-    match page.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "failed to render user report history");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    Ok((reports, total))
 }
 
 async fn web_read_notification(
@@ -14243,9 +14331,51 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(tracked_reports.contains("my tracked report"));
-        assert!(!tracked_reports.contains("another user private report"));
-        assert!(tracked_reports.contains("Pending"));
+        assert!(tracked_reports.contains(r#"id="reports-list""#));
+        assert!(tracked_reports.contains("http://localhost/app/style.012abcd.css"));
+        assert!(tracked_reports.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_report_globals = tracked_reports
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let report_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_report_globals)
+            .unwrap();
+        let report_globals: serde_json::Value =
+            serde_json::from_slice(&report_globals_bytes).unwrap();
+        assert_eq!(report_globals["route"], "user/reports");
+        assert_eq!(report_globals["i18n"]["auth"]["login"], "Log In");
+
+        let tracked_report_list = session_request(
+            &app,
+            &registered_cookie,
+            "GET",
+            "/user/reports/list?page=1",
+            None,
+        )
+        .await;
+        assert_eq!(tracked_report_list.status(), StatusCode::OK);
+        let tracked_report_list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(tracked_report_list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tracked_report_list["total"], 1);
+        assert_eq!(tracked_report_list["data"][0]["tid"], 999);
+        assert_eq!(
+            tracked_report_list["data"][0]["reason"],
+            "my tracked report"
+        );
+        assert_eq!(tracked_report_list["data"][0]["status"], 0);
+        assert_eq!(
+            tracked_report_list["data"][0]["texture_name"],
+            serde_json::Value::Null
+        );
+        assert_eq!(tracked_report_list["data"].as_array().unwrap().len(), 1);
         sqlx::query("DELETE FROM reports WHERE reason IN ('my tracked report','another user private report')")
             .execute(&pool)
             .await

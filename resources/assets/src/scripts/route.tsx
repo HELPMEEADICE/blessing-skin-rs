@@ -22,6 +22,11 @@ const routes: Route[] = [
     ),
   },
   {
+    path: 'user/reports',
+    react: () => import('../views/user/Reports'),
+    el: '#reports-list',
+  },
+  {
     path: 'user/closet',
     react: () => import('../views/user/Closet'),
     el: '#closet-list',
