@@ -2659,13 +2659,16 @@ struct AdminPluginsPage {
 
 #[derive(Template)]
 #[template(
-    source = r#"<!doctype html><html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ plugin_name }} - {{ heading }}</title><style>body{font-family:system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#222}.message:empty{display:none}textarea{box-sizing:border-box;width:100%;min-height:26rem;font:13px ui-monospace,monospace;padding:.75rem}button{padding:.55rem 1rem} .message{padding:.75rem;background:#f3f4f6;margin:1rem 0;white-space:pre-wrap}</style></head><body><main><h1>{{ heading }}: {{ plugin_name }}</h1><p class="message">{{ message }}</p><form method="post" action="/admin/plugins/config/{{ plugin_name }}"><label for="configuration">JSON configuration</label><p>Settings are stored by this component and validated when saved.</p><textarea id="configuration" name="configuration" spellcheck="false">{{ configuration }}</textarea><p><button type="submit">{{ save_label }}</button> <a href="/admin/plugins/manage">{{ back_label }}</a></p></form></main></body></html>"#,
+    source = r#"<!doctype html><html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ plugin_name }} - {{ heading }}</title><style>body{font-family:system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#222}.message:empty{display:none}textarea{box-sizing:border-box;width:100%;min-height:26rem;font:13px ui-monospace,monospace;padding:.75rem}button{padding:.55rem 1rem} .message{padding:.75rem;background:#f3f4f6;margin:1rem 0;white-space:pre-wrap}</style></head><body><main><h1>{{ heading }}: {{ plugin_name }}</h1><p class="message">{{ message }}</p><form method="post" action="{{ base_url }}/admin/plugins/config/{{ plugin_name }}"><label for="configuration">{{ configuration_label }}</label><p>{{ description }}</p><textarea id="configuration" name="configuration" spellcheck="false">{{ configuration }}</textarea><p><button type="submit">{{ save_label }}</button> <a href="{{ base_url }}/admin/plugins/manage">{{ back_label }}</a></p></form></main></body></html>"#,
     ext = "html"
 )]
 struct PluginConfigurationPage {
     locale: String,
+    base_url: String,
     plugin_name: String,
     heading: String,
+    configuration_label: String,
+    description: String,
     configuration: String,
     message: String,
     save_label: String,
@@ -3900,11 +3903,24 @@ async fn web_admin_plugin_config(
     let chinese = state.config.locale.starts_with("zh");
     let page = PluginConfigurationPage {
         locale: state.config.locale.clone(),
+        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
         plugin_name: name,
         heading: if chinese {
             "插件设置"
         } else {
             "Plugin configuration"
+        }
+        .to_owned(),
+        configuration_label: if chinese {
+            "JSON 配置"
+        } else {
+            "JSON configuration"
+        }
+        .to_owned(),
+        description: if chinese {
+            "配置以 JSON 对象形式保存在组件的隔离状态中，保存时会校验格式。"
+        } else {
+            "Settings are stored by this component and validated when saved."
         }
         .to_owned(),
         configuration: match serde_json::from_str::<serde_json::Value>(&configuration)
@@ -13363,8 +13379,9 @@ mod tests {
 
     use super::{
         AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
-        PasswordResetPage, RegisterPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
-        render_cape_preview, render_skin_avatar, render_skin_preview, router, valid_texture_hash,
+        PasswordResetPage, PluginConfigurationPage, RegisterPage, Rgba, RgbaImage, content_etag,
+        parse_legacy_datetime, render_cape_preview, render_skin_avatar, render_skin_preview,
+        router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -13464,6 +13481,30 @@ mod tests {
         let id = cookie.split_once('=').unwrap().1.to_owned();
         let answer = challenges.lock().unwrap().get(&id).unwrap().0.clone();
         (cookie, answer)
+    }
+
+    #[test]
+    fn plugin_configuration_page_preserves_app_subpaths_and_escapes_values() {
+        let page = PluginConfigurationPage {
+            locale: "zh_CN".to_owned(),
+            base_url: "https://example.test/skin".to_owned(),
+            plugin_name: "demo-plugin".to_owned(),
+            heading: "插件设置".to_owned(),
+            configuration_label: "JSON 配置".to_owned(),
+            description: "设置说明".to_owned(),
+            configuration: r#"{"unsafe":"</textarea><script>alert(1)</script>"}"#.to_owned(),
+            message: String::new(),
+            save_label: "保存".to_owned(),
+            back_label: "返回插件管理".to_owned(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(
+            html.contains("action=\"https://example.test/skin/admin/plugins/config/demo-plugin\"")
+        );
+        assert!(html.contains("href=\"https://example.test/skin/admin/plugins/manage\""));
+        assert!(html.contains("JSON 配置"));
+        assert!(!html.contains("<script>alert(1)</script>"));
     }
 
     #[test]
