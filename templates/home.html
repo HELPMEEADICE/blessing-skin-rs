@@ -1,14 +1,88 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ locale }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ site_name }}</title>
-  <style>body{font:16px system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f9;color:#343a40}main{background:white;padding:2rem;border-radius:8px;box-shadow:0 8px 28px #0002;text-align:center}a{display:inline-block;background:#007bff;color:white;text-decoration:none;border-radius:4px;padding:.7rem 1.2rem}</style>
-  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
-</head>
-<body><main id="home-app"><h1>{{ site_name }}</h1><p>{{ title }}</p><a href="/auth/login">{{ login }}</a> <a href="/skinlib">{% if locale.starts_with("zh") %}浏览皮肤库{% else %}Browse skin library{% endif %}</a></main>
-  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="{{ theme_color }}" />
+    <meta name="keywords" content="{{ meta_keywords }}" />
+    <meta name="description" content="{{ meta_description }}" />
+    {{ meta_extras|safe }} {% if !cdn_address.is_empty() %}
+    <link rel="preconnect" href="{{ cdn_address }}" id="cdn-host" crossorigin />
+    {% endif %}
+    <link rel="shortcut icon" href="{{ favicon }}" />
+    <link rel="icon" type="image/png" href="{{ favicon }}" sizes="192x192" />
+    <link rel="apple-touch-icon" href="{{ favicon }}" sizes="180x180" />
+    <title>{{ site_name }}</title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      .hp-wrapper {
+        position: relative;
+        isolation: isolate;
+        min-height: 100vh;
+      }
+      .home-background {
+        position: absolute;
+        z-index: -1;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .home-background.fixed {
+        position: fixed;
+        height: 100vh;
+      }
+    </style>
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if home_css_available %}
+    <link
+      rel="stylesheet"
+      href="{{ home_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if !custom_css.is_empty() %}
+    <style>
+      {{ custom_css|safe }}
+    </style>
+    {% endif %} {% if !frontend_globals_b64.is_empty() %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body class="hold-transition layout-top-nav">
+    <div id="home-app">
+      <main>
+        <h1>{{ site_name }}</h1>
+        <p>{{ title }}</p>
+        <a href="/auth/login">{{ login }}</a>
+        <a href="/skinlib">{{ browse_skinlib }}</a>
+      </main>
+    </div>
+    {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %} {% if home_script_available %}
+    <script src="{{ home_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+    {% if !custom_js.is_empty() %}
+    <script>{{ custom_js|safe }}</script>
+    {% endif %}
+  </body>
 </html>

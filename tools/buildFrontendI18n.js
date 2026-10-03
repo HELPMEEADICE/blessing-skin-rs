@@ -26,6 +26,14 @@ for (const locale of fs.readdirSync(languageRoot).sort()) {
     throw new Error(`Expected a translation mapping in ${input}`)
   }
 
+  const indexPath = path.join(languageRoot, locale, 'index.yml')
+  if (fs.existsSync(indexPath)) {
+    const index = yaml.safeLoad(fs.readFileSync(indexPath, 'utf8'))
+    if (index && typeof index === 'object' && !Array.isArray(index)) {
+      translations.index = index
+    }
+  }
+
   fs.writeFileSync(
     path.join(outputRoot, `${locale}.json`),
     `${JSON.stringify(translations)}\n`,

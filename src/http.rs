@@ -2557,49 +2557,240 @@ struct HomePage {
     locale: String,
     title: String,
     login: String,
+    browse_skinlib: String,
+    favicon: String,
+    theme_color: &'static str,
+    meta_keywords: String,
+    meta_description: String,
+    meta_extras: String,
+    cdn_address: String,
+    home_css_available: bool,
+    home_stylesheet: String,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
     frontend_script: String,
+    home_script_available: bool,
+    home_script: String,
+    custom_css: String,
+    custom_js: String,
     frontend_globals_b64: String,
 }
 
-async fn home(State(state): State<AppState>) -> Response {
+async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let site_name = site_name(&state).await;
-    let chinese = state.config.locale.starts_with("zh");
+    let locale = &state.config.locale;
+    let chinese = locale.starts_with("zh");
     let title = if chinese { "皮肤站" } else { "Skin Server" }.to_owned();
     let login = if chinese { "登录" } else { "Log in" }.to_owned();
-    let browse_skinlib = if chinese {
-        "浏览皮肤库"
+    let register = if chinese {
+        "现在注册"
     } else {
-        "Browse skin library"
+        "Register Now"
+    }
+    .to_owned();
+    let browse_skinlib = if chinese { "皮肤库" } else { "Skin Library" }.to_owned();
+    let user_center = if chinese {
+        "用户中心"
+    } else {
+        "User Center"
+    }
+    .to_owned();
+    let admin_panel = if chinese {
+        "管理面板"
+    } else {
+        "Admin Panel"
+    }
+    .to_owned();
+    let logout = if chinese { "登出" } else { "Log Out" }.to_owned();
+    let site_description = localized_site_option(&state, "site_description")
+        .await
+        .unwrap_or_else(|| {
+            if chinese {
+                "Minecraft 皮肤上传与托管服务".to_owned()
+            } else {
+                "Open-source Minecraft skin hosting service".to_owned()
+            }
+        });
+    let home_pic_url = site_option(&state, "home_pic_url")
+        .await
+        .unwrap_or_else(|| "./app/bg.webp".to_owned());
+    let fixed_bg = option_is_enabled(&state, "fixed_bg").await;
+    let hide_intro = option_is_enabled(&state, "hide_intro").await;
+    let transparent_navbar = option_is_enabled(&state, "transparent_navbar").await;
+    let navbar_color = site_option(&state, "navbar_color")
+        .await
+        .filter(|color| {
+            matches!(
+                color.as_str(),
+                "primary"
+                    | "secondary"
+                    | "success"
+                    | "danger"
+                    | "indigo"
+                    | "purple"
+                    | "pink"
+                    | "teal"
+                    | "cyan"
+                    | "dark"
+                    | "gray"
+                    | "fuchsia"
+                    | "maroon"
+                    | "olive"
+                    | "navy"
+                    | "lime"
+                    | "light"
+                    | "warning"
+                    | "white"
+                    | "orange"
+            )
+        })
+        .unwrap_or_else(|| "cyan".to_owned());
+    let theme_color = match navbar_color.as_str() {
+        "primary" => "#007bff",
+        "secondary" | "gray" => "#6c757d",
+        "success" => "#28a745",
+        "warning" => "#ffc107",
+        "danger" => "#dc3545",
+        "navy" => "#001f3f",
+        "olive" => "#3d9970",
+        "lime" => "#01ff70",
+        "fuchsia" => "#f012be",
+        "maroon" => "#d81b60",
+        "indigo" => "#6610f2",
+        "purple" => "#6f42c1",
+        "pink" => "#e83e8c",
+        "orange" => "#fd7e14",
+        "teal" => "#20c997",
+        "cyan" => "#17a2b8",
+        _ => "#ffffff",
     };
+    let meta_keywords = site_option(&state, "meta_keywords")
+        .await
+        .unwrap_or_default();
+    let meta_description = site_option(&state, "meta_description")
+        .await
+        .unwrap_or_else(|| site_description.clone());
+    let meta_extras_raw = site_option(&state, "meta_extras").await.unwrap_or_default();
+    let mut meta_sanitizer = ammonia::Builder::default();
+    meta_sanitizer.tags(["meta"].into_iter().collect());
+    meta_sanitizer.generic_attributes(std::collections::HashSet::new());
+    meta_sanitizer.tag_attributes(
+        [(
+            "meta",
+            ["name", "content", "property", "charset", "http-equiv"]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let meta_extras = meta_sanitizer.clean(&meta_extras_raw).to_string();
+    let base_url = state.config.app_url.trim_end_matches('/');
+    let favicon_option = site_option(&state, "favicon_url")
+        .await
+        .unwrap_or_else(|| "app/favicon.ico".to_owned());
+    let favicon = if favicon_option.starts_with("http://") || favicon_option.starts_with("https://")
+    {
+        favicon_option
+    } else {
+        format!("{base_url}/{}", favicon_option.trim_start_matches('/'))
+    };
+    let cdn_address = site_option(&state, "cdn_address").await.unwrap_or_default();
+    let custom_css =
+        strip_configured_html_tags(&site_option(&state, "custom_css").await.unwrap_or_default());
+    let custom_js =
+        strip_configured_html_tags(&site_option(&state, "custom_js").await.unwrap_or_default());
+    let site_url = site_option(&state, "site_url")
+        .await
+        .unwrap_or_else(|| base_url.to_owned());
+    let copyright_prefer_key = format!("copyright_prefer_{locale}");
+    let copyright_prefer = site_option(&state, &copyright_prefer_key)
+        .await
+        .or(site_option(&state, "copyright_prefer").await)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value <= 6)
+        .unwrap_or_default();
+    let copyright_text = localized_site_option(&state, "copyright_text")
+        .await
+        .unwrap_or_default()
+        .replace("{site_name}", &site_name)
+        .replace("{site_url}", &site_url);
+
+    let mut authenticated_user = None;
+    if let (Some(database), Some(uid)) =
+        (state.database.as_ref(), session_user_id(&state, &headers))
+    {
+        match database
+            .user_profile(&state.config.database.table_prefix, uid)
+            .await
+        {
+            Ok(user) => authenticated_user = user,
+            Err(error) => tracing::warn!(%error, uid, "could not load homepage session user"),
+        }
+    }
+    let authenticated = authenticated_user.is_some();
+    let home_extra = serde_json::json!({
+        "title": &title,
+        "login": &login,
+        "register": &register,
+        "browse_skinlib": &browse_skinlib,
+        "user_center": &user_center,
+        "admin_panel": &admin_panel,
+        "logout": &logout,
+        "description": &site_description,
+        "background": &home_pic_url,
+        "fixed_bg": fixed_bg,
+        "hide_intro": hide_intro,
+        "navbar_color": &navbar_color,
+        "authenticated": authenticated,
+        "user_id": authenticated_user.as_ref().map(|user| user.uid),
+        "user_label": authenticated_user.as_ref().map(|user| {
+            if user.nickname.is_empty() { &user.email } else { &user.nickname }
+        }),
+        "permission": authenticated_user.as_ref().map(|user| user.permission),
+        "copyright_prefer": copyright_prefer,
+        "copyright_text": &copyright_text,
+    });
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let home_stylesheet =
+        frontend_entrypoint(&app_dir, "home-css", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let home_script = frontend_entrypoint(&app_dir, "home", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
         "home",
         serde_json::json!({
-            "home": {
-                "title": &title,
-                "login": &login,
-                "browse_skinlib": browse_skinlib,
-            }
+            "home": home_extra,
+            "transparent_navbar": transparent_navbar,
         }),
         i18n,
     );
     let page = HomePage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: locale.clone(),
         title,
         login,
+        browse_skinlib,
+        favicon,
+        theme_color,
+        meta_keywords,
+        meta_description,
+        meta_extras,
+        cdn_address,
+        home_css_available: home_stylesheet.is_some(),
+        home_stylesheet: home_stylesheet.unwrap_or_default(),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
         frontend_script: frontend_script.unwrap_or_default(),
+        home_script_available: home_script.is_some(),
+        home_script: home_script.unwrap_or_default(),
+        custom_css,
+        custom_js,
         frontend_globals_b64,
     };
     match page.render() {
@@ -2611,6 +2802,38 @@ async fn home(State(state): State<AppState>) -> Response {
     }
 }
 
+async fn site_option(state: &AppState, key: &str) -> Option<String> {
+    state
+        .database
+        .as_ref()?
+        .option(&state.config.database.table_prefix, key)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn localized_site_option(state: &AppState, key: &str) -> Option<String> {
+    let localized_key = format!("{key}_{}", state.config.locale);
+    site_option(state, &localized_key)
+        .await
+        .or(site_option(state, key).await)
+}
+
+async fn option_is_enabled(state: &AppState, key: &str) -> bool {
+    site_option(state, key).await.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn strip_configured_html_tags(value: &str) -> String {
+    let Ok(tag) = regex::Regex::new(r"(?is)</?[a-z!][^>]*>") else {
+        return value.to_owned();
+    };
+    tag.replace_all(value, "").into_owned()
+}
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardPage {
@@ -5117,15 +5340,9 @@ fn admin_chart_date_label(date: chrono::NaiveDate, locale: &str) -> String {
 }
 
 pub(crate) async fn site_name(state: &AppState) -> String {
-    match &state.database {
-        Some(database) => database
-            .option(&state.config.database.table_prefix, "site_name")
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "Blessing Skin".to_owned()),
-        None => "Blessing Skin".to_owned(),
-    }
+    localized_site_option(state, "site_name")
+        .await
+        .unwrap_or_else(|| "Blessing Skin".to_owned())
 }
 
 async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -14377,10 +14594,23 @@ mod tests {
             locale: "en".to_owned(),
             title: "Skin Server".to_owned(),
             login: "Log in".to_owned(),
+            browse_skinlib: "Browse skin library".to_owned(),
+            favicon: String::new(),
+            theme_color: "#17a2b8",
+            meta_keywords: String::new(),
+            meta_description: String::new(),
+            meta_extras: String::new(),
+            cdn_address: String::new(),
+            home_css_available: false,
+            home_stylesheet: String::new(),
             frontend_style_available: false,
             frontend_stylesheet: String::new(),
             frontend_script_available: false,
             frontend_script: String::new(),
+            home_script_available: false,
+            home_script: String::new(),
+            custom_css: String::new(),
+            custom_js: String::new(),
             frontend_globals_b64: String::new(),
         };
         let html = page.render().unwrap();
@@ -15685,6 +15915,26 @@ mod tests {
         std::fs::write(
             public_dir.join("app/style.012abcd.css"),
             "body { color: black; }",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/home-css.012abcd.css"),
+            "body { font-size: 16px; }",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/home.012abcd.js"),
+            "window.homeFixture = true;",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/home-css.012abcd.css"),
+            "body { font-size: 16px; }",
+        )
+        .unwrap();
+        std::fs::write(
+            public_dir.join("app/home.012abcd.js"),
+            "window.homeFixture = true;",
         )
         .unwrap();
         std::fs::write(
@@ -17118,6 +17368,53 @@ mod tests {
         )
         .unwrap();
         assert!(localized_home.contains("Settings Integration"));
+
+        sqlx::query(r#"INSERT OR REPLACE INTO options (option_name,option_value) VALUES ('site_description_en','Legacy site description'), ('home_pic_url','/uploads/home.webp'), ('fixed_bg','true'), ('hide_intro','true'), ('transparent_navbar','true'), ('navbar_color','purple'), ('favicon_url','/favicon.png'), ('meta_keywords','minecraft,skins'), ('meta_description','Legacy SEO summary'), ('meta_extras','<meta name="author" content="legacy"><script>alert(1)</script>'), ('custom_css','body { color: red; }'), ('custom_js','window.homeCustom = true;'), ('copyright_prefer_en','2'), ('copyright_text_en','For {site_name} at {site_url}')"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let customized_home = session_request(&app, &registered_cookie, "GET", "/", None).await;
+        assert_eq!(customized_home.status(), StatusCode::OK);
+        let customized_home = String::from_utf8(
+            to_bytes(customized_home.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(customized_home.contains(r#"content="Legacy SEO summary""#));
+        assert!(customized_home.contains("http://localhost/favicon.png"));
+        assert!(customized_home.contains(r#"name="author" content="legacy""#));
+        assert!(!customized_home.contains("<script>alert(1)</script>"));
+        assert!(customized_home.contains("window.homeCustom = true;"));
+        assert!(customized_home.contains("http://localhost/app/home-css.012abcd.css"));
+        assert!(customized_home.contains("http://localhost/app/home.012abcd.js"));
+        let encoded_home_globals = customized_home
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let home_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_home_globals)
+            .unwrap();
+        let home_globals: serde_json::Value = serde_json::from_slice(&home_globals_bytes).unwrap();
+        assert_eq!(home_globals["route"], "home");
+        assert_eq!(home_globals["site_name"], "Settings Integration");
+        assert_eq!(home_globals["extra"]["home"]["fixed_bg"], true);
+        assert_eq!(home_globals["extra"]["home"]["hide_intro"], true);
+        assert_eq!(home_globals["extra"]["home"]["navbar_color"], "purple");
+        assert_eq!(
+            home_globals["extra"]["home"]["description"],
+            "Legacy site description"
+        );
+        assert_eq!(
+            home_globals["extra"]["home"]["background"],
+            "/uploads/home.webp"
+        );
+        assert_eq!(home_globals["extra"]["home"]["user_label"], "NewGuy");
+        assert_eq!(home_globals["extra"]["transparent_navbar"], true);
         let invalid_setting = session_request(
             &app,
             &registered_cookie,
