@@ -45,6 +45,8 @@ const routes: Route[] = [
   {
     path: 'user/profile',
     module: [() => import('../views/user/profile/index')],
+    react: () => import('../views/user/Profile'),
+    el: '#profile-app',
   },
   {
     path: 'user/oauth/manage',

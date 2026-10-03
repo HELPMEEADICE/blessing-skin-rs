@@ -34,6 +34,8 @@ if (route) {
       typeof route.el === 'string'
         ? document.querySelector(route.el)
         : route.el ?? null
-    ReactDOM.render(<Root />, c)
+    if (c) {
+      ReactDOM.render(<Root />, c)
+    }
   }
 }

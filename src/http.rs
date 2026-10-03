@@ -403,6 +403,11 @@ struct UserProfilePage {
     locale: String,
     user: UserProfile,
     allow_delete: bool,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -3910,11 +3915,32 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         Ok(user) => user,
         Err(response) => return response,
     };
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let allow_delete = user.permission < 1;
+    let extra = serde_json::json!({
+        "profile": {
+            "nickname": &user.nickname,
+            "email": &user.email,
+            "avatar": user.avatar,
+            "allow_delete": allow_delete,
+        }
+    });
+    let frontend_globals_b64 =
+        encode_frontend_globals(&state, &site_name, "user/profile", extra, i18n);
     let page = UserProfilePage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
-        allow_delete: user.permission < 1,
         user,
+        allow_delete,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -14112,9 +14138,26 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(profile_html.contains("first@example.test"));
-        assert!(profile_html.contains("data-action=\"nickname\""));
-        assert!(profile_html.contains("avatar-form"));
+        assert!(profile_html.contains(r#"id="profile-app""#));
+        assert!(profile_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(profile_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_profile_globals = profile_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let profile_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_profile_globals)
+            .unwrap();
+        let profile_globals: serde_json::Value =
+            serde_json::from_slice(&profile_globals_bytes).unwrap();
+        assert_eq!(profile_globals["route"], "user/profile");
+        assert_eq!(
+            profile_globals["extra"]["profile"]["email"],
+            "first@example.test"
+        );
         let oauth_page =
             session_request(&app, &registered_cookie, "GET", "/user/oauth/manage", None).await;
         assert_eq!(oauth_page.status(), StatusCode::OK);
