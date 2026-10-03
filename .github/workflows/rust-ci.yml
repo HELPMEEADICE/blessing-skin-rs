@@ -65,6 +65,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify old schema reads and writes on MySQL, MariaDB, and PostgreSQL
         run: cargo test --locked legacy_database_compatibility -- --test-threads=1
+  plugin-scaffold:
+    name: Build generated WASM plugin scaffold
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - name: Install cargo-component
+        run: cargo install cargo-component --locked --version 0.21.1
+      - name: Generate scaffold from a legacy plugin fixture
+        run: >-
+          cargo run --locked --bin plugin-migrate --
+          tests/__mocks__/fake-with-views
+          --output "${{ runner.temp }}/plugin-scaffold"
+      - name: Build generated component
+        working-directory: ${{ runner.temp }}/plugin-scaffold
+        run: cargo component build --release
+
   build:
     name: ${{ matrix.name }}
     strategy:
