@@ -15799,7 +15799,11 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(plugins_html.contains("WASM plugin management"));
+        let normalized_plugins_html = plugins_html
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized_plugins_html.contains("WASM plugin management"));
         assert!(plugins_html.contains(r#"class="content"><div class="container-fluid""#));
         assert!(plugins_html.contains("http://localhost/app/app.012abcd.js"));
         let encoded_plugins_globals = plugins_html
