@@ -4899,7 +4899,7 @@ impl DatabasePool {
                  verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
             ),
             Self::MySql(_) => format!(
-                "SELECT CAST(uid AS BIGINT) AS uid, email, nickname, locale, CAST(score AS BIGINT) AS score, CAST(avatar AS BIGINT) AS avatar, permission, \
+                "SELECT CAST(uid AS SIGNED) AS uid, email, nickname, locale, CAST(score AS SIGNED) AS score, CAST(avatar AS SIGNED) AS avatar, permission, \
                  DATE_FORMAT(last_sign_at, '%Y-%m-%d %H:%i:%s') AS last_sign_at, \
                  DATE_FORMAT(register_at, '%Y-%m-%d %H:%i:%s') AS register_at, \
                  verified, is_dark_mode FROM {prefix}users WHERE uid = ? LIMIT 1"
