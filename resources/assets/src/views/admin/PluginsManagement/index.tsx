@@ -8,8 +8,9 @@ import FileInput from '@/components/FileInput'
 import Loading from '@/components/Loading'
 import InfoBox from './InfoBox'
 import type { Plugin } from './types'
+import WasmPlugins from './WasmPlugins'
 
-const PluginsManagement: React.FC = () => {
+const PhpPluginsManagement: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true)
   const [plugins, setPlugins] = useImmer<Plugin[]>([])
   const [file, setFile] = useState<File | null>(null)
@@ -243,5 +244,8 @@ const PluginsManagement: React.FC = () => {
     </div>
   )
 }
+
+const PluginsManagement: React.FC = () =>
+  blessing.extra?.wasm_plugins ? <WasmPlugins /> : <PhpPluginsManagement />
 
 export default hot(PluginsManagement)

@@ -2430,6 +2430,11 @@ struct AdminPluginsPage {
     site_name: String,
     locale: String,
     can_upload: bool,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -3432,10 +3437,31 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let can_upload = user.permission >= 2;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/plugins/manage",
+        serde_json::json!({
+            "wasm_plugins": true,
+            "can_upload": can_upload,
+        }),
+        i18n,
+    );
     let page = AdminPluginsPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
-        can_upload: user.permission >= 2,
+        can_upload,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -12275,11 +12301,12 @@ const COPYRIGHTS: [&str; 7] = [
 
 #[cfg(test)]
 mod tests {
+    use askama::Template;
     use image::{GenericImageView, ImageFormat};
 
     use super::{
-        Rgba, RgbaImage, content_etag, parse_legacy_datetime, render_cape_preview,
-        render_skin_avatar, render_skin_preview, router, valid_texture_hash,
+        AdminPluginsPage, Rgba, RgbaImage, content_etag, parse_legacy_datetime,
+        render_cape_preview, render_skin_avatar, render_skin_preview, router, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -12619,6 +12646,26 @@ mod tests {
         assert_eq!(super::parse_legacy_form_bool("0"), Some(false));
         assert_eq!(super::parse_legacy_form_bool("false"), Some(false));
         assert_eq!(super::parse_legacy_form_bool("maybe"), None);
+    }
+
+    #[test]
+    fn admin_plugins_page_keeps_inline_fallback_without_frontend_bundle() {
+        let page = AdminPluginsPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            can_upload: true,
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
+        assert!(html.contains("fetch('/admin/plugins/data'"));
+        assert!(html.contains("plugin-migrate"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
     #[test]
@@ -13874,6 +13921,23 @@ mod tests {
         )
         .unwrap();
         assert!(plugins_html.contains("WASM plugin management"));
+        assert!(plugins_html.contains(r#"class="content"><div class="container-fluid""#));
+        assert!(plugins_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_plugins_globals = plugins_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let plugins_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_plugins_globals)
+            .unwrap();
+        let plugins_globals: serde_json::Value =
+            serde_json::from_slice(&plugins_globals_bytes).unwrap();
+        assert_eq!(plugins_globals["route"], "admin/plugins/manage");
+        assert_eq!(plugins_globals["extra"]["wasm_plugins"], true);
+        assert_eq!(plugins_globals["extra"]["can_upload"], false);
         let plugin_data =
             session_request(&app, &admin_cookie, "GET", "/admin/plugins/data", None).await;
         assert_eq!(plugin_data.status(), StatusCode::OK);
