@@ -4375,7 +4375,15 @@ async fn web_read_notification(
         .read_notification(&state.config.database.table_prefix, user_id, &id)
         .await
     {
-        Ok(Some(notification)) => notification_detail(notification),
+        Ok(Some(notification)) => {
+            emit_plugin_event(
+                &state,
+                "notification.read",
+                serde_json::json!({"user_id": user_id, "notification_id": notification.id}),
+            )
+            .await;
+            notification_detail(notification)
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "message": "Notification not found." })),
@@ -6907,13 +6915,20 @@ async fn web_send_notification(
     };
     let data = serde_json::json!({ "title": title, "content": content }).to_string();
     for recipient in recipients {
+        let notification_id = new_notification_id();
         if let Err(error) = database
-            .create_site_notification(prefix, &new_notification_id(), recipient, &data)
+            .create_site_notification(prefix, &notification_id, recipient, &data)
             .await
         {
             tracing::error!(%error, recipient, sender_uid = user.uid, "failed to store admin notification");
             return unavailable();
         }
+        emit_plugin_event(
+            &state,
+            "notification.sent",
+            serde_json::json!({"sender_id": user.uid, "recipient_id": recipient, "notification_id": notification_id}),
+        )
+        .await;
     }
     if !is_json {
         Redirect::to("/admin").into_response()
@@ -7022,13 +7037,20 @@ async fn api_send_notification(
     };
     let data = serde_json::json!({ "title": title, "content": content }).to_string();
     for recipient in recipients {
+        let notification_id = new_notification_id();
         if let Err(error) = database
-            .create_site_notification(prefix, &new_notification_id(), recipient, &data)
+            .create_site_notification(prefix, &notification_id, recipient, &data)
             .await
         {
             tracing::error!(%error, recipient, "failed to store notification");
             return unavailable();
         }
+        emit_plugin_event(
+            &state,
+            "notification.sent",
+            serde_json::json!({"sender_id": identity.user_id, "recipient_id": recipient, "notification_id": notification_id}),
+        )
+        .await;
     }
     let mut response = StatusCode::FOUND.into_response();
     response
@@ -7152,7 +7174,15 @@ async fn api_read_notification(
         .read_notification(&state.config.database.table_prefix, identity.user_id, &id)
         .await
     {
-        Ok(Some(notification)) => notification_detail(notification),
+        Ok(Some(notification)) => {
+            emit_plugin_event(
+                &state,
+                "notification.read",
+                serde_json::json!({"user_id": identity.user_id, "notification_id": notification.id}),
+            )
+            .await;
+            notification_detail(notification)
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "message": "Notification not found." })),
@@ -8996,15 +9026,23 @@ async fn submit_skinlib_report(
         )
         .await
     {
-        Ok(crate::database::ReportSubmissionOutcome::Submitted) => login_result(
-            0,
-            if state.config.locale.starts_with("zh") {
-                "举报已提交，请等待管理员处理"
-            } else {
-                "Thanks for reporting! The administrators will review it as soon as possible."
-            },
-            None,
-        ),
+        Ok(crate::database::ReportSubmissionOutcome::Submitted) => {
+            emit_plugin_event(
+                &state,
+                "report.submitted",
+                serde_json::json!({"reporter_id": reporter.uid, "texture_id": tid, "uploader_id": texture.uploader}),
+            )
+            .await;
+            login_result(
+                0,
+                if state.config.locale.starts_with("zh") {
+                    "举报已提交，请等待管理员处理"
+                } else {
+                    "Thanks for reporting! The administrators will review it as soon as possible."
+                },
+                None,
+            )
+        }
         Ok(crate::database::ReportSubmissionOutcome::AlreadyReported) => login_result(
             1,
             if state.config.locale.starts_with("zh") {
@@ -11236,7 +11274,7 @@ async fn web_review_report(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            return review_report_action(&state, id, &body, user.permission).await;
+            return review_report_action(&state, id, &body, user.uid, user.permission).await;
         }
         Ok(Some(_)) => {
             return (
@@ -11274,7 +11312,8 @@ async fn api_review_report(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            return review_report_action(&state, id, &body, user.permission).await;
+            return review_report_action(&state, id, &body, identity.user_id, user.permission)
+                .await;
         }
         Ok(Some(_)) | Ok(None) => {
             return (
@@ -11294,6 +11333,7 @@ async fn review_report_action(
     state: &AppState,
     id: i64,
     body: &[u8],
+    admin_user_id: i64,
     admin_permission: i32,
 ) -> Response {
     let request = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -11323,7 +11363,8 @@ async fn review_report_action(
         }
     };
     if action == "delete" {
-        return delete_reported_texture(state, id, reporter_score_modification).await;
+        return delete_reported_texture(state, id, reporter_score_modification, admin_user_id)
+            .await;
     }
     let outcome = if action == "reject" {
         database
@@ -11358,8 +11399,24 @@ async fn review_report_action(
             .await
     };
     match outcome {
-        Ok(crate::database::ReportReviewOutcome::Rejected) => report_review_success(state, 2),
-        Ok(crate::database::ReportReviewOutcome::Resolved) => report_review_success(state, 1),
+        Ok(crate::database::ReportReviewOutcome::Rejected) => {
+            emit_plugin_event(
+                state,
+                "report.reviewed",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 2}),
+            )
+            .await;
+            report_review_success(state, 2)
+        }
+        Ok(crate::database::ReportReviewOutcome::Resolved) => {
+            emit_plugin_event(
+                state,
+                "report.reviewed",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 1}),
+            )
+            .await;
+            report_review_success(state, 1)
+        }
         Ok(crate::database::ReportReviewOutcome::UploaderNotFound) => {
             let message = if state.config.locale.starts_with("zh") {
                 "用户不存在"
@@ -11419,6 +11476,7 @@ async fn delete_reported_texture(
     state: &AppState,
     report_id: i64,
     reporter_score_modification: i64,
+    admin_user_id: i64,
 ) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -11470,15 +11528,23 @@ async fn delete_reported_texture(
             )
             .await
         {
-            Ok(crate::database::ReportReviewOutcome::Resolved) => login_result(
-                0,
-                if state.config.locale.starts_with("zh") {
-                    "请求的材质已被删除"
-                } else {
-                    "The requested texture has been deleted."
-                },
-                Some(serde_json::json!({ "status": 1 })),
-            ),
+            Ok(crate::database::ReportReviewOutcome::Resolved) => {
+                emit_plugin_event(
+                    state,
+                    "report.reviewed",
+                    serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
+                )
+                .await;
+                login_result(
+                    0,
+                    if state.config.locale.starts_with("zh") {
+                        "请求的材质已被删除"
+                    } else {
+                        "The requested texture has been deleted."
+                    },
+                    Some(serde_json::json!({ "status": 1 })),
+                )
+            }
             Ok(crate::database::ReportReviewOutcome::NotFound) => {
                 StatusCode::NOT_FOUND.into_response()
             }
@@ -11594,6 +11660,18 @@ async fn delete_reported_texture(
             }
         }
     }
+    emit_plugin_event(
+        state,
+        "texture.deleted",
+        serde_json::json!({"texture_id": texture.tid, "uploader_id": texture.uploader, "hash": texture.hash, "name": texture.name}),
+    )
+    .await;
+    emit_plugin_event(
+        state,
+        "report.reviewed",
+        serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
+    )
+    .await;
     report_review_success(state, 1)
 }
 

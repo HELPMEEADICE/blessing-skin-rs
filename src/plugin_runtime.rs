@@ -39,6 +39,10 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "texture.deleted",
     "texture.visibility.updated",
     "texture.type.updated",
+    "notification.sent",
+    "notification.read",
+    "report.submitted",
+    "report.reviewed",
 ];
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 
@@ -652,6 +656,34 @@ mod tests {
             validate_plugin_event(
                 "player.renamed",
                 br#"{"user_id":7,"player_id":3,"previous_name":"Alex","name":"Steve"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "notification.sent",
+                br#"{"sender_id":1,"recipient_id":7,"notification_id":"legacy-id"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "notification.read",
+                br#"{"user_id":7,"notification_id":"legacy-id"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.submitted",
+                br#"{"reporter_id":7,"texture_id":11,"uploader_id":3}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.reviewed",
+                br#"{"report_id":9,"admin_user_id":1,"action":"reject","status":2}"#
             )
             .is_ok()
         );
