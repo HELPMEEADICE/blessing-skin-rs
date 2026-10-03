@@ -73,8 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         installer::run(&config).await?;
         return Ok(());
     }
-    let mut plugins = plugin_runtime::PluginRuntime::load(&config.plugins_dir)?;
-    let wasm_plugins = plugins.loaded_plugin_names();
     let database = match DatabasePool::connect(&config.database).await {
         Ok(pool) => Some(pool),
         Err(error) => {
@@ -82,6 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    let mut plugins = plugin_runtime::PluginRuntime::load(
+        &config.plugins_dir,
+        database.clone(),
+        &config.database.table_prefix,
+    )
+    .await?;
+    let wasm_plugins = plugins.loaded_plugin_names();
 
     let session_key = config
         .app_key
@@ -127,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    plugins.shutdown();
+    plugins.shutdown().await;
     Ok(())
 }
 

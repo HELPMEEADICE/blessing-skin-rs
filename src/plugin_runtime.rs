@@ -1,25 +1,34 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fs, io,
     path::{Path, PathBuf},
 };
+
+use crate::database::DatabasePool;
 
 use wasmtime::{
     Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.0.0";
+const HOST_API_VERSION: &str = "1.1.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
+const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const PLUGIN_LOG_MESSAGE_LIMIT: usize = 4 * 1024;
+const PLUGIN_STATE_KEY_LIMIT: usize = 128;
+const PLUGIN_STATE_VALUE_LIMIT: usize = 64 * 1024;
+const PLUGIN_STATE_ENTRY_LIMIT: usize = 256;
+const PLUGIN_STATE_TOTAL_LIMIT: usize = 1024 * 1024;
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 
 struct PluginStore {
     name: String,
     limits: StoreLimits,
+    state: HashMap<String, Vec<u8>>,
 }
 
 struct LoadedPlugin {
@@ -31,10 +40,16 @@ struct LoadedPlugin {
 
 pub struct PluginRuntime {
     plugins: Vec<LoadedPlugin>,
+    database: Option<DatabasePool>,
+    table_prefix: String,
 }
 
 impl PluginRuntime {
-    pub fn load(directory: &Path) -> Result<Self, Box<dyn Error>> {
+    pub async fn load(
+        directory: &Path,
+        database: Option<DatabasePool>,
+        table_prefix: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let engine = plugin_engine()?;
         let mut paths = Vec::new();
         match find_components(directory, &mut paths) {
@@ -47,9 +62,22 @@ impl PluginRuntime {
         paths.sort();
         let mut runtime = Self {
             plugins: Vec::new(),
+            database: database.clone(),
+            table_prefix: table_prefix.to_owned(),
         };
+        if paths.is_empty() {
+            return Ok(runtime);
+        }
+        let Some(database) = database else {
+            tracing::warn!(directory = %directory.display(), "WASM plugins were not loaded because the database is unavailable for persistent plugin state");
+            return Ok(runtime);
+        };
+        if let Err(error) = database.ensure_wasm_plugin_state_schema(table_prefix).await {
+            tracing::warn!(%error, "WASM plugins were not loaded because their state table could not be prepared");
+            return Ok(runtime);
+        }
         for path in paths {
-            if let Err(error) = runtime.load_component(&engine, &path) {
+            if let Err(error) = runtime.load_component(&engine, &path, &database).await {
                 tracing::warn!(%error, plugin = %path.display(), "WASM plugin failed to load; continuing without it");
             }
         }
@@ -61,8 +89,10 @@ impl PluginRuntime {
         let engine = plugin_engine()?;
         let mut runtime = Self {
             plugins: Vec::new(),
+            database: None,
+            table_prefix: String::new(),
         };
-        runtime.load_component_bytes(&engine, Path::new("uploaded.wasm"), bytes)?;
+        runtime.load_component_bytes(&engine, Path::new("uploaded.wasm"), bytes, HashMap::new())?;
         if let Some(plugin) = runtime.plugins.last_mut() {
             stop_plugin(plugin)?;
         }
@@ -84,7 +114,12 @@ impl PluginRuntime {
             .collect()
     }
 
-    fn load_component(&mut self, engine: &Engine, path: &Path) -> Result<(), Box<dyn Error>> {
+    async fn load_component(
+        &mut self,
+        engine: &Engine,
+        path: &Path,
+        database: &DatabasePool,
+    ) -> Result<(), Box<dyn Error>> {
         let metadata = fs::metadata(path)?;
         if metadata.len() > COMPONENT_FILE_LIMIT {
             return Err(io::Error::new(
@@ -93,8 +128,35 @@ impl PluginRuntime {
             )
             .into());
         }
+        let plugin_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "plugin name is not UTF-8")
+            })?;
+        if !valid_plugin_name(plugin_name) {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "plugin name is invalid").into(),
+            );
+        }
+        let state = validated_plugin_state(
+            database
+                .wasm_plugin_state_entries(&self.table_prefix, plugin_name)
+                .await?,
+        )?;
         let bytes = fs::read(path)?;
-        self.load_component_bytes(engine, path, &bytes)
+        self.load_component_bytes(engine, path, &bytes, state)?;
+        if let Err(error) =
+            persist_plugin_state(database, &self.table_prefix, self.plugins.last().unwrap()).await
+        {
+            if let Some(mut plugin) = self.plugins.pop() {
+                if let Err(shutdown_error) = stop_plugin(&mut plugin) {
+                    tracing::warn!(%shutdown_error, plugin = %path.display(), "plugin cleanup failed after state persistence error");
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn load_component_bytes(
@@ -102,6 +164,7 @@ impl PluginRuntime {
         engine: &Engine,
         path: &Path,
         bytes: &[u8],
+        state: HashMap<String, Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
         if bytes.len() as u64 > COMPONENT_FILE_LIMIT {
             return Err(io::Error::new(
@@ -124,13 +187,14 @@ impl PluginRuntime {
                 .tables(4)
                 .memories(4)
                 .build(),
+            state,
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
         store.set_fuel(COMPONENT_FUEL)?;
 
-        // Only the versioned logger is linked. WASI, filesystem, network, database,
-        // and undocumented host imports remain unavailable to components.
+        // Only versioned logging and plugin-scoped key/value state are linked. WASI,
+        // filesystem, network, raw database access, and undocumented imports remain unavailable.
         let mut linker = Linker::new(engine);
         linker.instance(HOST_LOG_INTERFACE)?.func_wrap(
             "log",
@@ -138,6 +202,32 @@ impl PluginRuntime {
              (level, message): (String, String)|
              -> wasmtime::Result<(Result<(), String>,)> {
                 let result = log_plugin_message(&store.data().name, &level, &message);
+                Ok((result,))
+            },
+        )?;
+        linker.instance(HOST_STATE_INTERFACE)?.func_wrap(
+            "get",
+            |store: StoreContextMut<'_, PluginStore>,
+             (key,): (String,)|
+             -> wasmtime::Result<(Result<Option<Vec<u8>>, String>,)> {
+                Ok((plugin_state_get(store.data(), &key),))
+            },
+        )?;
+        linker.instance(HOST_STATE_INTERFACE)?.func_wrap(
+            "set",
+            |mut store: StoreContextMut<'_, PluginStore>,
+             (key, value): (String, Vec<u8>)|
+             -> wasmtime::Result<(Result<(), String>,)> {
+                let result = plugin_state_set(store.data_mut(), key, value);
+                Ok((result,))
+            },
+        )?;
+        linker.instance(HOST_STATE_INTERFACE)?.func_wrap(
+            "delete",
+            |mut store: StoreContextMut<'_, PluginStore>,
+             (key,): (String,)|
+             -> wasmtime::Result<(Result<bool, String>,)> {
+                let result = plugin_state_delete(store.data_mut(), &key);
                 Ok((result,))
             },
         )?;
@@ -190,13 +280,20 @@ impl PluginRuntime {
         Ok(())
     }
 
-    pub fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
+        let database = self.database.clone();
+        let table_prefix = self.table_prefix.clone();
         for plugin in self.plugins.iter_mut().rev() {
             if let Err(error) = stop_plugin(plugin) {
                 tracing::warn!(%error, plugin = %plugin.path.display(), "WASM plugin shutdown failed");
-            } else {
-                tracing::info!(plugin = %plugin.path.display(), "WASM plugin shut down");
+                continue;
             }
+            if let Some(database) = &database {
+                if let Err(error) = persist_plugin_state(database, &table_prefix, plugin).await {
+                    tracing::warn!(%error, plugin = %plugin.path.display(), "WASM plugin state could not be saved during shutdown");
+                }
+            }
+            tracing::info!(plugin = %plugin.path.display(), "WASM plugin shut down");
         }
         self.plugins.clear();
     }
@@ -205,6 +302,105 @@ impl PluginRuntime {
     fn loaded_count(&self) -> usize {
         self.plugins.len()
     }
+}
+
+fn validate_plugin_state_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > PLUGIN_STATE_KEY_LIMIT || key.chars().any(char::is_control) {
+        return Err(format!(
+            "plugin state keys must contain 1 to {PLUGIN_STATE_KEY_LIMIT} non-control bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validated_plugin_state(
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<HashMap<String, Vec<u8>>, Box<dyn Error>> {
+    if entries.len() > PLUGIN_STATE_ENTRY_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored plugin state exceeds the entry limit",
+        )
+        .into());
+    }
+    let mut state = HashMap::with_capacity(entries.len());
+    let mut total_bytes = 0usize;
+    for (key, value) in entries {
+        validate_plugin_state_key(&key)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        if value.len() > PLUGIN_STATE_VALUE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored plugin state value exceeds the per-value limit",
+            )
+            .into());
+        }
+        total_bytes = total_bytes.saturating_add(value.len());
+        if total_bytes > PLUGIN_STATE_TOTAL_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored plugin state exceeds the total size limit",
+            )
+            .into());
+        }
+        state.insert(key, value);
+    }
+    Ok(state)
+}
+
+fn plugin_state_get(store: &PluginStore, key: &str) -> Result<Option<Vec<u8>>, String> {
+    validate_plugin_state_key(key)?;
+    Ok(store.state.get(key).cloned())
+}
+
+fn plugin_state_set(store: &mut PluginStore, key: String, value: Vec<u8>) -> Result<(), String> {
+    validate_plugin_state_key(&key)?;
+    if value.len() > PLUGIN_STATE_VALUE_LIMIT {
+        return Err(format!(
+            "plugin state values cannot exceed {PLUGIN_STATE_VALUE_LIMIT} bytes"
+        ));
+    }
+    let previous_len = store.state.get(&key).map_or(0, Vec::len);
+    let current_len: usize = store.state.values().map(Vec::len).sum();
+    let new_len = current_len
+        .saturating_sub(previous_len)
+        .saturating_add(value.len());
+    if !store.state.contains_key(&key) && store.state.len() >= PLUGIN_STATE_ENTRY_LIMIT {
+        return Err(format!(
+            "a plugin can store at most {PLUGIN_STATE_ENTRY_LIMIT} state entries"
+        ));
+    }
+    if new_len > PLUGIN_STATE_TOTAL_LIMIT {
+        return Err(format!(
+            "a plugin state store cannot exceed {PLUGIN_STATE_TOTAL_LIMIT} bytes"
+        ));
+    }
+    store.state.insert(key, value);
+    Ok(())
+}
+
+fn plugin_state_delete(store: &mut PluginStore, key: &str) -> Result<bool, String> {
+    validate_plugin_state_key(key)?;
+    Ok(store.state.remove(key).is_some())
+}
+
+async fn persist_plugin_state(
+    database: &DatabasePool,
+    table_prefix: &str,
+    plugin: &LoadedPlugin,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries: Vec<_> = plugin
+        .store
+        .data()
+        .state
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    database
+        .replace_wasm_plugin_state(table_prefix, &plugin.store.data().name, &entries)
+        .await?;
+    Ok(())
 }
 
 fn log_plugin_message(plugin: &str, level: &str, message: &str) -> Result<(), String> {
@@ -279,8 +475,13 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{PLUGIN_LOG_MESSAGE_LIMIT, PluginRuntime, log_plugin_message};
+    use super::{
+        PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore,
+        StoreLimitsBuilder, log_plugin_message, plugin_state_delete, plugin_state_get,
+        plugin_state_set, validated_plugin_state,
+    };
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -319,23 +520,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_plugin_directory_is_an_empty_runtime() {
+    #[tokio::test]
+    async fn missing_plugin_directory_is_an_empty_runtime() {
         let path = temp_dir();
-        let runtime = PluginRuntime::load(&path).unwrap();
+        let runtime = PluginRuntime::load(&path, None, "").await.unwrap();
         assert_eq!(runtime.loaded_count(), 0);
     }
 
-    #[test]
-    fn php_files_are_ignored_and_invalid_components_are_isolated() {
+    #[tokio::test]
+    async fn php_files_are_ignored_and_invalid_components_are_isolated() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
         let path = temp_dir();
         fs::create_dir_all(path.join("nested")).unwrap();
         fs::write(path.join("old-plugin.php"), "<?php exit;").unwrap();
         fs::write(path.join("nested/invalid.wasm"), "not a component").unwrap();
         fs::write(path.join("nested/empty.wasm"), "(component)").unwrap();
-        let mut runtime = PluginRuntime::load(&path).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let database = crate::database::DatabasePool::Sqlite(pool);
+        let mut runtime = PluginRuntime::load(&path, Some(database), "bs_")
+            .await
+            .unwrap();
         assert_eq!(runtime.loaded_count(), 0);
-        runtime.shutdown();
+        runtime.shutdown().await;
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn plugin_state_is_scoped_bounded_and_binary_safe() {
+        let mut state = PluginStore {
+            name: "test".to_owned(),
+            limits: StoreLimitsBuilder::new().build(),
+            state: HashMap::new(),
+        };
+        assert_eq!(plugin_state_get(&state, "token").unwrap(), None);
+        plugin_state_set(&mut state, "token".to_owned(), vec![0, 128, 255]).unwrap();
+        assert_eq!(
+            plugin_state_get(&state, "token").unwrap(),
+            Some(vec![0, 128, 255])
+        );
+        assert!(plugin_state_set(&mut state, "".to_owned(), vec![]).is_err());
+        assert!(
+            plugin_state_set(
+                &mut state,
+                "too-large".to_owned(),
+                vec![0; PLUGIN_STATE_VALUE_LIMIT + 1]
+            )
+            .is_err()
+        );
+        assert!(plugin_state_delete(&mut state, "token").unwrap());
+        assert!(!plugin_state_delete(&mut state, "token").unwrap());
+        assert!(validated_plugin_state(vec![("".to_owned(), vec![])]).is_err());
+        assert!(
+            validated_plugin_state(vec![(
+                "large".to_owned(),
+                vec![0; PLUGIN_STATE_VALUE_LIMIT + 1]
+            )])
+            .is_err()
+        );
     }
 }

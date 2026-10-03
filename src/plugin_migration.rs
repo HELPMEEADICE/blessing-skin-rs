@@ -314,7 +314,7 @@ fn write_scaffold(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"Rust/WASM port scaffold for a legacy Blessing Skin plugin\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nwit-bindgen = \"0.62\"\n\n[profile.release]\nlto = true\nopt-level = \"s\"\ncodegen-units = 1\npanic = \"abort\"\n"
     );
     let readme = format!(
-        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports one versioned, bounded logging capability. The host does not grant filesystem, network, database, or WASI access.\n"
+        "# Rust component scaffold: `{crate_name}`\n\nThis scaffold does not execute or translate PHP code. Use `migration-report.json` to review the legacy hooks and dependencies, then port each behavior explicitly.\n\nThe exported WIT contract is `blessing-skin:plugin@1.0.0`. Implement the generated guest interface in `src/lib.rs`. Build with the Rust component toolchain using `cargo component build --release`.\n\nThe generated guest imports versioned logging and plugin-scoped key/value state. State is binary data stored in the Rust-only `wasm_plugin_state` table; one plugin may keep at most 256 keys, 64 KiB per value, and 1 MiB total. Host API version 1.1 checkpoints state after initialization and successful shutdown. The host does not grant filesystem, network, raw database, or WASI access.\n"
     );
     let source = r#"mod bindings {
     wit_bindgen::generate!({
@@ -334,6 +334,14 @@ impl bindings::exports::blessing_skin::plugin::lifecycle::Guest for Component {
             "info".to_owned(),
             "plugin initialized".to_owned(),
         )?;
+        let first_run = bindings::blessing_skin::plugin::state::get("initialized".to_owned())?
+            .is_none();
+        if first_run {
+            bindings::blessing_skin::plugin::state::set(
+                "initialized".to_owned(),
+                b"true".to_vec(),
+            )?;
+        }
         Ok(())
     }
 
@@ -348,6 +356,12 @@ interface host {
     log: func(level: string, message: string) -> result<_, string>;
 }
 
+interface state {
+    get: func(key: string) -> result<option<list<u8>>, string>;
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+    delete: func(key: string) -> result<bool, string>;
+}
+
 interface lifecycle {
     initialize: func(host-api-version: string) -> result<_, string>;
     shutdown: func();
@@ -355,6 +369,7 @@ interface lifecycle {
 
 world plugin {
     import host;
+    import state;
     export lifecycle;
 }
 "#;
@@ -488,9 +503,14 @@ mod tests {
         assert!(manifest.contains("name = \"fancy-addon-plugin\""));
         assert!(wit.contains("blessing-skin:plugin@1.0.0"));
         assert!(wit.contains("interface host"));
+        assert!(wit.contains("interface state"));
+        assert!(wit.contains("get: func(key: string) -> result<option<list<u8>>, string>"));
         assert!(wit.contains("import host;"));
+        assert!(wit.contains("import state;"));
         assert!(source.contains("blessing_skin::plugin::lifecycle::Guest"));
         assert!(source.contains("blessing_skin::plugin::host::log"));
+        assert!(source.contains("blessing_skin::plugin::state::get"));
+        assert!(source.contains("blessing_skin::plugin::state::set"));
         assert!(output.join("migration-report.json").is_file());
         assert!(write_scaffold(&output, &report, &json).is_err());
         fs::remove_dir_all(root).unwrap();

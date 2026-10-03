@@ -808,6 +808,137 @@ impl DatabasePool {
         Ok(())
     }
 
+    pub async fn ensure_wasm_plugin_state_schema(&self, prefix: &str) -> Result<(), sqlx::Error> {
+        let value_type = match self {
+            Self::Sqlite(_) => "BLOB",
+            Self::MySql(_) => "LONGBLOB",
+            Self::Postgres(_) => "BYTEA",
+        };
+        let key_type = match self {
+            Self::MySql(_) => "VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            Self::Sqlite(_) | Self::Postgres(_) => "VARCHAR(128)",
+        };
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {prefix}wasm_plugin_state (plugin_name {key_type} NOT NULL, state_key {key_type} NOT NULL, state_value {value_type} NOT NULL, PRIMARY KEY (plugin_name, state_key))"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn wasm_plugin_state_entries(
+        &self,
+        prefix: &str,
+        plugin_name: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
+        let marker = if matches!(self, Self::Postgres(_)) {
+            "$1"
+        } else {
+            "?"
+        };
+        let sql = format!(
+            "SELECT state_key, state_value FROM {prefix}wasm_plugin_state WHERE plugin_name = {marker} ORDER BY state_key"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, Vec<u8>)>(sqlx::AssertSqlSafe(sql))
+                    .bind(plugin_name)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (String, Vec<u8>)>(sqlx::AssertSqlSafe(sql))
+                    .bind(plugin_name)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (String, Vec<u8>)>(sqlx::AssertSqlSafe(sql))
+                    .bind(plugin_name)
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
+    pub async fn replace_wasm_plugin_state(
+        &self,
+        prefix: &str,
+        plugin_name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<(), sqlx::Error> {
+        let (delete_marker, first, second, third) = if matches!(self, Self::Postgres(_)) {
+            ("$1", "$1", "$2", "$3")
+        } else {
+            ("?", "?", "?", "?")
+        };
+        let delete_sql =
+            format!("DELETE FROM {prefix}wasm_plugin_state WHERE plugin_name = {delete_marker}");
+        let insert_sql = format!(
+            "INSERT INTO {prefix}wasm_plugin_state (plugin_name, state_key, state_value) VALUES ({first}, {second}, {third})"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(plugin_name)
+                    .execute(&mut *transaction)
+                    .await?;
+                for (key, value) in entries {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+                        .bind(plugin_name)
+                        .bind(key)
+                        .bind(value)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+            }
+            Self::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(plugin_name)
+                    .execute(&mut *transaction)
+                    .await?;
+                for (key, value) in entries {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+                        .bind(plugin_name)
+                        .bind(key)
+                        .bind(value)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(plugin_name)
+                    .execute(&mut *transaction)
+                    .await?;
+                for (key, value) in entries {
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+                        .bind(plugin_name)
+                        .bind(key)
+                        .bind(value)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn option(&self, prefix: &str, key: &str) -> Result<Option<String>, sqlx::Error> {
         let sql = match self {
             Self::Sqlite(_) | Self::MySql(_) => {
@@ -8246,6 +8377,88 @@ mod language_line_tests {
     };
 
     #[tokio::test]
+    async fn wasm_plugin_state_schema_and_binary_values_round_trip() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let database = DatabasePool::Sqlite(pool);
+        database
+            .ensure_wasm_plugin_state_schema("bs_")
+            .await
+            .unwrap();
+        database
+            .ensure_wasm_plugin_state_schema("bs_")
+            .await
+            .unwrap();
+        database
+            .replace_wasm_plugin_state(
+                "bs_",
+                "example.plugin",
+                &[
+                    ("token".to_owned(), vec![0, 1, 127, 128, 255]),
+                    ("Case".to_owned(), b"upper".to_vec()),
+                    ("case".to_owned(), b"lower".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries("bs_", "example.plugin")
+                .await
+                .unwrap(),
+            vec![
+                ("Case".to_owned(), b"upper".to_vec()),
+                ("case".to_owned(), b"lower".to_vec()),
+                ("token".to_owned(), vec![0, 1, 127, 128, 255]),
+            ]
+        );
+        database
+            .replace_wasm_plugin_state(
+                "bs_",
+                "Example.plugin",
+                &[("token".to_owned(), b"other plugin".to_vec())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries("bs_", "Example.plugin")
+                .await
+                .unwrap(),
+            vec![("token".to_owned(), b"other plugin".to_vec())]
+        );
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries("bs_", "example.plugin")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        database
+            .replace_wasm_plugin_state("bs_", "example.plugin", &[])
+            .await
+            .unwrap();
+        assert!(
+            database
+                .wasm_plugin_state_entries("bs_", "example.plugin")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries("bs_", "Example.plugin")
+                .await
+                .unwrap(),
+            vec![("token".to_owned(), b"other plugin".to_vec())]
+        );
+    }
+
+    #[tokio::test]
     async fn language_line_crud_preserves_other_locales_and_paginates() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -8445,7 +8658,75 @@ mod language_line_tests {
             Some("Rust-backed Legacy Skin")
         );
 
-        for suffix in ["options", "textures", "players", "users"] {
+        database
+            .ensure_wasm_plugin_state_schema(&prefix)
+            .await
+            .unwrap();
+        database
+            .replace_wasm_plugin_state(
+                &prefix,
+                "compat-fixture",
+                &[
+                    ("binary".to_owned(), vec![0, 1, 255]),
+                    ("Case".to_owned(), b"upper".to_vec()),
+                    ("case".to_owned(), b"lower".to_vec()),
+                    ("remove-me".to_owned(), b"old".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut initial_state = database
+            .wasm_plugin_state_entries(&prefix, "compat-fixture")
+            .await
+            .unwrap();
+        initial_state.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            initial_state,
+            vec![
+                ("Case".to_owned(), b"upper".to_vec()),
+                ("binary".to_owned(), vec![0, 1, 255]),
+                ("case".to_owned(), b"lower".to_vec()),
+                ("remove-me".to_owned(), b"old".to_vec()),
+            ]
+        );
+        database
+            .replace_wasm_plugin_state(
+                &prefix,
+                "Compat-fixture",
+                &[("token".to_owned(), b"other plugin".to_vec())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries(&prefix, "Compat-fixture")
+                .await
+                .unwrap(),
+            vec![("token".to_owned(), b"other plugin".to_vec())]
+        );
+        database
+            .replace_wasm_plugin_state(
+                &prefix,
+                "compat-fixture",
+                &[("binary".to_owned(), vec![255, 0, 128])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .wasm_plugin_state_entries(&prefix, "compat-fixture")
+                .await
+                .unwrap(),
+            vec![("binary".to_owned(), vec![255, 0, 128])]
+        );
+
+        for suffix in [
+            "wasm_plugin_state",
+            "options",
+            "textures",
+            "players",
+            "users",
+        ] {
             execute_legacy_fixture_sql(
                 &database,
                 &format!("DROP TABLE IF EXISTS {prefix}{suffix}"),

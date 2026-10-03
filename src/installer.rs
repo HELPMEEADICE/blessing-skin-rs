@@ -356,6 +356,7 @@ async fn initialize_schema(pool: &DatabasePool, prefix: &str) -> Result<(), sqlx
             }
         }
     }
+    pool.ensure_wasm_plugin_state_schema(prefix).await?;
     Ok(())
 }
 
