@@ -346,7 +346,7 @@ async fn render_page(
         }
     };
     let options = rows.into_iter().collect::<HashMap<_, _>>();
-    let locale = state.config.locale.clone();
+    let locale = http::request_locale(&state);
     let fields = definitions
         .iter()
         .map(|definition| {
@@ -486,7 +486,7 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
         };
         updates.insert(key.clone(), value.clone());
         if definition.localized || (section == "customize" && key == "copyright_prefer") {
-            updates.insert(format!("{key}_{}", state.config.locale), value);
+            updates.insert(format!("{key}_{}", http::request_locale(&state)), value);
         }
     }
     if section == "score"
@@ -534,13 +534,13 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
                 .into_response();
         }
     }
-    Json(serde_json::json!({"code":0,"message":if state.config.locale.starts_with("zh") {"设置已保存。"} else {"Settings saved."}})).into_response()
+    Json(serde_json::json!({"code":0,"message":if http::request_locale(&state).starts_with("zh") {"设置已保存。"} else {"Settings saved."}})).into_response()
 }
 
 async fn admin_user(state: &AppState, headers: &HeaderMap) -> Result<UserProfile, Response> {
     let user = http::authenticated_web_user(state, headers).await?;
     if user.permission < 1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if http::request_locale(&state).starts_with("zh") {
             "只有管理员可以修改站点设置。"
         } else {
             "Only administrators can change site settings."

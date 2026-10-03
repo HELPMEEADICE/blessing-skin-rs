@@ -54,6 +54,111 @@ use crate::{
     image_cache::{CachedImage, ImageCacheKey},
 };
 
+tokio::task_local! {
+    static REQUEST_LOCALE: String;
+}
+
+pub(crate) fn request_locale(state: &AppState) -> String {
+    REQUEST_LOCALE
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| state.config.locale.clone())
+}
+
+fn normalize_locale(locale: &str) -> Option<&'static str> {
+    match locale
+        .trim()
+        .replace('-', "_")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "zh_cn" | "zh_hans_cn" => Some("zh_CN"),
+        "zh_tw" => Some("zh_TW"),
+        "en" | "en_us" => Some("en"),
+        "es_es" => Some("es_ES"),
+        "ru" | "ru_ru" => Some("ru_RU"),
+        _ => None,
+    }
+}
+
+fn browser_preferred_locale(headers: &HeaderMap) -> Option<&'static str> {
+    let header = headers.get("accept-language")?.to_str().ok()?;
+    let mut candidates = header
+        .split(',')
+        .enumerate()
+        .filter_map(|(position, language)| {
+            let mut pieces = language.split(';');
+            let tag = pieces.next()?.trim();
+            if tag.is_empty() {
+                return None;
+            }
+            let quality = pieces
+                .filter_map(|parameter| parameter.trim().strip_prefix("q="))
+                .next()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            (quality > 0.0).then(|| (quality, position, normalize_locale(tag)))
+        })
+        .filter_map(|(quality, position, locale)| locale.map(|locale| (quality, position, locale)))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    candidates.first().map(|(_, _, locale)| *locale)
+}
+
+fn select_request_locale(state: &AppState, request: &axum::extract::Request) -> String {
+    let query_locale = request.uri().query().and_then(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "lang")
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.trim().is_empty())
+    });
+    let cookie_locale = request
+        .headers()
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (key, value) = cookie.trim().split_once('=')?;
+                (key == "locale").then(|| value.to_owned())
+            })
+        });
+    let requested = query_locale
+        .or(cookie_locale)
+        .or_else(|| browser_preferred_locale(request.headers()).map(str::to_owned));
+    requested
+        .as_deref()
+        .and_then(normalize_locale)
+        .or_else(|| normalize_locale(&state.config.locale))
+        .or_else(|| normalize_locale(&state.config.fallback_locale))
+        .unwrap_or("en")
+        .to_owned()
+}
+
+async fn detect_locale_preference(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let locale = select_request_locale(&state, &request);
+    let path = request.uri().path();
+    let should_set_cookie = path != "/api" && !path.starts_with("/api/");
+    let mut response = REQUEST_LOCALE
+        .scope(locale.clone(), next.run(request))
+        .await;
+    if should_set_cookie {
+        if let Ok(cookie) = HeaderValue::from_str(&format!(
+            "locale={locale}; Path=/; Max-Age=7200; SameSite=Lax"
+        )) {
+            response.headers_mut().append(SET_COOKIE, cookie);
+        }
+    }
+    response
+}
 async fn emit_plugin_event(state: &AppState, name: &str, payload: serde_json::Value) {
     let payload = match serde_json::to_vec(&payload) {
         Ok(payload) => payload,
@@ -345,6 +450,10 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             redirect_uninstalled,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            detect_locale_preference,
+        ))
         .with_state(state)
 }
 
@@ -557,7 +666,7 @@ async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> R
         }
     };
     if user.permission == -1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "你已被本站封禁，详情请联系站点管理员"
         } else {
             "You are banned on this site. Please contact the admin."
@@ -573,12 +682,12 @@ async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 =
         encode_frontend_globals(&state, &site_name, "auth/bind", serde_json::json!({}), i18n);
     let page = BindEmailPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -613,7 +722,7 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
         }
     };
     if user.permission == -1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "你已被本站封禁，详情请联系站点管理员"
         } else {
             "You are banned on this site. Please contact the admin."
@@ -642,13 +751,16 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
         form_urlencoded::parse(&body)
             .find(|(key, _)| key == "email")
             .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.trim().is_empty())
     };
     let Some(email) = email.filter(|email| valid_email_address(email) && email.len() <= 100) else {
-        return registration_validation_error("email", "email", &state.config.locale);
+        return registration_validation_error("email", "email", &request_locale(&state));
     };
     let prefix = &state.config.database.table_prefix;
     match database.user_email_exists(prefix, &email, user_id).await {
-        Ok(true) => return registration_validation_error("email", "unique", &state.config.locale),
+        Ok(true) => {
+            return registration_validation_error("email", "unique", &request_locale(&state));
+        }
         Ok(false) => {}
         Err(error) => {
             tracing::error!(%error, user_id, "failed to check account email uniqueness");
@@ -667,7 +779,7 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
     } else {
         login_result(
             0,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "邮箱已绑定。"
             } else {
                 "Email address bound successfully."
@@ -822,7 +934,7 @@ pub(crate) fn encode_frontend_globals(
 ) -> String {
     let globals = serde_json::json!({
         "version": state.config.version,
-        "locale": state.config.locale,
+        "locale": request_locale(&state),
         "base_url": state.config.app_url.trim_end_matches('/'),
         "site_name": site_name,
         "route": route,
@@ -857,7 +969,7 @@ async fn login_page(
     let site_name = match &state.database {
         Some(database) => {
             let prefix = &state.config.database.table_prefix;
-            let localized = format!("site_name_{}", state.config.locale);
+            let localized = format!("site_name_{}", request_locale(&state));
             database
                 .option(prefix, &localized)
                 .await
@@ -868,7 +980,7 @@ async fn login_page(
         }
         None => "Blessing Skin".to_owned(),
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let redirect_to = safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default();
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
@@ -876,7 +988,7 @@ async fn login_page(
     let frontend_script_available = frontend_script.is_some();
     let stylesheet = stylesheet.unwrap_or_default();
     let frontend_script = frontend_script.unwrap_or_default();
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let failures = query
         .identification
         .as_deref()
@@ -922,7 +1034,7 @@ async fn login_page(
     );
     let page = LoginPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         redirect_to,
         title: if chinese { "登录" } else { "Log In" }.to_owned(),
         prompt: if chinese {
@@ -1038,12 +1150,12 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             }
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1057,7 +1169,7 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     );
     let page = RegisterPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         title: if chinese { "注册" } else { "Register" }.to_owned(),
         prompt: if chinese {
             "创建一个账号来管理你的皮肤与角色。"
@@ -1118,12 +1230,12 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
             return unavailable();
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1136,7 +1248,7 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     );
     let page = ForgotPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         title: if chinese { "找回密码" } else { "Forgot Password" }.to_owned(),
         prompt: if chinese {
             "输入账户邮箱，我们会发送一条一小时内有效的重置链接。"
@@ -1264,7 +1376,7 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
     };
     let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
     let site_name = site_name(&state).await;
-    let body = if state.config.locale.starts_with("zh") {
+    let body = if request_locale(&state).starts_with("zh") {
         format!(
             "你收到了这封邮件，因为有人请求重置 {site_name} 账户密码。\n\n请在一小时内访问以下链接重设密码：\n{url}\n\n如果你没有请求重置密码，请忽略此邮件。"
         )
@@ -1273,7 +1385,7 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
             "You received this email because a password reset was requested for your {site_name} account.\n\nReset your password within one hour by visiting:\n{url}\n\nIf you did not request a password reset, you can ignore this email."
         )
     };
-    let subject = if state.config.locale.starts_with("zh") {
+    let subject = if request_locale(&state).starts_with("zh") {
         format!("{site_name} 密码重置")
     } else {
         format!("Reset your {site_name} password")
@@ -1339,12 +1451,12 @@ async fn reset_page(
             return unavailable();
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1354,7 +1466,7 @@ async fn reset_page(
     );
     let page = PasswordResetPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         title: if chinese {
             "重设密码"
         } else {
@@ -1523,12 +1635,12 @@ async fn verify_email_page(
             return unavailable();
         }
     }
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1538,7 +1650,7 @@ async fn verify_email_page(
     );
     let page = EmailVerificationPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         title: if chinese {
             "邮箱验证"
         } else {
@@ -1714,7 +1826,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         }
     };
     if user.permission == -1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "你已被本站封禁，详情请联系站点管理员"
         } else {
             "You are banned on this site. Please contact the admin."
@@ -1752,7 +1864,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
     };
     let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
     let site_name = site_name(&state).await;
-    let body = if state.config.locale.starts_with("zh") {
+    let body = if request_locale(&state).starts_with("zh") {
         format!(
             "有人注册了 {site_name} 账户。如果这是你的账户，请访问以下链接验证邮箱：\n{url}\n\n如果你没有注册，请忽略此邮件。"
         )
@@ -1761,7 +1873,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
             "Someone registered an account with this email address on {site_name}. Verify your email by visiting:\n{url}\n\nIf you did not register, you can ignore this email."
         )
     };
-    let subject = if state.config.locale.starts_with("zh") {
+    let subject = if request_locale(&state).starts_with("zh") {
         format!("验证你的 {site_name} 账户")
     } else {
         format!("Verify your account on {site_name}")
@@ -1793,7 +1905,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
 }
 
 fn auth_message<'a>(state: &AppState, chinese: &'a str, english: &'a str) -> &'a str {
-    if state.config.locale.starts_with("zh") {
+    if request_locale(&state).starts_with("zh") {
         chinese
     } else {
         english
@@ -2185,21 +2297,23 @@ async fn handle_register(
     };
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return registration_validation_error("email", "required", &state.config.locale),
+        Err(_) => {
+            return registration_validation_error("email", "required", &request_locale(&state));
+        }
     };
     let Some(email) = request
         .get("email")
         .and_then(serde_json::Value::as_str)
         .filter(|email| valid_email_address(email) && email.len() <= 100)
     else {
-        return registration_validation_error("email", "email", &state.config.locale);
+        return registration_validation_error("email", "email", &request_locale(&state));
     };
     let Some(password) = request
         .get("password")
         .and_then(serde_json::Value::as_str)
         .filter(|password| (8..=32).contains(&password.chars().count()))
     else {
-        return registration_validation_error("password", "length", &state.config.locale);
+        return registration_validation_error("password", "length", &request_locale(&state));
     };
     let Some(captcha) = request
         .get("captcha")
@@ -2207,12 +2321,12 @@ async fn handle_register(
         .and_then(serde_json::Value::as_str)
         .filter(|captcha| !captcha.trim().is_empty())
     else {
-        return registration_validation_error("captcha", "required", &state.config.locale);
+        return registration_validation_error("captcha", "required", &request_locale(&state));
     };
     match verify_registration_captcha(&state, &headers, captcha).await {
         Ok(true) => {}
         Ok(false) => {
-            return registration_validation_error("captcha", "invalid", &state.config.locale);
+            return registration_validation_error("captcha", "invalid", &request_locale(&state));
         }
         Err(response) => return response,
     }
@@ -2236,7 +2350,11 @@ async fn handle_register(
             .and_then(serde_json::Value::as_str)
             .filter(|name| !name.is_empty())
         else {
-            return registration_validation_error("player_name", "required", &state.config.locale);
+            return registration_validation_error(
+                "player_name",
+                "required",
+                &request_locale(&state),
+            );
         };
         let rule = match database.option(prefix, "player_name_rule").await {
             Ok(value) => value.unwrap_or_else(|| "official".to_owned()),
@@ -2271,7 +2389,7 @@ async fn handle_register(
             }
         };
         if !valid_player_name(name, &rule, &custom_rule, min_length, max_length) {
-            return registration_validation_error("player_name", "format", &state.config.locale);
+            return registration_validation_error("player_name", "format", &request_locale(&state));
         }
         player_name = Some(name);
         name
@@ -2281,7 +2399,7 @@ async fn handle_register(
             .and_then(serde_json::Value::as_str)
             .filter(|nickname| !nickname.is_empty() && nickname.chars().count() <= 255)
         else {
-            return registration_validation_error("nickname", "required", &state.config.locale);
+            return registration_validation_error("nickname", "required", &request_locale(&state));
         };
         nickname
     };
@@ -2333,11 +2451,11 @@ async fn handle_register(
         .await
     {
         Ok(crate::database::UserRegistrationOutcome::EmailExists) => {
-            registration_validation_error("email", "unique", &state.config.locale)
+            registration_validation_error("email", "unique", &request_locale(&state))
         }
         Ok(crate::database::UserRegistrationOutcome::PlayerNameExists) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "该角色名已被占用"
             } else {
                 "The player name is already registered."
@@ -2346,7 +2464,7 @@ async fn handle_register(
         ),
         Ok(crate::database::UserRegistrationOutcome::IpLimit) => login_result(
             1,
-            &if state.config.locale.starts_with("zh") {
+            &if request_locale(&state).starts_with("zh") {
                 format!("你在本站注册的账号已达到上限 {max_registrations_per_ip} 个，无法继续注册")
             } else {
                 format!("You can't register more than {max_registrations_per_ip} accounts.")
@@ -2370,7 +2488,7 @@ async fn handle_register(
                     return unavailable();
                 }
             };
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "注册成功，正在跳转..."
             } else {
                 "Your account was registered. Redirecting..."
@@ -2456,17 +2574,17 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     }
     let request: LoginRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return validation_error("identification", &state.config.locale),
+        Err(_) => return validation_error("identification", &request_locale(&state)),
     };
     let Some(identification) = request
         .identification
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned())
     else {
-        return validation_error("identification", &state.config.locale);
+        return validation_error("identification", &request_locale(&state));
     };
     let Some(password) = request.password.filter(|value| !value.is_empty()) else {
-        return validation_error("password", &state.config.locale);
+        return validation_error("password", &request_locale(&state));
     };
     let failures = login_failure_count(&state, &identification);
     if failures > 3 {
@@ -2481,7 +2599,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         if !captcha_valid {
             return login_result(
                 1,
-                if state.config.locale.starts_with("zh") {
+                if request_locale(&state).starts_with("zh") {
                     "验证码无效。"
                 } else {
                     "The CAPTCHA is invalid."
@@ -2491,7 +2609,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     }
     if !(6..=32).contains(&password.chars().count()) {
-        return validation_error("password", &state.config.locale);
+        return validation_error("password", &request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -2508,7 +2626,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     let credential = match credential {
         Ok(Some(credential)) => credential,
         Ok(None) => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "用户不存在"
             } else {
                 "No such user."
@@ -2545,7 +2663,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
             entry.1 = now;
             entry.0
         };
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "密码错误"
         } else {
             "Wrong password."
@@ -2585,7 +2703,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&identification);
 
-    let message = if state.config.locale.starts_with("zh") {
+    let message = if request_locale(&state).starts_with("zh") {
         "登录成功，欢迎回来"
     } else {
         "Logged in successfully."
@@ -2652,7 +2770,7 @@ struct HomePage {
 
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let site_name = site_name(&state).await;
-    let locale = &state.config.locale;
+    let locale = &request_locale(&state);
     let chinese = locale.starts_with("zh");
     let title = if chinese { "皮肤站" } else { "Skin Server" }.to_owned();
     let login = if chinese { "登录" } else { "Log in" }.to_owned();
@@ -2886,7 +3004,7 @@ async fn site_option(state: &AppState, key: &str) -> Option<String> {
 }
 
 async fn localized_site_option(state: &AppState, key: &str) -> Option<String> {
-    let localized_key = format!("{key}_{}", state.config.locale);
+    let localized_key = format!("{key}_{}", request_locale(&state));
     site_option(state, &localized_key)
         .await
         .or(site_option(state, key).await)
@@ -3294,21 +3412,21 @@ async fn oauth_client_create(
     };
     let request = match serde_json::from_slice::<OAuthClientRequest>(&body) {
         Ok(request) => request,
-        Err(_) => return oauth_client_validation_error("name", &state.config.locale),
+        Err(_) => return oauth_client_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request
         .name
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty() && name.chars().count() <= 255)
     else {
-        return oauth_client_validation_error("name", &state.config.locale);
+        return oauth_client_validation_error("name", &request_locale(&state));
     };
     let Some(redirect) = request
         .redirect
         .map(|redirect| redirect.trim().to_owned())
         .filter(|redirect| valid_oauth_redirect(redirect))
     else {
-        return oauth_client_validation_error("redirect", &state.config.locale);
+        return oauth_client_validation_error("redirect", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -3345,21 +3463,21 @@ async fn oauth_client_update(
     };
     let request = match serde_json::from_slice::<OAuthClientRequest>(&body) {
         Ok(request) => request,
-        Err(_) => return oauth_client_validation_error("name", &state.config.locale),
+        Err(_) => return oauth_client_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request
         .name
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty() && name.chars().count() <= 255)
     else {
-        return oauth_client_validation_error("name", &state.config.locale);
+        return oauth_client_validation_error("name", &request_locale(&state));
     };
     let Some(redirect) = request
         .redirect
         .map(|redirect| redirect.trim().to_owned())
         .filter(|redirect| valid_oauth_redirect(redirect))
     else {
-        return oauth_client_validation_error("redirect", &state.config.locale);
+        return oauth_client_validation_error("redirect", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -3528,7 +3646,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3542,7 +3660,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         players,
         notifications,
         show_email_verification,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -3574,7 +3692,7 @@ async fn web_admin_translations(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3584,7 +3702,7 @@ async fn web_admin_translations(
     );
     let page = AdminTranslationsPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         added: query.added.unwrap_or_default() == 1,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -3704,20 +3822,20 @@ async fn web_create_language_line(
     let group = form.group.trim();
     let key = form.key.trim();
     if group.is_empty() || group.chars().count() > 255 {
-        return translation_validation_error("group", &state.config.locale);
+        return translation_validation_error("group", &request_locale(&state));
     }
     if key.is_empty() || key.chars().count() > 255 {
-        return translation_validation_error("key", &state.config.locale);
+        return translation_validation_error("key", &request_locale(&state));
     }
     if form.text.trim().is_empty() {
-        return translation_validation_error("text", &state.config.locale);
+        return translation_validation_error("text", &request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
     match database.language_line_exists(prefix, group, key).await {
-        Ok(true) => return translation_validation_error("key", &state.config.locale),
+        Ok(true) => return translation_validation_error("key", &request_locale(&state)),
         Err(error) => {
             tracing::error!(%error, "failed to check language line key");
             return unavailable();
@@ -3725,7 +3843,13 @@ async fn web_create_language_line(
         Ok(false) => {}
     }
     if let Err(error) = database
-        .create_language_line(prefix, group, key, &state.config.locale, form.text.trim())
+        .create_language_line(
+            prefix,
+            group,
+            key,
+            &request_locale(&state),
+            form.text.trim(),
+        )
         .await
     {
         tracing::error!(%error, "failed to create language line");
@@ -3748,7 +3872,7 @@ async fn web_update_language_line(
         return StatusCode::FORBIDDEN.into_response();
     }
     if form.text.trim().is_empty() {
-        return translation_validation_error("text", &state.config.locale);
+        return translation_validation_error("text", &request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -3757,21 +3881,21 @@ async fn web_update_language_line(
         .update_language_line(
             &state.config.database.table_prefix,
             id,
-            &state.config.locale,
+            &request_locale(&state),
             form.text.trim(),
         )
         .await
     {
         Ok(true) => Json(serde_json::json!({
             "code": 0,
-            "message": translation_admin_message("updated", &state.config.locale)
+            "message": translation_admin_message("updated", &request_locale(&state))
         }))
         .into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "code": 1,
-                "message": translation_admin_message("missing", &state.config.locale)
+                "message": translation_admin_message("missing", &request_locale(&state))
             })),
         )
             .into_response(),
@@ -3803,14 +3927,14 @@ async fn web_delete_language_line(
     {
         Ok(true) => Json(serde_json::json!({
             "code": 0,
-            "message": translation_admin_message("deleted", &state.config.locale)
+            "message": translation_admin_message("deleted", &request_locale(&state))
         }))
         .into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "code": 1,
-                "message": translation_admin_message("missing", &state.config.locale)
+                "message": translation_admin_message("missing", &request_locale(&state))
             })),
         )
             .into_response(),
@@ -3876,7 +4000,7 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3886,7 +4010,7 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     );
     let page = AdminDashboardPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         stats,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -3912,7 +4036,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let debug = std::env::var("APP_DEBUG").ok().is_some_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
@@ -4030,7 +4154,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -4045,7 +4169,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     );
     let page = AdminStatusPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         groups,
         wasm_plugins,
         frontend_style_available: stylesheet.is_some(),
@@ -4074,7 +4198,7 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
 
     let page = AdminUpdatePage {
         site_name: site_name(&state).await,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         version: state.config.version.to_owned(),
         releases_url: "https://github.com/HELPMEEADICE/blessing-skin-rs/releases".to_owned(),
     };
@@ -4096,7 +4220,7 @@ async fn web_admin_update_download(State(state): State<AppState>, headers: Heade
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let message = if state.config.locale.starts_with("zh") {
+    let message = if request_locale(&state).starts_with("zh") {
         "Rust 服务以独立程序发行。请下载对应平台的软件包，并按更新说明停止服务、替换程序后重新启动。"
     } else {
         "The Rust service is distributed as a standalone program. Download the package for your platform, then follow the update instructions to stop the service, replace the program, and restart it."
@@ -4116,7 +4240,7 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let can_upload = user.permission >= 2;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -4130,7 +4254,7 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     );
     let page = AdminPluginsPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         can_upload,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -4194,7 +4318,7 @@ async fn web_admin_plugin_readme(
         }
     };
     let content = render_notification_markdown(&markdown);
-    let language = if state.config.locale.starts_with("zh") {
+    let language = if request_locale(&state).starts_with("zh") {
         "zh-CN"
     } else {
         "en"
@@ -4247,6 +4371,7 @@ async fn web_admin_plugin_config(
             match form_urlencoded::parse(&body)
                 .find(|(key, _)| key == "configuration")
                 .map(|(_, value)| value.into_owned())
+                .filter(|value| !value.trim().is_empty())
             {
                 Some(value) => value,
                 None => return StatusCode::BAD_REQUEST.into_response(),
@@ -4260,7 +4385,7 @@ async fn web_admin_plugin_config(
             .await
         {
             Ok(true) => {
-                message = if state.config.locale.starts_with("zh") {
+                message = if request_locale(&state).starts_with("zh") {
                     "配置已保存。".to_owned()
                 } else {
                     "Configuration saved.".to_owned()
@@ -4269,7 +4394,7 @@ async fn web_admin_plugin_config(
             Ok(false) => return StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
                 tracing::warn!(%error, plugin = %name, "WASM plugin rejected configuration");
-                message = if state.config.locale.starts_with("zh") {
+                message = if request_locale(&state).starts_with("zh") {
                     format!("配置未保存：{error}")
                 } else {
                     format!("Configuration was not saved: {error}")
@@ -4294,9 +4419,9 @@ async fn web_admin_plugin_config(
             return unavailable();
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let page = PluginConfigurationPage {
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         base_url: state.config.app_url.trim_end_matches('/').to_owned(),
         plugin_name: name,
         heading: if chinese {
@@ -5258,7 +5383,7 @@ fn admin_plugin_record(
 ) -> serde_json::Value {
     let filename = format!("{name}.wasm");
     let loaded = state.wasm_plugins.iter().any(|plugin| plugin == &filename);
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let description = if loaded && !on_disk {
         if chinese {
             "文件已移除；当前进程重启前仍会运行"
@@ -5341,7 +5466,7 @@ async fn web_admin_chart(State(state): State<AppState>, headers: HeaderMap) -> R
         .collect();
     let x_axis = axis_dates
         .iter()
-        .map(|date| admin_chart_date_label(*date, &state.config.locale))
+        .map(|date| admin_chart_date_label(*date, &request_locale(&state)))
         .collect::<Vec<_>>();
     let user_data = axis_dates
         .iter()
@@ -5359,7 +5484,7 @@ async fn web_admin_chart(State(state): State<AppState>, headers: HeaderMap) -> R
                 .unwrap_or(&0)
         })
         .collect::<Vec<_>>();
-    let (user_label, texture_label) = admin_chart_series_labels(&state.config.locale);
+    let (user_label, texture_label) = admin_chart_series_labels(&request_locale(&state));
 
     Json(serde_json::json!({
         "labels": [user_label, texture_label],
@@ -5426,7 +5551,7 @@ async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) ->
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -5436,7 +5561,7 @@ async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) ->
     );
     let page = OAuthManagePage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -5461,7 +5586,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let allow_delete = user.permission < 1;
     let extra = serde_json::json!({
         "profile": {
@@ -5475,7 +5600,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         encode_frontend_globals(&state, &site_name, "user/profile", extra, i18n);
     let page = UserProfilePage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         user,
         allow_delete,
         frontend_style_available: stylesheet.is_some(),
@@ -5526,7 +5651,7 @@ async fn web_user_reports(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -5536,7 +5661,7 @@ async fn web_user_reports(
     );
     let page = UserReportsPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         reports,
         current_page,
         last_page: total
@@ -5786,7 +5911,7 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .await
     {
         Ok(crate::database::UserSignOutcome::Signed(score)) => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("签到成功，获得了 {reward} 积分")
             } else {
                 format!("Signed successfully. You got {reward} scores.")
@@ -5836,7 +5961,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
             return unavailable();
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let rule_label = match (chinese, rule.as_str()) {
         (true, "official") => "仅允许官方角色名字符".to_owned(),
         (true, "cjk") => "允许中文角色名".to_owned(),
@@ -5860,7 +5985,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -5876,7 +6001,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
     );
     let page = PlayerManagementPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         user,
         score_per_player,
         rule_label,
@@ -5953,10 +6078,10 @@ async fn web_add_player(
     };
     let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &state.config.locale),
+        Err(_) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -5971,7 +6096,7 @@ async fn web_add_player(
             }
         };
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     }
     let score_cost = match database.option(prefix, "score_per_player").await {
         Ok(value) => value
@@ -5993,7 +6118,7 @@ async fn web_add_player(
                 serde_json::json!({"user_id": user.uid, "player_id": player.pid, "name": player.name}),
             )
             .await;
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("成功添加了角色 {}", player.name)
             } else {
                 format!("Player {} was added successfully.", player.name)
@@ -6005,11 +6130,11 @@ async fn web_add_player(
             )
         }
         Ok(crate::database::PlayerAddOutcome::NameExists) => {
-            duplicate_player_name_error(&state.config.locale)
+            duplicate_player_name_error(&request_locale(&state))
         }
         Ok(crate::database::PlayerAddOutcome::InsufficientScore) => login_result(
             7,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "添加角色失败，积分不足"
             } else {
                 "You don't have enough score to add a player."
@@ -6038,10 +6163,10 @@ async fn web_rename_player(
     };
     let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &state.config.locale),
+        Err(_) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -6056,7 +6181,7 @@ async fn web_rename_player(
             }
         };
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     }
     match database
         .rename_player(prefix, user.uid, player_id, &name)
@@ -6072,7 +6197,7 @@ async fn web_rename_player(
                 serde_json::json!({"user_id": user.uid, "player_id": player_id, "previous_name": previous_name, "name": name}),
             )
             .await;
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("角色名已从 {previous_name} 更新为 {name}")
             } else {
                 format!("Player renamed from {previous_name} to {name}.")
@@ -6083,12 +6208,12 @@ async fn web_rename_player(
                 Some(serde_json::to_value(player).unwrap_or(serde_json::Value::Null)),
             )
         }
-        Ok(PlayerRenameOutcome::NameExists) => duplicate_player_name_error(&state.config.locale),
+        Ok(PlayerRenameOutcome::NameExists) => duplicate_player_name_error(&request_locale(&state)),
         Ok(PlayerRenameOutcome::Forbidden) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "code": 1,
-                "message": if state.config.locale.starts_with("zh") {
+                "message": if request_locale(&state).starts_with("zh") {
                     "无权操作此角色"
                 } else {
                     "You are not allowed to modify this player."
@@ -6136,11 +6261,11 @@ async fn web_set_player_textures(
             emit_player_textures_updated(&state, &player).await;
             player_texture_response(
                 Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &state.config.locale,
+                &request_locale(&state),
                 false,
             )
         }
-        result => player_texture_response(result, &state.config.locale, false),
+        result => player_texture_response(result, &request_locale(&state), false),
     }
 }
 
@@ -6180,11 +6305,11 @@ async fn web_clear_player_textures(
             emit_player_textures_updated(&state, &player).await;
             player_texture_response(
                 Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &state.config.locale,
+                &request_locale(&state),
                 true,
             )
         }
-        result => player_texture_response(result, &state.config.locale, true),
+        result => player_texture_response(result, &request_locale(&state), true),
     }
 }
 
@@ -6237,7 +6362,7 @@ async fn web_delete_player(
             .await;
             login_result(
                 0,
-                &if state.config.locale.starts_with("zh") {
+                &if request_locale(&state).starts_with("zh") {
                     format!("角色 {name} 已被删除")
                 } else {
                     format!("Player {name} was deleted successfully.")
@@ -6249,7 +6374,7 @@ async fn web_delete_player(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "code": 1,
-                "message": if state.config.locale.starts_with("zh") {
+                "message": if request_locale(&state).starts_with("zh") {
                     "无权操作此角色"
                 } else {
                     "You are not allowed to modify this player."
@@ -6277,7 +6402,7 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -6287,7 +6412,7 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
     );
     let page = ClosetManagementPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         user,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -6380,10 +6505,10 @@ async fn web_add_closet_item(
     };
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return closet_validation_error("tid", &state.config.locale),
+        Err(_) => return closet_validation_error("tid", &request_locale(&state)),
     };
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
-        return closet_validation_error("tid", &state.config.locale);
+        return closet_validation_error("tid", &request_locale(&state));
     };
     let Some(name) = request
         .get("name")
@@ -6391,7 +6516,7 @@ async fn web_add_closet_item(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     else {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -6429,7 +6554,7 @@ async fn web_add_closet_item(
     {
         Ok(crate::database::ClosetAddOutcome::Added) => login_result(
             0,
-            &if state.config.locale.starts_with("zh") {
+            &if request_locale(&state).starts_with("zh") {
                 format!("材质 {name} 收藏成功")
             } else {
                 format!("Added {name} to closet successfully.")
@@ -6438,7 +6563,7 @@ async fn web_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "你已经收藏过这个材质啦"
             } else {
                 "You have already added this texture."
@@ -6447,7 +6572,7 @@ async fn web_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::InsufficientScore) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "收藏失败，积分不足"
             } else {
                 "You don't have enough score to add it to closet."
@@ -6456,7 +6581,7 @@ async fn web_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::TextureNotFound) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "该材质不存在"
             } else {
                 "We cannot find this texture."
@@ -6465,7 +6590,7 @@ async fn web_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::PrivateTexture) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "请求的材质已经设为私密，仅上传者和管理员可查看"
             } else {
                 "The requested texture is private and only visible to the uploader and admins."
@@ -6494,7 +6619,7 @@ async fn web_rename_closet_item(
     };
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return closet_validation_error("name", &state.config.locale),
+        Err(_) => return closet_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request
         .get("name")
@@ -6502,7 +6627,7 @@ async fn web_rename_closet_item(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     else {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -6513,7 +6638,7 @@ async fn web_rename_closet_item(
     {
         Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
             0,
-            &if state.config.locale.starts_with("zh") {
+            &if request_locale(&state).starts_with("zh") {
                 format!("衣柜物品成功重命名至 {name}")
             } else {
                 format!("The item is successfully renamed to {name}")
@@ -6579,7 +6704,7 @@ async fn web_remove_closet_item(
     {
         Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
             0,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "材质已从衣柜中移除"
             } else {
                 "The texture was removed from closet successfully."
@@ -6619,13 +6744,15 @@ async fn user_profile_update(
     };
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return login_result(1, illegal_parameters_message(&state.config.locale), None),
+        Err(_) => {
+            return login_result(1, illegal_parameters_message(&request_locale(&state)), None);
+        }
     };
     let Some(action) = request.get("action").and_then(serde_json::Value::as_str) else {
-        return login_result(1, illegal_parameters_message(&state.config.locale), None);
+        return login_result(1, illegal_parameters_message(&request_locale(&state)), None);
     };
     let prefix = &state.config.database.table_prefix;
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     match action {
         "nickname" => {
             let Some(nickname) = request
@@ -6633,7 +6760,11 @@ async fn user_profile_update(
                 .and_then(serde_json::Value::as_str)
                 .filter(|nickname| !nickname.is_empty())
             else {
-                return profile_validation_error("new_nickname", "required", &state.config.locale);
+                return profile_validation_error(
+                    "new_nickname",
+                    "required",
+                    &request_locale(&state),
+                );
             };
             if let Err(error) = database
                 .update_user_text(prefix, user.uid, "nickname", nickname)
@@ -6664,7 +6795,7 @@ async fn user_profile_update(
                 return profile_validation_error(
                     "current_password",
                     "password",
-                    &state.config.locale,
+                    &request_locale(&state),
                 );
             };
             let Some(new_password) = request
@@ -6675,7 +6806,7 @@ async fn user_profile_update(
                 return profile_validation_error(
                     "new_password",
                     "new_password",
-                    &state.config.locale,
+                    &request_locale(&state),
                 );
             };
             let credential = match database.credentials_by_user_id(prefix, user.uid).await {
@@ -6740,14 +6871,14 @@ async fn user_profile_update(
                 .and_then(serde_json::Value::as_str)
                 .filter(|email| valid_email_address(email) && email.len() <= 100)
             else {
-                return profile_validation_error("email", "email", &state.config.locale);
+                return profile_validation_error("email", "email", &request_locale(&state));
             };
             let Some(password) = request
                 .get("password")
                 .and_then(serde_json::Value::as_str)
                 .filter(|password| (6..=32).contains(&password.chars().count()))
             else {
-                return profile_validation_error("password", "password", &state.config.locale);
+                return profile_validation_error("password", "password", &request_locale(&state));
             };
             let credential = match database.credentials_by_user_id(prefix, user.uid).await {
                 Ok(Some(credential)) => credential,
@@ -6821,7 +6952,7 @@ async fn user_profile_update(
                 .and_then(serde_json::Value::as_str)
                 .filter(|password| (6..=32).contains(&password.chars().count()))
             else {
-                return profile_validation_error("password", "password", &state.config.locale);
+                return profile_validation_error("password", "password", &request_locale(&state));
             };
             if user.permission >= 1 {
                 return login_result(
@@ -6884,7 +7015,7 @@ async fn user_profile_update(
                 }
             }
         }
-        _ => login_result(1, illegal_parameters_message(&state.config.locale), None),
+        _ => login_result(1, illegal_parameters_message(&request_locale(&state)), None),
     }
 }
 
@@ -6906,7 +7037,7 @@ async fn user_set_avatar(
         .and_then(|value| value.get("tid"))
         .and_then(|value| request_i64(Some(value)))
     else {
-        return profile_validation_error("tid", "integer", &state.config.locale);
+        return profile_validation_error("tid", "integer", &request_locale(&state));
     };
     if tid != 0 {
         let texture = match database
@@ -6917,7 +7048,7 @@ async fn user_set_avatar(
             Ok(None) => {
                 return login_result(
                     1,
-                    if state.config.locale.starts_with("zh") {
+                    if request_locale(&state).starts_with("zh") {
                         "材质不存在"
                     } else {
                         "No such texture."
@@ -6933,7 +7064,7 @@ async fn user_set_avatar(
         if texture.texture_type == "cape" {
             return login_result(
                 1,
-                if state.config.locale.starts_with("zh") {
+                if request_locale(&state).starts_with("zh") {
                     "披风不能被设置为头像"
                 } else {
                     "You can't set a cape as avatar."
@@ -6944,7 +7075,7 @@ async fn user_set_avatar(
         if !texture.is_public && texture.uploader != user.uid && user.permission < 1 {
             return login_result(
                 1,
-                if state.config.locale.starts_with("zh") {
+                if request_locale(&state).starts_with("zh") {
                     "请求的材质已经设为私密，仅上传者和管理员可查看"
                 } else {
                     "The requested texture is private and only visible to the uploader and admins."
@@ -6968,7 +7099,7 @@ async fn user_set_avatar(
     .await;
     login_result(
         0,
-        if state.config.locale.starts_with("zh") {
+        if request_locale(&state).starts_with("zh") {
             "设置成功"
         } else {
             "New avatar was set successfully."
@@ -7050,7 +7181,7 @@ fn expire_web_session(state: &AppState, mut response: Response) -> Response {
 async fn logout(State(state): State<AppState>) -> Response {
     let mut response = login_result(
         0,
-        if state.config.locale.starts_with("zh") {
+        if request_locale(&state).starts_with("zh") {
             "已退出登录"
         } else {
             "Logged out successfully."
@@ -7326,7 +7457,7 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7341,7 +7472,7 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
     .await;
     render_setup_page(
         &SetupWelcomePage {
-            locale: state.config.locale.clone(),
+            locale: request_locale(&state),
             version,
             frontend_script_available: assets.frontend_script_available,
             frontend_script: assets.frontend_script,
@@ -7417,7 +7548,7 @@ async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) 
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7461,7 +7592,7 @@ async fn setup_database_page(State(state): State<AppState>, headers: HeaderMap) 
     let assets = setup_page_assets(&state, "setup/database", extra).await;
     render_setup_page(
         &SetupDatabasePage {
-            locale: state.config.locale.clone(),
+            locale: request_locale(&state),
             csrf: csrf.clone(),
             driver: driver.to_owned(),
             host,
@@ -7488,7 +7619,7 @@ async fn setup_database_save(
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7609,7 +7740,7 @@ async fn setup_database_save(
             let assets = setup_page_assets(&state, "setup/database", extra).await;
             render_setup_page(
                 &SetupDatabasePage {
-                    locale: state.config.locale.clone(),
+                    locale: request_locale(&state),
                     csrf: csrf.clone(),
                     driver: form.driver,
                     host: form.host,
@@ -7664,7 +7795,7 @@ async fn setup_info_page(State(state): State<AppState>, headers: HeaderMap) -> R
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7693,7 +7824,7 @@ async fn setup_info_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let assets = setup_page_assets(&state, "setup/info", extra).await;
     render_setup_page(
         &SetupInfoPage {
-            locale: state.config.locale.clone(),
+            locale: request_locale(&state),
             csrf: csrf.clone(),
             site_name,
             error: String::new(),
@@ -7714,7 +7845,7 @@ async fn setup_finish(
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7800,7 +7931,7 @@ async fn setup_finish(
             let assets = setup_page_assets(&state, "setup/finish", serde_json::json!({})).await;
             render_setup_page(
                 &SetupFinishPage {
-                    locale: state.config.locale.clone(),
+                    locale: request_locale(&state),
                     frontend_script_available: assets.frontend_script_available,
                     frontend_script: assets.frontend_script,
                     frontend_globals_b64: assets.frontend_globals_b64,
@@ -7811,7 +7942,7 @@ async fn setup_finish(
         }
         Err(crate::installer::InstallError::AlreadyInstalled) => render_setup_page(
             &SetupLockedPage {
-                locale: state.config.locale.clone(),
+                locale: request_locale(&state),
             },
             &headers,
             None,
@@ -7869,7 +8000,7 @@ async fn setup_database_error(
     let assets = setup_page_assets(state, "setup/database", extra).await;
     let mut response = render_setup_page(
         &SetupDatabasePage {
-            locale: state.config.locale.clone(),
+            locale: request_locale(&state),
             csrf: csrf.clone(),
             driver: form.driver.clone(),
             host: form.host.clone(),
@@ -7908,7 +8039,7 @@ async fn setup_info_error(
     let assets = setup_page_assets(state, "setup/info", extra).await;
     let mut response = render_setup_page(
         &SetupInfoPage {
-            locale: state.config.locale.clone(),
+            locale: request_locale(&state),
             csrf: csrf.clone(),
             site_name: site_name.to_owned(),
             error,
@@ -7928,7 +8059,7 @@ fn setup_is_locked(state: &AppState) -> bool {
 }
 
 fn setup_message(state: &AppState, english: &str, chinese: &str) -> String {
-    if state.config.locale.starts_with("zh") {
+    if request_locale(&state).starts_with("zh") {
         chinese.to_owned()
     } else {
         english.to_owned()
@@ -7942,7 +8073,7 @@ async fn setup_page_assets(
 ) -> SetupPageAssets {
     let app_dir = state.public_dir.join("app");
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(state, "Blessing Skin", route, extra, i18n);
     SetupPageAssets {
         frontend_script_available: frontend_script.is_some(),
@@ -8169,7 +8300,7 @@ async fn web_send_notification(
     let request = if is_json {
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(request) => request,
-            Err(_) => return notification_validation_error("receiver", &state.config.locale),
+            Err(_) => return notification_validation_error("receiver", &request_locale(&state)),
         }
     } else {
         let fields = form_urlencoded::parse(&body).collect::<HashMap<_, _>>();
@@ -8182,7 +8313,7 @@ async fn web_send_notification(
         })
     };
     let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("receiver", &state.config.locale);
+        return notification_validation_error("receiver", &request_locale(&state));
     };
     let receiver = receiver.trim();
     let audience = match receiver {
@@ -8190,33 +8321,33 @@ async fn web_send_notification(
         "normal" => crate::database::NotificationAudience::Normal,
         "uid" => {
             let Some(uid) = request_i64(request.get("uid")) else {
-                return notification_validation_error("uid", &state.config.locale);
+                return notification_validation_error("uid", &request_locale(&state));
             };
             crate::database::NotificationAudience::User(uid)
         }
         "email" => {
             let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
-                return notification_validation_error("email", &state.config.locale);
+                return notification_validation_error("email", &request_locale(&state));
             };
             let email = email.trim();
             if !valid_email_address(email) {
-                return notification_validation_error("email", &state.config.locale);
+                return notification_validation_error("email", &request_locale(&state));
             }
             crate::database::NotificationAudience::Email(email.to_owned())
         }
-        _ => return notification_validation_error("receiver", &state.config.locale),
+        _ => return notification_validation_error("receiver", &request_locale(&state)),
     };
     let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("title", &state.config.locale);
+        return notification_validation_error("title", &request_locale(&state));
     };
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 20 {
-        return notification_validation_error("title", &state.config.locale);
+        return notification_validation_error("title", &request_locale(&state));
     }
     let content = match request.get("content") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(content)) => Some(content.trim()),
-        _ => return notification_validation_error("content", &state.config.locale),
+        _ => return notification_validation_error("content", &request_locale(&state)),
     };
     let prefix = &state.config.database.table_prefix;
     let recipients = match database.notification_recipients(prefix, &audience).await {
@@ -8227,7 +8358,7 @@ async fn web_send_notification(
                 crate::database::NotificationAudience::Email(_) => "email",
                 _ => "receiver",
             };
-            return notification_validation_error(field, &state.config.locale);
+            return notification_validation_error(field, &request_locale(&state));
         }
         Err(error) => {
             tracing::error!(%error, sender_uid = user.uid, "failed to select notification recipients");
@@ -8256,7 +8387,7 @@ async fn web_send_notification(
     } else {
         login_result(
             0,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "站内通知已发送。"
             } else {
                 "The site notification was sent."
@@ -8299,10 +8430,10 @@ async fn api_send_notification(
 
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return notification_validation_error("receiver", &state.config.locale),
+        Err(_) => return notification_validation_error("receiver", &request_locale(&state)),
     };
     let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("receiver", &state.config.locale);
+        return notification_validation_error("receiver", &request_locale(&state));
     };
     let receiver = receiver.trim();
     let audience = match receiver {
@@ -8310,33 +8441,33 @@ async fn api_send_notification(
         "normal" => crate::database::NotificationAudience::Normal,
         "uid" => {
             let Some(uid) = request_i64(request.get("uid")) else {
-                return notification_validation_error("uid", &state.config.locale);
+                return notification_validation_error("uid", &request_locale(&state));
             };
             crate::database::NotificationAudience::User(uid)
         }
         "email" => {
             let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
-                return notification_validation_error("email", &state.config.locale);
+                return notification_validation_error("email", &request_locale(&state));
             };
             let email = email.trim();
             if !valid_email_address(email) {
-                return notification_validation_error("email", &state.config.locale);
+                return notification_validation_error("email", &request_locale(&state));
             }
             crate::database::NotificationAudience::Email(email.to_owned())
         }
-        _ => return notification_validation_error("receiver", &state.config.locale),
+        _ => return notification_validation_error("receiver", &request_locale(&state)),
     };
     let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("title", &state.config.locale);
+        return notification_validation_error("title", &request_locale(&state));
     };
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 20 {
-        return notification_validation_error("title", &state.config.locale);
+        return notification_validation_error("title", &request_locale(&state));
     }
     let content = match request.get("content") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(content)) => Some(content.trim()),
-        _ => return notification_validation_error("content", &state.config.locale),
+        _ => return notification_validation_error("content", &request_locale(&state)),
     };
 
     let recipients = match database.notification_recipients(prefix, &audience).await {
@@ -8348,7 +8479,7 @@ async fn api_send_notification(
                     crate::database::NotificationAudience::Email(_) => "email",
                     _ => "receiver",
                 },
-                &state.config.locale,
+                &request_locale(&state),
             );
         }
         Err(error) => {
@@ -8582,10 +8713,10 @@ async fn api_rename_player(
     };
     let request: RenamePlayerRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &state.config.locale),
+        Err(_) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -8618,7 +8749,7 @@ async fn api_rename_player(
         .flatten()
         .unwrap_or_default();
     if !valid_player_name(&name, &name_rule, &custom_rule, min_length, max_length) {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     }
 
     match database
@@ -8635,7 +8766,7 @@ async fn api_rename_player(
                 serde_json::json!({"user_id": identity.user_id, "player_id": player_id, "previous_name": previous_name, "name": name}),
             )
             .await;
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("角色名已从 {previous_name} 更新为 {name}")
             } else {
                 format!("Player renamed from {previous_name} to {name}.")
@@ -8648,7 +8779,7 @@ async fn api_rename_player(
         }
         Ok(PlayerRenameOutcome::NameExists) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "该角色名已被使用"
             } else {
                 "That player name is already in use."
@@ -8659,7 +8790,7 @@ async fn api_rename_player(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "code": 1,
-                "message": if state.config.locale.starts_with("zh") {
+                "message": if request_locale(&state).starts_with("zh") {
                     "无权操作此角色"
                 } else {
                     "You are not allowed to modify this player."
@@ -8712,11 +8843,11 @@ async fn api_set_player_textures(
             emit_player_textures_updated(&state, &player).await;
             player_texture_response(
                 Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &state.config.locale,
+                &request_locale(&state),
                 false,
             )
         }
-        result => player_texture_response(result, &state.config.locale, false),
+        result => player_texture_response(result, &request_locale(&state), false),
     }
 }
 
@@ -8762,11 +8893,11 @@ async fn api_clear_player_textures(
             emit_player_textures_updated(&state, &player).await;
             player_texture_response(
                 Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &state.config.locale,
+                &request_locale(&state),
                 true,
             )
         }
-        result => player_texture_response(result, &state.config.locale, true),
+        result => player_texture_response(result, &request_locale(&state), true),
     }
 }
 
@@ -8906,10 +9037,10 @@ async fn api_add_player(
     }
     let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &state.config.locale),
+        Err(_) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -8942,7 +9073,7 @@ async fn api_add_player(
         .flatten()
         .unwrap_or_default();
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
-        return validation_error("name", &state.config.locale);
+        return validation_error("name", &request_locale(&state));
     }
     let score_cost = match database.option(prefix, "score_per_player").await {
         Ok(value) => value
@@ -8964,7 +9095,7 @@ async fn api_add_player(
                 serde_json::json!({"user_id": identity.user_id, "player_id": player.pid, "name": player.name}),
             )
             .await;
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("成功添加了角色 {}", player.name)
             } else {
                 format!("Player {} was added successfully.", player.name)
@@ -8976,11 +9107,11 @@ async fn api_add_player(
             )
         }
         Ok(crate::database::PlayerAddOutcome::NameExists) => {
-            duplicate_player_name_error(&state.config.locale)
+            duplicate_player_name_error(&request_locale(&state))
         }
         Ok(crate::database::PlayerAddOutcome::InsufficientScore) => login_result(
             7,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "添加角色失败，积分不足"
             } else {
                 "You don't have enough score to add a player."
@@ -9052,7 +9183,7 @@ async fn api_delete_player(
             .await;
             login_result(
                 0,
-                &if state.config.locale.starts_with("zh") {
+                &if request_locale(&state).starts_with("zh") {
                 format!("角色 {name} 已被删除")
             } else {
                 format!("Player {name} was deleted successfully.")
@@ -9064,7 +9195,7 @@ async fn api_delete_player(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "code": 1,
-                "message": if state.config.locale.starts_with("zh") { "无权操作此角色" } else { "You are not allowed to modify this player." }
+                "message": if request_locale(&state).starts_with("zh") { "无权操作此角色" } else { "You are not allowed to modify this player." }
             })),
         )
             .into_response(),
@@ -9130,17 +9261,17 @@ async fn api_add_closet_item(
     }
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return closet_validation_error("tid", &state.config.locale),
+        Err(_) => return closet_validation_error("tid", &request_locale(&state)),
     };
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
-        return closet_validation_error("tid", &state.config.locale);
+        return closet_validation_error("tid", &request_locale(&state));
     };
     let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     };
     let name = name.trim();
     if name.is_empty() {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -9186,7 +9317,7 @@ async fn api_add_closet_item(
     {
         Ok(crate::database::ClosetAddOutcome::Added) => login_result(
             0,
-            &if state.config.locale.starts_with("zh") {
+            &if request_locale(&state).starts_with("zh") {
                 format!("材质 {name} 收藏成功")
             } else {
                 format!("Added {name} to closet successfully.")
@@ -9195,7 +9326,7 @@ async fn api_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::NameExists) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "你已经收藏过这个材质啦"
             } else {
                 "You have already added this texture."
@@ -9204,7 +9335,7 @@ async fn api_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::InsufficientScore) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "收藏失败，积分不足"
             } else {
                 "You don't have enough score to add it to closet."
@@ -9213,7 +9344,7 @@ async fn api_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::TextureNotFound) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "该材质不存在"
             } else {
                 "We cannot find this texture."
@@ -9222,7 +9353,7 @@ async fn api_add_closet_item(
         ),
         Ok(crate::database::ClosetAddOutcome::PrivateTexture) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "请求的材质已经设为私密，仅上传者和管理员可查看"
             } else {
                 "The requested texture is private and only visible to the uploader and admins."
@@ -9254,14 +9385,14 @@ async fn api_rename_closet_item(
     };
     let request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(request) => request,
-        Err(_) => return closet_validation_error("name", &state.config.locale),
+        Err(_) => return closet_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     };
     let name = name.trim();
     if name.is_empty() {
-        return closet_validation_error("name", &state.config.locale);
+        return closet_validation_error("name", &request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -9277,7 +9408,7 @@ async fn api_rename_closet_item(
     {
         Ok(crate::database::ClosetRenameOutcome::Renamed) => login_result(
             0,
-            &if state.config.locale.starts_with("zh") {
+            &if request_locale(&state).starts_with("zh") {
                 format!("衣柜物品成功重命名至 {name}")
             } else {
                 format!("The item is successfully renamed to {name}")
@@ -9353,7 +9484,7 @@ async fn api_remove_closet_item(
     {
         Ok(crate::database::ClosetRemoveOutcome::Removed) => login_result(
             0,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "材质已从衣柜中移除"
             } else {
                 "The texture was removed from closet successfully."
@@ -9371,7 +9502,7 @@ async fn api_remove_closet_item(
 fn closet_item_missing(state: &AppState) -> Response {
     login_result(
         1,
-        if state.config.locale.starts_with("zh") {
+        if request_locale(&state).starts_with("zh") {
             "衣柜中不存在此材质"
         } else {
             "The texture does not exist in your closet."
@@ -9395,7 +9526,7 @@ async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -9405,7 +9536,7 @@ async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
     );
     let page = SkinLibraryPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         logged_in,
         current_uid,
         frontend_style_available: stylesheet.is_some(),
@@ -9497,7 +9628,7 @@ async fn skinlib_show_page(
         .as_ref()
         .map(|user| user.nickname.clone())
         .unwrap_or_else(|| {
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "不存在的用户".to_owned()
             } else {
                 "No such user.".to_owned()
@@ -9557,7 +9688,7 @@ async fn skinlib_show_page(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -9576,7 +9707,7 @@ async fn skinlib_show_page(
     );
     let page = SkinLibraryShowPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         tid: texture.tid,
         name: texture.name,
         texture_type: texture.texture_type,
@@ -9656,7 +9787,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
             return unavailable();
         }
     };
-    let localized_policy_key = format!("content_policy_{}", state.config.locale);
+    let localized_policy_key = format!("content_policy_{}", request_locale(&state));
     let content_policy = match database.option(prefix, &localized_policy_key).await {
         Ok(Some(value)) if !value.is_empty() => value,
         Ok(_) => match database.option(prefix, "content_policy").await {
@@ -9678,7 +9809,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
             return unavailable();
         }
     };
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let rule = match texture_name_regexp {
         Some(regexp) if chinese => format!("本站已应用特殊的名称规则：{regexp}"),
         Some(regexp) => format!("Custom name rules are applied as {regexp}"),
@@ -9697,7 +9828,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -9716,7 +9847,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
     );
     let page = TextureUploadPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         user,
         public_rate,
         private_rate,
@@ -9793,7 +9924,7 @@ async fn skinlib_info(
         let status = status_code
             .and_then(|code| StatusCode::from_u16(code).ok())
             .unwrap_or(StatusCode::FORBIDDEN);
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             if status == StatusCode::NOT_FOUND {
                 "请求的材质文件已经被删除"
             } else {
@@ -9841,7 +9972,7 @@ pub(crate) async fn authenticated_web_user(
         }
     };
     if user.permission == -1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "你已被本站封禁，详情请联系站点管理员"
         } else {
             "You are banned on this site. Please contact the admin."
@@ -9858,7 +9989,7 @@ pub(crate) async fn authenticated_web_user(
         .await
     {
         Ok(value) if legacy_option_bool(value.as_deref()) && !user.verified => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "你必须验证邮箱后才能访问此页面"
             } else {
                 "To access this page, you should verify your email address first."
@@ -9983,7 +10114,7 @@ async fn upload_texture(
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "invalid texture upload multipart body");
-                return upload_validation_error("file", &state.config.locale);
+                return upload_validation_error("file", &request_locale(&state));
             }
         };
         let Some(field_name) = field.name().map(str::to_owned) else {
@@ -9993,7 +10124,7 @@ async fn upload_texture(
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%error, field = field_name, "failed to read texture upload field");
-                return upload_validation_error(&field_name, &state.config.locale);
+                return upload_validation_error(&field_name, &request_locale(&state));
             }
         };
         if field_name == "file" {
@@ -10001,7 +10132,7 @@ async fn upload_texture(
             continue;
         }
         let Ok(value) = String::from_utf8(bytes.to_vec()) else {
-            return upload_validation_error(&field_name, &state.config.locale);
+            return upload_validation_error(&field_name, &request_locale(&state));
         };
         match field_name.as_str() {
             "name" => name = Some(value),
@@ -10014,19 +10145,19 @@ async fn upload_texture(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
-        return upload_validation_error("name", &state.config.locale);
+        return upload_validation_error("name", &request_locale(&state));
     };
     let Some(file_bytes) = file_bytes.filter(|bytes: &Vec<u8>| !bytes.is_empty()) else {
-        return upload_validation_error("file", &state.config.locale);
+        return upload_validation_error("file", &request_locale(&state));
     };
     let Some(texture_type) = texture_type else {
-        return upload_validation_error("type", &state.config.locale);
+        return upload_validation_error("type", &request_locale(&state));
     };
     if !valid_texture_type(&texture_type) {
-        return upload_validation_error("type", &state.config.locale);
+        return upload_validation_error("type", &request_locale(&state));
     }
     let Some(is_public) = public.as_deref().and_then(parse_legacy_form_bool) else {
-        return upload_validation_error("public", &state.config.locale);
+        return upload_validation_error("public", &request_locale(&state));
     };
     let name_rule = match database
         .option(&state.config.database.table_prefix, "texture_name_regexp")
@@ -10044,7 +10175,7 @@ async fn upload_texture(
             return unavailable();
         }
         if !valid_texture_name(&name, &name_rule) {
-            return upload_validation_error("name", &state.config.locale);
+            return upload_validation_error("name", &request_locale(&state));
         }
     }
     let max_upload_kb = match database
@@ -10061,10 +10192,10 @@ async fn upload_texture(
         }
     };
     if file_bytes.len() as u64 > max_upload_kb.saturating_mul(1024) as u64 {
-        return upload_validation_error("file", &state.config.locale);
+        return upload_validation_error("file", &request_locale(&state));
     }
     let Some((width, height)) = png_dimensions(&file_bytes) else {
-        return upload_validation_error("file", &state.config.locale);
+        return upload_validation_error("file", &request_locale(&state));
     };
     let max_width = match database
         .option(&state.config.database.table_prefix, "max_texture_width")
@@ -10079,7 +10210,7 @@ async fn upload_texture(
         }
     };
     if width > max_width {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             format!("材质过宽（{width}px），本站允许的最大宽度为 {max_width}px")
         } else {
             format!("The texture is too wide ({width}px). Maximum width allowed is {max_width}px")
@@ -10087,13 +10218,13 @@ async fn upload_texture(
         return login_result(1, &message, None);
     }
     if !valid_texture_dimensions(&texture_type, width, height) {
-        return upload_size_error(&state.config.locale, &texture_type, width, height);
+        return upload_size_error(&request_locale(&state), &texture_type, width, height);
     }
     let sanitized = match sanitize_png(&file_bytes) {
         Ok(sanitized) => sanitized,
         Err(error) => {
             tracing::warn!(%error, "failed to decode uploaded PNG texture");
-            return upload_validation_error("file", &state.config.locale);
+            return upload_validation_error("file", &request_locale(&state));
         }
     };
     let hash = Sha256::digest(&sanitized)
@@ -10167,7 +10298,7 @@ async fn upload_texture(
     if reporter.score < score_cost {
         return login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "积分不足"
             } else {
                 "You don't have enough score to upload this texture."
@@ -10214,7 +10345,7 @@ async fn upload_texture(
                 serde_json::json!({"user_id": reporter.uid, "texture_id": tid, "hash": hash, "name": name, "type": texture_type, "public": is_public}),
             )
             .await;
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("材质 {name} 上传成功")
             } else {
                 format!("Texture {name} was uploaded successfully.")
@@ -10223,7 +10354,7 @@ async fn upload_texture(
         }
         Ok(crate::database::TextureUploadOutcome::AlreadyUploaded(tid)) => login_result(
             2,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
             } else {
                 "The texture is already uploaded by someone else. You can add it to your closet directly."
@@ -10234,7 +10365,7 @@ async fn upload_texture(
             cleanup_unreferenced_upload(&state, database, &hash, file_was_missing).await;
             login_result(
                 1,
-                if state.config.locale.starts_with("zh") {
+                if request_locale(&state).starts_with("zh") {
                     "积分不足"
                 } else {
                     "You don't have enough score to upload this texture."
@@ -10297,7 +10428,7 @@ async fn texture_mutation_context(
         }
     };
     if texture.uploader != user.uid && user.permission < 1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "你没有权限修改此材质"
         } else {
             "You have no permission to moderate this texture."
@@ -10321,21 +10452,21 @@ async fn submit_skinlib_report(
         Err(response) => return response,
     };
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
-        return report_validation_error("tid", &state.config.locale);
+        return report_validation_error("tid", &request_locale(&state));
     };
     let Some(reason) = request.get("reason").and_then(serde_json::Value::as_str) else {
-        return report_validation_error("reason", &state.config.locale);
+        return report_validation_error("reason", &request_locale(&state));
     };
     let reason = reason.trim();
     if reason.is_empty() {
-        return report_validation_error("reason", &state.config.locale);
+        return report_validation_error("reason", &request_locale(&state));
     }
     let texture = match database
         .texture_info(&state.config.database.table_prefix, tid)
         .await
     {
         Ok(Some(texture)) => texture,
-        Ok(None) => return report_validation_error("tid", &state.config.locale),
+        Ok(None) => return report_validation_error("tid", &request_locale(&state)),
         Err(error) => {
             tracing::error!(%error, tid, "failed to load reported texture");
             return unavailable();
@@ -10376,7 +10507,7 @@ async fn submit_skinlib_report(
             .await;
             login_result(
                 0,
-                if state.config.locale.starts_with("zh") {
+                if request_locale(&state).starts_with("zh") {
                     "举报已提交，请等待管理员处理"
                 } else {
                     "Thanks for reporting! The administrators will review it as soon as possible."
@@ -10386,7 +10517,7 @@ async fn submit_skinlib_report(
         }
         Ok(crate::database::ReportSubmissionOutcome::AlreadyReported) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "您已经举报过该材质了，请耐心等待管理员处理。您可以在用户中心查看举报的处理进度。"
             } else {
                 "You have already reported this texture. The administrators will review it as soon as possible. You can also track the status of your report at User Center."
@@ -10395,7 +10526,7 @@ async fn submit_skinlib_report(
         ),
         Ok(crate::database::ReportSubmissionOutcome::InsufficientScore) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "积分不足"
             } else {
                 "You don't have enough score to upload this texture."
@@ -10457,11 +10588,11 @@ async fn rename_texture(
         Err(response) => return response,
     };
     let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
-        return texture_name_validation_error(&state.config.locale);
+        return texture_name_validation_error(&request_locale(&state));
     };
     let name = name.trim();
     if name.is_empty() {
-        return texture_name_validation_error(&state.config.locale);
+        return texture_name_validation_error(&request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -10482,7 +10613,7 @@ async fn rename_texture(
             return unavailable();
         }
         if !valid_texture_name(name, &name_rule) {
-            return texture_name_validation_error(&state.config.locale);
+            return texture_name_validation_error(&request_locale(&state));
         }
     }
     if let Err(error) = database
@@ -10498,7 +10629,7 @@ async fn rename_texture(
         serde_json::json!({"texture_id": tid, "previous_name": texture.name, "name": name}),
     )
     .await;
-    let message = if state.config.locale.starts_with("zh") {
+    let message = if request_locale(&state).starts_with("zh") {
         format!("材质名称已被成功设置为 {name}")
     } else {
         format!("The texture was renamed to {name} successfully.")
@@ -10667,7 +10798,7 @@ async fn delete_texture(
     .await;
     login_result(
         0,
-        if state.config.locale.starts_with("zh") {
+        if request_locale(&state).starts_with("zh") {
             "材质已被成功删除"
         } else {
             "The texture was deleted successfully."
@@ -10792,14 +10923,14 @@ async fn toggle_texture_privacy(
                 serde_json::json!({"texture_id": tid, "public": is_public}),
             )
             .await;
-            let privacy = if state.config.locale.starts_with("zh") {
+            let privacy = if request_locale(&state).starts_with("zh") {
                 if is_public { "公开" } else { "私密" }
             } else if is_public {
                 "Public"
             } else {
                 "Private"
             };
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 format!("材质已被设为 {privacy}")
             } else {
                 format!("The texture was set to {privacy} successfully.")
@@ -10807,7 +10938,7 @@ async fn toggle_texture_privacy(
             login_result(0, &message, None)
         }
         Ok(crate::database::TexturePrivacyOutcome::DuplicatePublicTexture(duplicate_tid)) => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
             } else {
                 "The texture is already uploaded by someone else. You can add it to your closet directly."
@@ -10820,7 +10951,7 @@ async fn toggle_texture_privacy(
         }
         Ok(crate::database::TexturePrivacyOutcome::InsufficientScore) => login_result(
             1,
-            if state.config.locale.starts_with("zh") {
+            if request_locale(&state).starts_with("zh") {
                 "积分不足"
             } else {
                 "You don't have enough score to upload this texture."
@@ -10845,10 +10976,10 @@ async fn update_texture_type(
         Err(response) => return response,
     };
     let Some(texture_type) = request.get("type").and_then(serde_json::Value::as_str) else {
-        return texture_type_validation_error(&state.config.locale);
+        return texture_type_validation_error(&request_locale(&state));
     };
     if !valid_texture_type(texture_type) {
-        return texture_type_validation_error(&state.config.locale);
+        return texture_type_validation_error(&request_locale(&state));
     }
     let Some(database) = &state.database else {
         return unavailable();
@@ -10866,7 +10997,7 @@ async fn update_texture_type(
         serde_json::json!({"texture_id": tid, "previous_type": texture.texture_type, "type": texture_type}),
     )
     .await;
-    let message = if state.config.locale.starts_with("zh") {
+    let message = if request_locale(&state).starts_with("zh") {
         format!("材质的适用模型已被修改为 {texture_type}")
     } else {
         format!("The texture's model was changed to {texture_type} successfully.")
@@ -11160,7 +11291,7 @@ async fn apply_admin_user_mutation(
         }
     };
     if target.uid != actor_uid && target.permission >= actor_permission {
-        return admin_user_permission_error(&state.config.locale);
+        return admin_user_permission_error(&request_locale(&state));
     }
 
     match mutation {
@@ -11173,17 +11304,17 @@ async fn apply_admin_user_mutation(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
-                return admin_user_validation_error("email", "required", &state.config.locale);
+                return admin_user_validation_error("email", "required", &request_locale(&state));
             };
             if !valid_email_address(email) {
-                return admin_user_validation_error("email", "email", &state.config.locale);
+                return admin_user_validation_error("email", "email", &request_locale(&state));
             }
             match database
                 .user_email_exists(&state.config.database.table_prefix, email, target_uid)
                 .await
             {
                 Ok(true) => {
-                    return admin_user_validation_error("email", "unique", &state.config.locale);
+                    return admin_user_validation_error("email", "unique", &request_locale(&state));
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -11209,7 +11340,7 @@ async fn apply_admin_user_mutation(
                 serde_json::json!({"user_id": target_uid, "action": "email"}),
             )
             .await;
-            admin_user_success(AdminUserMutation::Email, &state.config.locale, None)
+            admin_user_success(AdminUserMutation::Email, &request_locale(&state), None)
         }
         AdminUserMutation::Verification => {
             if let Err(error) = database
@@ -11229,7 +11360,11 @@ async fn apply_admin_user_mutation(
                 }),
             )
             .await;
-            admin_user_success(AdminUserMutation::Verification, &state.config.locale, None)
+            admin_user_success(
+                AdminUserMutation::Verification,
+                &request_locale(&state),
+                None,
+            )
         }
         AdminUserMutation::Nickname => {
             let request = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -11240,7 +11375,11 @@ async fn apply_admin_user_mutation(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
-                return admin_user_validation_error("nickname", "required", &state.config.locale);
+                return admin_user_validation_error(
+                    "nickname",
+                    "required",
+                    &request_locale(&state),
+                );
             };
             if let Err(error) = database
                 .update_user_text(
@@ -11262,7 +11401,7 @@ async fn apply_admin_user_mutation(
             .await;
             admin_user_success(
                 AdminUserMutation::Nickname,
-                &state.config.locale,
+                &request_locale(&state),
                 Some(nickname),
             )
         }
@@ -11273,10 +11412,14 @@ async fn apply_admin_user_mutation(
                 .and_then(|value| value.get("password"))
                 .and_then(serde_json::Value::as_str)
             else {
-                return admin_user_validation_error("password", "required", &state.config.locale);
+                return admin_user_validation_error(
+                    "password",
+                    "required",
+                    &request_locale(&state),
+                );
             };
             if !(8..=16).contains(&password.chars().count()) {
-                return admin_user_validation_error("password", "length", &state.config.locale);
+                return admin_user_validation_error("password", "length", &request_locale(&state));
             }
             let Some(hash) = hash_legacy_password(
                 password,
@@ -11304,7 +11447,7 @@ async fn apply_admin_user_mutation(
                 serde_json::json!({"user_id": target_uid, "action": "password"}),
             )
             .await;
-            admin_user_success(AdminUserMutation::Password, &state.config.locale, None)
+            admin_user_success(AdminUserMutation::Password, &request_locale(&state), None)
         }
         AdminUserMutation::Score => {
             let request = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -11313,7 +11456,7 @@ async fn apply_admin_user_mutation(
                 .and_then(|value| value.get("score"))
                 .and_then(|value| request_i64(Some(value)))
             else {
-                return admin_user_validation_error("score", "integer", &state.config.locale);
+                return admin_user_validation_error("score", "integer", &request_locale(&state));
             };
             if let Err(error) = database
                 .update_user_integer(
@@ -11337,7 +11480,7 @@ async fn apply_admin_user_mutation(
                 }),
             )
             .await;
-            admin_user_success(AdminUserMutation::Score, &state.config.locale, None)
+            admin_user_success(AdminUserMutation::Score, &request_locale(&state), None)
         }
         AdminUserMutation::Permission => {
             let request = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -11347,10 +11490,10 @@ async fn apply_admin_user_mutation(
                 .and_then(|value| request_i64(Some(value)))
                 .filter(|value| matches!(*value, -1 | 0 | 1))
             else {
-                return admin_user_validation_error("permission", "in", &state.config.locale);
+                return admin_user_validation_error("permission", "in", &request_locale(&state));
             };
             if target_uid == actor_uid || (permission == 1 && actor_permission < 2) {
-                return admin_user_permission_error(&state.config.locale);
+                return admin_user_permission_error(&request_locale(&state));
             }
             if let Err(error) = database
                 .update_user_integer(
@@ -11374,7 +11517,7 @@ async fn apply_admin_user_mutation(
                 }),
             )
             .await;
-            admin_user_success(AdminUserMutation::Permission, &state.config.locale, None)
+            admin_user_success(AdminUserMutation::Permission, &request_locale(&state), None)
         }
         AdminUserMutation::Delete => match database
             .delete_user(&state.config.database.table_prefix, target_uid)
@@ -11387,7 +11530,7 @@ async fn apply_admin_user_mutation(
                     serde_json::json!({"user_id": target_uid}),
                 )
                 .await;
-                admin_user_success(AdminUserMutation::Delete, &state.config.locale, None)
+                admin_user_success(AdminUserMutation::Delete, &request_locale(&state), None)
             }
             Ok(false) => StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
@@ -11547,7 +11690,7 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -11557,7 +11700,7 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
     );
     let page = AdminPlayersPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         current_uid: user.uid,
         current_permission: user.permission,
         frontend_style_available: stylesheet.is_some(),
@@ -11815,7 +11958,7 @@ async fn apply_admin_player_mutation(
         }
     };
     if player.uid != actor_uid && player.owner_permission >= actor_permission {
-        return admin_player_permission_error(&state.config.locale);
+        return admin_player_permission_error(&request_locale(&state));
     }
     match mutation {
         AdminPlayerMutation::Name => {
@@ -11827,7 +11970,7 @@ async fn apply_admin_player_mutation(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
-                return admin_player_validation_error("player_name", &state.config.locale);
+                return admin_player_validation_error("player_name", &request_locale(&state));
             };
             let min_length = database
                 .option(prefix, "player_name_length_min")
@@ -11856,11 +11999,11 @@ async fn apply_admin_player_mutation(
                 .flatten()
                 .unwrap_or_default();
             if !valid_player_name(name, &rule, &custom_rule, min_length, max_length) {
-                return admin_player_validation_error("player_name", &state.config.locale);
+                return admin_player_validation_error("player_name", &request_locale(&state));
             }
             match database.admin_player_name_exists(prefix, name).await {
                 Ok(true) => {
-                    return admin_player_validation_error("player_name", &state.config.locale);
+                    return admin_player_validation_error("player_name", &request_locale(&state));
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -11886,7 +12029,12 @@ async fn apply_admin_player_mutation(
                 }),
             )
             .await;
-            admin_player_success(AdminPlayerMutation::Name, &state.config.locale, name, None)
+            admin_player_success(
+                AdminPlayerMutation::Name,
+                &request_locale(&state),
+                name,
+                None,
+            )
         }
         AdminPlayerMutation::Owner => {
             let request = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -11895,12 +12043,16 @@ async fn apply_admin_player_mutation(
                 .and_then(|value| value.get("uid"))
                 .and_then(|value| request_i64(Some(value)))
             else {
-                return admin_player_validation_error("uid", &state.config.locale);
+                return admin_player_validation_error("uid", &request_locale(&state));
             };
             let owner = match database.user_profile(prefix, uid).await {
                 Ok(Some(owner)) => owner,
                 Ok(None) => {
-                    return login_result(1, admin_user_missing_message(&state.config.locale), None);
+                    return login_result(
+                        1,
+                        admin_user_missing_message(&request_locale(&state)),
+                        None,
+                    );
                 }
                 Err(error) => {
                     tracing::error!(%error, uid, "failed to load new player owner");
@@ -11926,7 +12078,7 @@ async fn apply_admin_player_mutation(
             .await;
             admin_player_success(
                 AdminPlayerMutation::Owner,
-                &state.config.locale,
+                &request_locale(&state),
                 &player.name,
                 Some(&owner.nickname),
             )
@@ -11938,7 +12090,7 @@ async fn apply_admin_player_mutation(
                 .and_then(|value| value.get("tid"))
                 .and_then(|value| request_i64(Some(value)))
             else {
-                return admin_player_validation_error("tid", &state.config.locale);
+                return admin_player_validation_error("tid", &request_locale(&state));
             };
             let Some(texture_type) = request
                 .as_ref()
@@ -11946,13 +12098,13 @@ async fn apply_admin_player_mutation(
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| matches!(*value, "skin" | "cape"))
             else {
-                return admin_player_validation_error("type", &state.config.locale);
+                return admin_player_validation_error("type", &request_locale(&state));
             };
             if tid != 0 {
                 match database.texture_info(prefix, tid).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        let message = admin_texture_missing_message(tid, &state.config.locale);
+                        let message = admin_texture_missing_message(tid, &request_locale(&state));
                         return login_result(1, &message, None);
                     }
                     Err(error) => {
@@ -11986,7 +12138,7 @@ async fn apply_admin_player_mutation(
             .await;
             admin_player_success(
                 AdminPlayerMutation::Texture,
-                &state.config.locale,
+                &request_locale(&state),
                 &player.name,
                 None,
             )
@@ -12005,7 +12157,7 @@ async fn apply_admin_player_mutation(
                 .await;
                 admin_player_success(
                     AdminPlayerMutation::Delete,
-                    &state.config.locale,
+                    &request_locale(&state),
                     &player.name,
                     None,
                 )
@@ -12114,7 +12266,7 @@ async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap)
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -12129,7 +12281,7 @@ async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap)
     );
     let page = AdminUsersPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         current_uid: user.uid,
         current_permission: user.permission,
         frontend_style_available: stylesheet.is_some(),
@@ -12482,7 +12634,7 @@ async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: 
         .as_ref()
         .and_then(|value| value.get("tid"))
         .and_then(|value| request_i64(Some(value)));
-    let chinese = state.config.locale.starts_with("zh");
+    let chinese = request_locale(&state).starts_with("zh");
     let Some(tid) = tid else {
         let message = if remove {
             if chinese {
@@ -12611,7 +12763,7 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -12621,7 +12773,7 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
     );
     let page = AdminReportsPage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: request_locale(&state),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -12784,7 +12936,7 @@ async fn review_report_action(
         .and_then(serde_json::Value::as_str)
         .filter(|action| matches!(*action, "reject" | "ban" | "delete"))
     else {
-        return report_review_validation_error(&state.config.locale);
+        return report_review_validation_error(&request_locale(&state));
     };
     let Some(database) = &state.database else {
         return unavailable();
@@ -12859,7 +13011,7 @@ async fn review_report_action(
             report_review_success(state, 1)
         }
         Ok(crate::database::ReportReviewOutcome::UploaderNotFound) => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "用户不存在"
             } else {
                 "No such user."
@@ -12867,7 +13019,7 @@ async fn review_report_action(
             login_result(1, message, None)
         }
         Ok(crate::database::ReportReviewOutcome::UploaderPermissionDenied) => {
-            let message = if state.config.locale.starts_with("zh") {
+            let message = if request_locale(&state).starts_with("zh") {
                 "你无权操作此用户"
             } else {
                 "You have no permission to operate this user."
@@ -12883,7 +13035,7 @@ async fn review_report_action(
 }
 
 fn report_review_success(state: &AppState, status: i32) -> Response {
-    let message = if state.config.locale.starts_with("zh") {
+    let message = if request_locale(&state).starts_with("zh") {
         "操作成功"
     } else {
         "Operated successfully."
@@ -12978,7 +13130,7 @@ async fn delete_reported_texture(
                 .await;
                 login_result(
                     0,
-                    if state.config.locale.starts_with("zh") {
+                    if request_locale(&state).starts_with("zh") {
                         "请求的材质已被删除"
                     } else {
                         "The requested texture has been deleted."
@@ -13439,7 +13591,7 @@ async fn api_root(State(state): State<AppState>) -> Response {
 }
 
 async fn build_api_root(database: &DatabasePool, state: &AppState) -> Result<ApiRoot, sqlx::Error> {
-    let locale_key = format!("copyright_prefer_{}", state.config.locale);
+    let locale_key = format!("copyright_prefer_{}", request_locale(&state));
     let preference = database
         .option(&state.config.database.table_prefix, &locale_key)
         .await?
@@ -13498,7 +13650,7 @@ async fn player_json(
     };
 
     if profile.permission == -1 {
-        let message = if state.config.locale.starts_with("zh") {
+        let message = if request_locale(&state).starts_with("zh") {
             "该角色拥有者已被本站封禁"
         } else {
             "The owner of this player has been banned."
@@ -14402,6 +14554,20 @@ mod tests {
     };
 
     #[test]
+    fn legacy_locale_aliases_and_accept_language_quality_are_resolved() {
+        assert_eq!(super::normalize_locale("zh-HANS-CN"), Some("zh_CN"));
+        assert_eq!(super::normalize_locale("en_US"), Some("en"));
+        assert_eq!(super::normalize_locale("ru"), Some("ru_RU"));
+        assert_eq!(super::normalize_locale("fr"), None);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "accept-language",
+            axum::http::HeaderValue::from_static("fr-CA;q=1, en-US;q=0.7, ru;q=0.9"),
+        );
+        assert_eq!(super::browser_preferred_locale(&headers), Some("ru_RU"));
+    }
+    #[test]
     fn database_frontend_translations_override_static_lines_with_locale_fallback() {
         let mut translations = serde_json::json!({
             "auth": { "login": "Log In" },
@@ -15276,6 +15442,7 @@ mod tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
             locale: "en".to_owned(),
+            fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
                 connection: crate::config::DatabaseConnection::Sqlite(SqliteConnectOptions::new()),
                 table_prefix: String::new(),
@@ -15968,6 +16135,7 @@ mod tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
             locale: "en".to_owned(),
+            fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
                 connection: crate::config::DatabaseConnection::Sqlite(
                     sqlx::sqlite::SqliteConnectOptions::new(),
@@ -16058,6 +16226,114 @@ mod tests {
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
+        let query_locale_page = app
+            .clone()
+            .oneshot(
+                Request::get("/?lang=zh_TW")
+                    .header("accept-language", "ru")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_locale_page.status(), StatusCode::OK);
+        assert!(
+            query_locale_page
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie.to_str().unwrap().starts_with("locale=zh_TW;"))
+        );
+        let query_locale_html = String::from_utf8(
+            to_bytes(query_locale_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(query_locale_html.contains("<html lang=\"zh_TW\">"));
+
+        let cookie_locale_page = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login")
+                    .header("cookie", "locale=en_US")
+                    .header("accept-language", "ru")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_locale_page.status(), StatusCode::OK);
+        let cookie_locale_html = String::from_utf8(
+            to_bytes(cookie_locale_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(cookie_locale_html.contains("<html lang=\"en\">"));
+
+        let browser_locale_page = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login")
+                    .header("accept-language", "fr-CA;q=1, ru;q=0.9, en;q=0.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_locale_page.status(), StatusCode::OK);
+        let browser_locale_html = String::from_utf8(
+            to_bytes(browser_locale_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(browser_locale_html.contains("<html lang=\"ru_RU\">"));
+
+        let invalid_locale_page = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login?lang=fr")
+                    .header("accept-language", "ru")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_locale_page.status(), StatusCode::OK);
+        assert!(
+            invalid_locale_page
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie.to_str().unwrap().starts_with("locale=en;"))
+        );
+        let invalid_locale_html = String::from_utf8(
+            to_bytes(invalid_locale_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(invalid_locale_html.contains("<html lang=\"en\">"));
+
+        let api_locale_response = app
+            .clone()
+            .oneshot(Request::get("/api?lang=zh_TW").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !api_locale_response
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie.to_str().unwrap().starts_with("locale="))
+        );
+
         let setup_page = app
             .clone()
             .oneshot(Request::get("/setup").body(Body::empty()).unwrap())

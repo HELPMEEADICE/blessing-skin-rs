@@ -355,8 +355,12 @@ pub async fn authorize(
         crate::http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script =
         crate::http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n =
-        crate::http::load_frontend_translations(&state, &app_dir, &state.config.locale).await;
+    let i18n = crate::http::load_frontend_translations(
+        &state,
+        &app_dir,
+        &crate::http::request_locale(&state),
+    )
+    .await;
     let frontend_globals_b64 = crate::http::encode_frontend_globals(
         &state,
         &site_name,
@@ -373,7 +377,7 @@ pub async fn authorize(
     );
     let page = OAuthAuthorizePage {
         site_name,
-        locale: state.config.locale.clone(),
+        locale: crate::http::request_locale(&state),
         client_name: client.name,
         scopes,
         auth_token,
@@ -1941,6 +1945,7 @@ mod integration_tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             version: "test",
             locale: "en".to_owned(),
+            fallback_locale: "en".to_owned(),
             database: DatabaseConfig {
                 connection: DatabaseConnection::Sqlite(sqlx::sqlite::SqliteConnectOptions::new()),
                 table_prefix: String::new(),
