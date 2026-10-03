@@ -1063,6 +1063,49 @@ impl DatabasePool {
         Ok((rows, total))
     }
 
+    pub async fn frontend_language_lines(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let group_column = if matches!(self, Self::MySql(_)) {
+            format!("{}group{}", char::from(96), char::from(96))
+        } else {
+            "\"group\"".to_owned()
+        };
+        let key_column = if matches!(self, Self::MySql(_)) {
+            format!("{}key{}", char::from(96), char::from(96))
+        } else {
+            "\"key\"".to_owned()
+        };
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT {key_column}, text FROM {prefix}language_lines WHERE {group_column} = $1 ORDER BY id"
+            ),
+            _ => format!(
+                "SELECT {key_column}, text FROM {prefix}language_lines WHERE {group_column} = ? ORDER BY id"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .bind("front-end")
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .bind("front-end")
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                    .bind("front-end")
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
     pub async fn language_line_exists(
         &self,
         prefix: &str,
@@ -8458,6 +8501,36 @@ mod language_line_tests {
         );
     }
 
+    #[tokio::test]
+    async fn frontend_language_lines_only_loads_the_front_end_group() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE bs_language_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, \"group\" TEXT NOT NULL, \"key\" TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT, updated_at TEXT, UNIQUE(\"group\", \"key\"))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bs_language_lines (\"group\", \"key\", text) VALUES ('front-end', 'auth.login', '{\"en\":\"Sign in\"}'), ('general', 'login', '{\"en\":\"Log in\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let translations = DatabasePool::Sqlite(pool)
+            .frontend_language_lines("bs_")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            translations,
+            vec![("auth.login".to_owned(), r#"{"en":"Sign in"}"#.to_owned())]
+        );
+    }
     #[tokio::test]
     async fn language_line_crud_preserves_other_locales_and_paginates() {
         let pool = SqlitePoolOptions::new()

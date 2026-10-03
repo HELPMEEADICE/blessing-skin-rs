@@ -355,7 +355,8 @@ pub async fn authorize(
         crate::http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script =
         crate::http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = crate::http::load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n =
+        crate::http::load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = crate::http::encode_frontend_globals(
         &state,
         &site_name,

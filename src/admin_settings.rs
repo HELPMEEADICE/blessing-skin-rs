@@ -403,7 +403,7 @@ async fn render_page(
         http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script =
         http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = http::load_frontend_translations(&app_dir, &locale).await;
+    let i18n = http::load_frontend_translations(&state, &app_dir, &locale).await;
     let route = match section {
         "general" => "admin/options",
         "score" => "admin/score",

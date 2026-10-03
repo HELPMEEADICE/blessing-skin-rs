@@ -573,7 +573,7 @@ async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 =
         encode_frontend_globals(&state, &site_name, "auth/bind", serde_json::json!({}), i18n);
     let page = BindEmailPage {
@@ -712,6 +712,7 @@ pub(crate) async fn frontend_entrypoint(
 }
 
 pub(crate) async fn load_frontend_translations(
+    state: &AppState,
     app_dir: &std::path::Path,
     locale: &str,
 ) -> serde_json::Value {
@@ -721,6 +722,7 @@ pub(crate) async fn load_frontend_translations(
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     };
+    let mut translations = None;
     for candidate in [locale, "en"] {
         if !valid_locale(candidate) {
             continue;
@@ -730,16 +732,87 @@ pub(crate) async fn load_frontend_translations(
             continue;
         };
         match serde_json::from_slice::<serde_json::Value>(&contents) {
-            Ok(value) if value.is_object() => return value,
+            Ok(value) if value.is_object() => {
+                translations = Some(value);
+                break;
+            }
             Ok(_) => tracing::warn!(locale = candidate, "frontend translations are not a map"),
             Err(error) => {
                 tracing::warn!(locale = candidate, %error, "failed to read frontend translations")
             }
         }
     }
-    serde_json::json!({})
+    let mut translations = translations.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(database) = state.database.as_ref() {
+        match database
+            .frontend_language_lines(&state.config.database.table_prefix)
+            .await
+        {
+            Ok(lines) => merge_frontend_language_lines(&mut translations, locale, lines),
+            Err(error) => {
+                tracing::warn!(%error, "failed to load database frontend translations")
+            }
+        }
+    }
+    translations
 }
 
+fn merge_frontend_language_lines(
+    translations: &mut serde_json::Value,
+    locale: &str,
+    lines: Vec<(String, String)>,
+) {
+    for (key, stored) in lines {
+        let Ok(available) = serde_json::from_str::<serde_json::Value>(&stored) else {
+            tracing::warn!("skipping malformed database frontend translation");
+            continue;
+        };
+        let Some(available) = available.as_object() else {
+            tracing::warn!("skipping non-map database frontend translation");
+            continue;
+        };
+        let text = available
+            .get(locale)
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| available.get("en").and_then(serde_json::Value::as_str));
+        if let Some(text) = text {
+            set_frontend_translation(
+                translations,
+                &key,
+                serde_json::Value::String(text.to_owned()),
+            );
+        }
+    }
+}
+
+fn set_frontend_translation(
+    translations: &mut serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let segments = key.split('.').collect::<Vec<_>>();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return;
+    }
+    let mut current = translations;
+    for segment in &segments[..segments.len() - 1] {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        current = current
+            .as_object_mut()
+            .expect("translation parent was made an object")
+            .entry((*segment).to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if !current.is_object() {
+        *current = serde_json::json!({});
+    }
+    current
+        .as_object_mut()
+        .expect("translation parent was made an object")
+        .insert(segments[segments.len() - 1].to_owned(), value);
+}
 pub(crate) fn encode_frontend_globals(
     state: &AppState,
     site_name: &str,
@@ -803,7 +876,7 @@ async fn login_page(
     let frontend_script_available = frontend_script.is_some();
     let stylesheet = stylesheet.unwrap_or_default();
     let frontend_script = frontend_script.unwrap_or_default();
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let failures = query
         .identification
         .as_deref()
@@ -970,7 +1043,7 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1050,7 +1123,7 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1271,7 +1344,7 @@ async fn reset_page(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -1455,7 +1528,7 @@ async fn verify_email_page(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -2758,7 +2831,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
         frontend_entrypoint(&app_dir, "home-css", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
     let home_script = frontend_entrypoint(&app_dir, "home", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3455,7 +3528,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3501,7 +3574,7 @@ async fn web_admin_translations(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3803,7 +3876,7 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -3957,7 +4030,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -4043,7 +4116,7 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let can_upload = user.permission >= 2;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -5353,7 +5426,7 @@ async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) ->
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -5388,7 +5461,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let allow_delete = user.permission < 1;
     let extra = serde_json::json!({
         "profile": {
@@ -5453,7 +5526,7 @@ async fn web_user_reports(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -5787,7 +5860,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -6204,7 +6277,7 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -7869,7 +7942,7 @@ async fn setup_page_assets(
 ) -> SetupPageAssets {
     let app_dir = state.public_dir.join("app");
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(state, "Blessing Skin", route, extra, i18n);
     SetupPageAssets {
         frontend_script_available: frontend_script.is_some(),
@@ -9322,7 +9395,7 @@ async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -9484,7 +9557,7 @@ async fn skinlib_show_page(
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -9624,7 +9697,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -11474,7 +11547,7 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -12041,7 +12114,7 @@ async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap)
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -12538,7 +12611,7 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
     let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let i18n = load_frontend_translations(&state, &app_dir, &state.config.locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
         &site_name,
@@ -14323,10 +14396,35 @@ mod tests {
     use super::{
         AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
         PasswordResetPage, PluginConfigurationPage, RegisterPage, Rgba, RgbaImage, content_etag,
-        parse_legacy_datetime, public_download_ip, render_cape_preview, render_skin_avatar,
-        render_skin_preview, router, safe_remote_component_url, valid_texture_hash,
+        merge_frontend_language_lines, parse_legacy_datetime, public_download_ip,
+        render_cape_preview, render_skin_avatar, render_skin_preview, router,
+        safe_remote_component_url, valid_texture_hash,
     };
 
+    #[test]
+    fn database_frontend_translations_override_static_lines_with_locale_fallback() {
+        let mut translations = serde_json::json!({
+            "auth": { "login": "Log In" },
+            "nav": { "home": "Home" }
+        });
+
+        merge_frontend_language_lines(
+            &mut translations,
+            "fr",
+            vec![
+                (
+                    "nav.home".to_owned(),
+                    r#"{"en":"Home","fr":"Accueil"}"#.to_owned(),
+                ),
+                ("auth.login".to_owned(), r#"{"en":"Sign in"}"#.to_owned()),
+                ("broken".to_owned(), "not-json".to_owned()),
+            ],
+        );
+
+        assert_eq!(translations["nav"]["home"], "Accueil");
+        assert_eq!(translations["auth"]["login"], "Sign in");
+        assert!(translations.get("broken").is_none());
+    }
     async fn submit_test_registration(
         app: &axum::Router,
         cookie: &str,
@@ -16815,6 +16913,29 @@ mod tests {
         .unwrap();
         assert_eq!(list["data"][0]["text"]["en"], "Homepage");
         assert_eq!(list["data"][0]["text"]["fr"], "Accueil");
+
+        let translated_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/i18n", None).await;
+        assert_eq!(translated_page.status(), StatusCode::OK);
+        let translated_html = String::from_utf8(
+            to_bytes(translated_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let encoded_globals = translated_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_globals)
+            .unwrap();
+        let globals: serde_json::Value = serde_json::from_slice(&globals_bytes).unwrap();
+        assert_eq!(globals["i18n"]["nav"]["home"], "Homepage");
 
         let deleted = session_request(
             &app,
