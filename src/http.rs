@@ -329,6 +329,11 @@ struct AdminTranslationsPage {
     site_name: String,
     locale: String,
     added: bool,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -2924,10 +2929,27 @@ async fn web_admin_translations(
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/i18n",
+        serde_json::json!({}),
+        i18n,
+    );
     let page = AdminTranslationsPage {
-        site_name: site_name(&state).await,
+        site_name,
         locale: state.config.locale.clone(),
         added: query.added.unwrap_or_default() == 1,
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -13806,6 +13828,24 @@ mod tests {
         .unwrap();
         assert!(translation_html.contains("Translation entries"));
         assert!(translation_html.contains("action=\"/admin/i18n\""));
+        assert!(translation_html.contains(r#"id="table""#));
+        assert!(translation_html.contains("http://localhost/app/style.012abcd.css"));
+        assert!(translation_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_translation_globals = translation_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let translation_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_translation_globals)
+            .unwrap();
+        let translation_globals: serde_json::Value =
+            serde_json::from_slice(&translation_globals_bytes).unwrap();
+        assert_eq!(translation_globals["route"], "admin/i18n");
+        assert_eq!(translation_globals["extra"], serde_json::json!({}));
+        assert_eq!(translation_globals["i18n"]["auth"]["login"], "Log In");
 
         let create_body = form_urlencoded::Serializer::new(String::new())
             .append_pair("group", "front-end")

@@ -27,6 +27,9 @@
     .pager{display:flex;justify-content:space-between;align-items:center;padding:1rem}
     @media(max-width:780px){main{margin:0;padding:1rem;border-radius:0}.layout{grid-template-columns:1fr}.table-wrap{overflow:auto}}
   </style>
+<meta name="csrf-token" content="">
+{% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
+{% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
 <main id="translation-app" data-locale="{{ locale }}">
@@ -44,6 +47,9 @@
   <div class="layout">
     <section class="panel">
       <h2>{% if locale.starts_with("zh") %}翻译条目{% else %}Translation entries{% endif %}</h2>
+{% if frontend_script_available %}
+      <div id="table"></div>
+{% else %}
       <div class="table-wrap">
         <table>
           <thead><tr>
@@ -60,6 +66,7 @@
         <span id="page-label" class="muted"></span>
         <button id="next" type="button">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</button>
       </div>
+{% endif %}
     </section>
     <section class="panel">
       <h2>{% if locale.starts_with("zh") %}添加新条目{% else %}Add a translation{% endif %}</h2>
@@ -79,6 +86,7 @@
   </div>
   <p id="status" role="status" aria-live="polite"></p>
 </main>
+{% if frontend_script_available %}{% else %}
 <script>
 (() => {
   const root = document.getElementById('translation-app');
@@ -172,5 +180,7 @@
   loadLines();
 })();
 </script>
+{% endif %}
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
 </html>
