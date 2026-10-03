@@ -26,8 +26,7 @@ const WasmPlugins: React.FC = () => {
   const uploadForm = useRef<HTMLFormElement>(null)
 
   const say = useCallback(
-    (english: string, chineseText: string) =>
-      chinese ? chineseText : english,
+    (english: string, chineseText: string) => (chinese ? chineseText : english),
     [chinese],
   )
 
@@ -185,9 +184,7 @@ const WasmPlugins: React.FC = () => {
               role="status"
               aria-live="polite"
             >
-              {isLoading
-                ? say('Loading components…', '正在加载组件…')
-                : status}
+              {isLoading ? say('Loading components…', '正在加载组件…') : status}
             </p>
             {isLoading ? (
               <Loading />
@@ -224,8 +221,8 @@ const WasmPlugins: React.FC = () => {
                           {workingPlugin === plugin.name
                             ? say('Working…', '处理中…')
                             : plugin.enabled
-                              ? say('Disable', '停用')
-                              : say('Enable', '启用')}
+                            ? say('Disable', '停用')
+                            : say('Enable', '启用')}
                         </button>
                         <button
                           className="btn btn-danger btn-sm mb-1"

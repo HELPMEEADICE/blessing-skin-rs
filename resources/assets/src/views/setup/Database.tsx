@@ -34,33 +34,65 @@ const Database: React.FC = () => {
               : 'The database stores Blessing Skin data. Table prefixes may contain only ASCII letters, digits, and underscores. The service tests the connection before saving these settings.'}
           </p>
           {setup.error !== '' && (
-            <p className="error" role="alert">{setup.error}</p>
+            <p className="error" role="alert">
+              {setup.error}
+            </p>
           )}
           <form method="post" action="/setup/database">
             <input type="hidden" name="csrf" value={setup.csrf} />
-            <label htmlFor="type">{chinese ? '数据库类型' : 'Database type'}</label>
+            <label htmlFor="type">
+              {chinese ? '数据库类型' : 'Database type'}
+            </label>
             <select id="type" name="type" defaultValue={setup.driver}>
               <option value="mysql">MySQL / MariaDB</option>
               <option value="pgsql">PostgreSQL</option>
               <option value="sqlite">SQLite</option>
             </select>
             <label htmlFor="host">{chinese ? '服务器地址' : 'Host'}</label>
-            <input id="host" name="host" defaultValue={setup.host} autoComplete="off" />
+            <input
+              id="host"
+              name="host"
+              defaultValue={setup.host}
+              autoComplete="off"
+            />
             <label htmlFor="port">
-              {chinese ? '端口（留空使用默认值）' : 'Port (leave blank for the default)'}
+              {chinese
+                ? '端口（留空使用默认值）'
+                : 'Port (leave blank for the default)'}
             </label>
-            <input id="port" name="port" inputMode="numeric" defaultValue={setup.port} />
+            <input
+              id="port"
+              name="port"
+              inputMode="numeric"
+              defaultValue={setup.port}
+            />
             <label htmlFor="username">{chinese ? '用户名' : 'Username'}</label>
-            <input id="username" name="username" defaultValue={setup.username} autoComplete="username" />
+            <input
+              id="username"
+              name="username"
+              defaultValue={setup.username}
+              autoComplete="username"
+            />
             <label htmlFor="password">{chinese ? '密码' : 'Password'}</label>
-            <input id="password" name="password" type="password" autoComplete="new-password" />
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autoComplete="new-password"
+            />
             <label htmlFor="db">
-              {chinese ? '数据库名称或 SQLite 文件路径' : 'Database name or SQLite file path'}
+              {chinese
+                ? '数据库名称或 SQLite 文件路径'
+                : 'Database name or SQLite file path'}
             </label>
             <input id="db" name="db" required defaultValue={setup.database} />
-            <label htmlFor="prefix">{chinese ? '数据表前缀（可选）' : 'Table prefix (optional)'}</label>
+            <label htmlFor="prefix">
+              {chinese ? '数据表前缀（可选）' : 'Table prefix (optional)'}
+            </label>
             <input id="prefix" name="prefix" defaultValue={setup.prefix} />
-            <button type="submit">{chinese ? '测试并保存' : 'Test and save'}</button>
+            <button type="submit">
+              {chinese ? '测试并保存' : 'Test and save'}
+            </button>
           </form>
         </>
       )}

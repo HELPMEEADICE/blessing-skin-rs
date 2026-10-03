@@ -18,7 +18,10 @@ test('renders the site title and public navigation links', () => {
 
   expect(getByText('Example Skin')).toBeInTheDocument()
   expect(getByText('Skin Server')).toBeInTheDocument()
-  expect(getByText('Log in').closest('a')).toHaveAttribute('href', '/auth/login')
+  expect(getByText('Log in').closest('a')).toHaveAttribute(
+    'href',
+    '/auth/login',
+  )
   expect(getByText('Browse skin library').closest('a')).toHaveAttribute(
     'href',
     '/skinlib',

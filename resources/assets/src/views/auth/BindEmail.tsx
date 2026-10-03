@@ -31,8 +31,8 @@ const BindEmail: React.FC = () => {
         error instanceof Error
           ? error.message
           : chinese
-            ? '无法连接到服务器。'
-            : 'Unable to connect to the server.',
+          ? '无法连接到服务器。'
+          : 'Unable to connect to the server.',
       )
     } finally {
       setIsPending(false)
@@ -50,18 +50,14 @@ const BindEmail: React.FC = () => {
         onChange={setEmail}
       />
       <Alert type="warning">{message}</Alert>
-      <button
-        className="btn btn-primary"
-        type="submit"
-        disabled={isPending}
-      >
+      <button className="btn btn-primary" type="submit" disabled={isPending}>
         {isPending
           ? chinese
             ? '正在绑定…'
             : 'Binding…'
           : chinese
-            ? '绑定并继续'
-            : 'Bind and continue'}
+          ? '绑定并继续'
+          : 'Bind and continue'}
       </button>
     </form>
   )

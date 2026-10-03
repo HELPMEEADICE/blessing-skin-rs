@@ -116,7 +116,9 @@ const Profile: React.FC = () => {
 
   return (
     <>
-      <p>{nickname} · {initial.email}</p>
+      <p>
+        {nickname} · {initial.email}
+      </p>
       <div className="grid">
         <section>
           <h2>{zh ? '修改昵称' : 'Change nickname'}</h2>
@@ -145,7 +147,9 @@ const Profile: React.FC = () => {
           />
           <form id="profile-change-avatar" onSubmit={saveAvatar}>
             <label htmlFor="profile-avatar">
-              {zh ? '材质编号（0 恢复默认头像）' : 'Texture ID (0 resets the avatar)'}
+              {zh
+                ? '材质编号（0 恢复默认头像）'
+                : 'Texture ID (0 resets the avatar)'}
             </label>
             <input
               id="profile-avatar"
@@ -259,7 +263,9 @@ const Profile: React.FC = () => {
             </>
           ) : (
             <p>
-              {zh ? '管理员账户不能删除。' : 'Administrator accounts cannot be deleted.'}
+              {zh
+                ? '管理员账户不能删除。'
+                : 'Administrator accounts cannot be deleted.'}
             </p>
           )}
         </section>

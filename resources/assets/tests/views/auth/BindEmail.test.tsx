@@ -11,9 +11,7 @@ test('submits a new account email and shows validation errors', async () => {
     message: 'This email address is already in use.',
   })
 
-  const { getByPlaceholderText, getByRole, getByText } = render(
-    <BindEmail />,
-  )
+  const { getByPlaceholderText, getByRole, getByText } = render(<BindEmail />)
   fireEvent.change(getByPlaceholderText('Email address'), {
     target: { value: 'taken@example.test' },
   })
@@ -24,7 +22,5 @@ test('submits a new account email and shows validation errors', async () => {
       email: 'taken@example.test',
     }),
   )
-  expect(
-    getByText('This email address is already in use.'),
-  ).toBeInTheDocument()
+  expect(getByText('This email address is already in use.')).toBeInTheDocument()
 })

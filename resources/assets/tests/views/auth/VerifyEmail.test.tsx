@@ -13,19 +13,16 @@ test('posts the email to the signed verification URL', async () => {
     message: 'Email does not match this account.',
   })
 
-  const { getByPlaceholderText, getByRole, getByText } = render(
-    <VerifyEmail />,
-  )
+  const { getByPlaceholderText, getByRole, getByText } = render(<VerifyEmail />)
   fireEvent.change(getByPlaceholderText('Email address'), {
     target: { value: 'wrong@example.test' },
   })
   fireEvent.click(getByRole('button', { name: 'Verify email' }))
 
   await waitFor(() =>
-    expect(fetch.post).toBeCalledWith(
-      '/auth/verify/7?signature=abc',
-      { email: 'wrong@example.test' },
-    ),
+    expect(fetch.post).toBeCalledWith('/auth/verify/7?signature=abc', {
+      email: 'wrong@example.test',
+    }),
   )
   expect(getByText('Email does not match this account.')).toBeInTheDocument()
 })

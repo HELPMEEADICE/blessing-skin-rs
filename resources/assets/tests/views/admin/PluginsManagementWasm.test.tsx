@@ -27,7 +27,8 @@ test('renders and manages Rust WASM components', async () => {
   ])
   fetch.post.mockResolvedValue({
     code: 0,
-    message: 'Plugin file updated. Restart the service for the change to take effect.',
+    message:
+      'Plugin file updated. Restart the service for the change to take effect.',
   })
 
   const { getByRole, getByText } = render(<PluginsManagement />)
@@ -55,9 +56,7 @@ test('uploads one WASM component for super administrators', async () => {
     message: 'WASM component installed. Restart the service to load it.',
   })
 
-  const { getByLabelText, getByRole, getByText } = render(
-    <PluginsManagement />,
-  )
+  const { getByLabelText, getByRole, getByText } = render(<PluginsManagement />)
   const componentFile = new File(['component'], 'sample.wasm', {
     type: 'application/wasm',
   })

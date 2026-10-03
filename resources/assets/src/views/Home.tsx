@@ -14,8 +14,7 @@ const Home: React.FC = () => {
     <>
       <h1>{blessing.site_name}</h1>
       <p>{title}</p>
-      <a href="/auth/login">{login}</a>{' '}
-      <a href="/skinlib">{browse_skinlib}</a>
+      <a href="/auth/login">{login}</a> <a href="/skinlib">{browse_skinlib}</a>
     </>
   )
 }

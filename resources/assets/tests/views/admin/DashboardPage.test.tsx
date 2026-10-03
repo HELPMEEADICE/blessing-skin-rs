@@ -15,7 +15,10 @@ beforeEach(() => {
   fetch.get.mockResolvedValue({
     labels: ['User Registration', 'Texture Uploads'],
     xAxis: ['2026-10-01', '2026-10-02'],
-    data: [[1, 2], [0, 1]],
+    data: [
+      [1, 2],
+      [0, 1],
+    ],
   })
 })
 

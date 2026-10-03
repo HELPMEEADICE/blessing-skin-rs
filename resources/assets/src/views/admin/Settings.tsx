@@ -58,8 +58,8 @@ const Settings: React.FC = () => {
         error instanceof Error
           ? error.message
           : zh
-            ? '无法连接到服务器。'
-            : 'Unable to connect to the server.',
+          ? '无法连接到服务器。'
+          : 'Unable to connect to the server.',
       )
     } finally {
       setIsSaving(false)
@@ -146,8 +146,8 @@ const Settings: React.FC = () => {
                 ? '正在保存…'
                 : 'Saving…'
               : zh
-                ? '保存设置'
-                : 'Save settings'}
+              ? '保存设置'
+              : 'Save settings'}
           </button>{' '}
           <span role="status">{status}</span>
         </p>

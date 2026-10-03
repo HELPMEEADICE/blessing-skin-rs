@@ -13,7 +13,8 @@ type AdminStatusData = {
 
 const SystemStatus: React.FC = () => {
   const chinese = blessing.locale.startsWith('zh')
-  const { groups, wasm_plugins } = blessing.extra.admin_status as AdminStatusData
+  const { groups, wasm_plugins } = blessing.extra
+    .admin_status as AdminStatusData
 
   return (
     <>
@@ -45,7 +46,11 @@ const SystemStatus: React.FC = () => {
             : `Loaded WASM plugins (${wasm_plugins.length})`}
         </h2>
         {wasm_plugins.length === 0 ? (
-          <p>{chinese ? '当前没有已加载的 WASM 插件。' : 'No WASM plugins loaded.'}</p>
+          <p>
+            {chinese
+              ? '当前没有已加载的 WASM 插件。'
+              : 'No WASM plugins loaded.'}
+          </p>
         ) : (
           <table>
             <tbody>

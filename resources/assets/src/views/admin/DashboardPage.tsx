@@ -77,7 +77,9 @@ const DashboardPage: React.FC = () => {
           !Array.isArray(result.xAxis) ||
           !Array.isArray(result.data)
         ) {
-          throw new Error(zh ? '无法加载活动图表。' : 'Unable to load activity charts.')
+          throw new Error(
+            zh ? '无法加载活动图表。' : 'Unable to load activity charts.',
+          )
         }
         setChartData(result)
       })
@@ -87,8 +89,8 @@ const DashboardPage: React.FC = () => {
             error instanceof Error
               ? error.message
               : zh
-                ? '无法加载活动图表。'
-                : 'Unable to load activity charts.',
+              ? '无法加载活动图表。'
+              : 'Unable to load activity charts.',
           )
         }
       })
@@ -216,20 +218,17 @@ const DashboardPage: React.FC = () => {
             onChange={(event) => setContent(event.target.value)}
           />
           <button type="submit" disabled={isSending}>
-            {isSending
-              ? zh
-                ? '正在发送…'
-                : 'Sending…'
-              : zh
-                ? '发送'
-                : 'Send'}
+            {isSending ? (zh ? '正在发送…' : 'Sending…') : zh ? '发送' : 'Send'}
           </button>
           <p id="notification-status" role="status">
             {notice}
           </p>
         </form>
       </section>
-      <section className="stats" aria-label={zh ? '站点统计' : 'Site statistics'}>
+      <section
+        className="stats"
+        aria-label={zh ? '站点统计' : 'Site statistics'}
+      >
         <article className="stat">
           <h2>{zh ? '用户' : 'Users'}</h2>
           <p>{stats.users}</p>
@@ -259,7 +258,9 @@ const DashboardPage: React.FC = () => {
             <Chart data={chartData} index={1} color="#6f42c1" />
           </>
         ) : (
-          <div className="chart"><Loading /></div>
+          <div className="chart">
+            <Loading />
+          </div>
         )}
       </section>
     </main>

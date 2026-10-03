@@ -31,8 +31,8 @@ const VerifyEmail: React.FC = () => {
         error instanceof Error
           ? error.message
           : chinese
-            ? '无法连接到服务器。'
-            : 'Unable to connect to the server.',
+          ? '无法连接到服务器。'
+          : 'Unable to connect to the server.',
       )
     } finally {
       setIsPending(false)
@@ -50,18 +50,14 @@ const VerifyEmail: React.FC = () => {
         onChange={setEmail}
       />
       <Alert type="warning">{message}</Alert>
-      <button
-        className="btn btn-primary"
-        type="submit"
-        disabled={isPending}
-      >
+      <button className="btn btn-primary" type="submit" disabled={isPending}>
         {isPending
           ? chinese
             ? '正在验证…'
             : 'Verifying…'
           : chinese
-            ? '验证邮箱'
-            : 'Verify email'}
+          ? '验证邮箱'
+          : 'Verify email'}
       </button>
     </form>
   )

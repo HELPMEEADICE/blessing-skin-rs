@@ -20,11 +20,15 @@ const Info: React.FC = () => {
           : 'This account will be the first super administrator. Installation creates legacy-compatible database tables and Passport keys.'}
       </p>
       {setup.error !== '' && (
-        <p className="error" role="alert">{setup.error}</p>
+        <p className="error" role="alert">
+          {setup.error}
+        </p>
       )}
       <form method="post" action="/setup/finish">
         <input type="hidden" name="csrf" value={setup.csrf} />
-        <label htmlFor="email">{chinese ? '管理员邮箱' : 'Administrator email'}</label>
+        <label htmlFor="email">
+          {chinese ? '管理员邮箱' : 'Administrator email'}
+        </label>
         <input
           id="email"
           name="email"

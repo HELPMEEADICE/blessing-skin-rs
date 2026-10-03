@@ -28,7 +28,9 @@ const OAuthAuthorize: React.FC = () => {
           </>
         )}
       </p>
-      <p>{chinese ? '批准后，此应用可以：' : 'If you approve, this app can:'}</p>
+      <p>
+        {chinese ? '批准后，此应用可以：' : 'If you approve, this app can:'}
+      </p>
       <ul className="scopes">
         {scopes.map((scope) => (
           <li key={scope}>{scope}</li>

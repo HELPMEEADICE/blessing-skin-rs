@@ -35,7 +35,9 @@ const Reports: React.FC = () => {
       })
       .catch((reason: unknown) => {
         if (!active) return
-        setError(reason instanceof Error ? reason.message : t('general.fatalError'))
+        setError(
+          reason instanceof Error ? reason.message : t('general.fatalError'),
+        )
       })
       .finally(() => {
         if (active) setIsLoading(false)
@@ -58,9 +60,15 @@ const Reports: React.FC = () => {
 
   return (
     <div className="card">
-      {error && <div className="card-body text-danger" role="alert">{error}</div>}
+      {error && (
+        <div className="card-body text-danger" role="alert">
+          {error}
+        </div>
+      )}
       {isLoading ? (
-        <div className="card-body"><Loading /></div>
+        <div className="card-body">
+          <Loading />
+        </div>
       ) : (
         <div className="card-body p-0 table-responsive">
           <table className="table table-striped">
@@ -74,14 +82,25 @@ const Reports: React.FC = () => {
             </thead>
             <tbody>
               {reports.length === 0 ? (
-                <tr><td className="text-center" colSpan={4}>{t('general.noResult')}</td></tr>
+                <tr>
+                  <td className="text-center" colSpan={4}>
+                    {t('general.noResult')}
+                  </td>
+                </tr>
               ) : (
                 reports.map((report) => (
                   <tr key={report.id}>
                     <td>
                       {report.tid}{' '}
-                      <a href={`${blessing.base_url}/skinlib/show/${report.tid}`} target="_blank" rel="noreferrer">
-                        <i className="fas fa-share" aria-label={t('user.viewInSkinlib')} />
+                      <a
+                        href={`${blessing.base_url}/skinlib/show/${report.tid}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <i
+                          className="fas fa-share"
+                          aria-label={t('user.viewInSkinlib')}
+                        />
                       </a>
                     </td>
                     <td>{report.reason}</td>
