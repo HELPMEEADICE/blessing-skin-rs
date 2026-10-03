@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
+    net::IpAddr,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -193,6 +194,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/plugins/upload",
             post(web_admin_plugins_upload).layer(DefaultBodyLimit::max(34 * 1024 * 1024)),
+        )
+        .route(
+            "/admin/plugins/wget",
+            post(web_admin_plugins_wget).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/admin/notifications/send", post(web_send_notification))
         .route("/admin/users", get(web_admin_users_page))
@@ -2777,6 +2782,11 @@ struct AdminPluginManageRequest {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct AdminPluginWgetRequest {
+    url: String,
+}
+
 #[derive(Template)]
 #[template(path = "admin_users.html")]
 struct AdminUsersPage {
@@ -4124,16 +4134,87 @@ async fn web_admin_plugins_upload(
             )
                 .into_response();
         }
-        upload = Some((filename, bytes));
+        upload = Some((filename, bytes.to_vec()));
     }
     let Some((filename, bytes)) = upload else {
         return admin_plugin_result(1, "Choose a .wasm component file.");
     };
+    store_wasm_component(&state, filename, bytes).await
+}
+
+async fn web_admin_plugins_wget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 2 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if body.len() > 8 * 1024 {
+        return admin_plugin_result(1, "The component URL is too long.");
+    }
+    let request = match serde_json::from_slice::<AdminPluginWgetRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return admin_plugin_result(1, "Invalid component download request."),
+    };
+    if request.url.len() > 8 * 1024 {
+        return admin_plugin_result(1, "The component URL is too long.");
+    }
+    let (filename, bytes) = match fetch_remote_wasm_component(&request.url).await {
+        Ok(component) => component,
+        Err(error) => {
+            tracing::warn!(error = ?error, "remote WASM component download failed");
+            return match error {
+                RemoteComponentError::InvalidUrl => admin_plugin_result(
+                    1,
+                    "Only public HTTPS URLs to .wasm component files are supported.",
+                ),
+                RemoteComponentError::UnsafeAddress => admin_plugin_result(
+                    1,
+                    "The component URL must resolve only to public IP addresses.",
+                ),
+                RemoteComponentError::InvalidFilename => admin_plugin_result(
+                    1,
+                    "The remote URL must end in a valid .wasm component filename.",
+                ),
+                RemoteComponentError::TooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({
+                        "code": 1,
+                        "message": "WASM components must be 32 MiB or smaller."
+                    })),
+                )
+                    .into_response(),
+                RemoteComponentError::HttpStatus(status) => {
+                    admin_plugin_result(1, &format!("The component server returned HTTP {status}."))
+                }
+                _ => admin_plugin_result(1, "Could not download the WASM component."),
+            };
+        }
+    };
+    store_wasm_component(&state, filename, bytes).await
+}
+
+async fn store_wasm_component(state: &AppState, filename: String, bytes: Vec<u8>) -> Response {
     let Some(name) = filename.strip_suffix(".wasm") else {
         return admin_plugin_result(1, "Only .wasm component files are supported.");
     };
     if !crate::plugin_runtime::valid_plugin_name(name) {
         return admin_plugin_result(1, "The uploaded filename is not valid.");
+    }
+    if bytes.len() as u64 > crate::plugin_runtime::COMPONENT_FILE_LIMIT {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": "WASM components must be 32 MiB or smaller."
+            })),
+        )
+            .into_response();
     }
     if let Err(error) = crate::plugin_runtime::PluginRuntime::validate_component_bytes(&bytes) {
         tracing::warn!(%error, plugin = %filename, "rejected invalid WASM plugin component");
@@ -4207,6 +4288,171 @@ async fn web_admin_plugins_upload(
     }
 }
 
+#[derive(Debug)]
+enum RemoteComponentError {
+    InvalidUrl,
+    UnsafeAddress,
+    Dns,
+    Request,
+    TooManyRedirects,
+    InvalidRedirect,
+    HttpStatus(u16),
+    TooLarge,
+    InvalidFilename,
+}
+
+fn safe_remote_component_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.contains('.')
+        && !host.ends_with(".localhost")
+        && host != "localhost"
+        && !host.ends_with(".local")
+        && !host.ends_with(".internal")
+        && !host.ends_with(".test")
+        && !host.ends_with(".invalid")
+        && !host.ends_with(".example")
+}
+
+fn public_download_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            !(address.is_unspecified()
+                || address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return public_download_ip(IpAddr::V4(mapped));
+            }
+            let segments = address.segments();
+            (segments[0] & 0xe000) == 0x2000
+                && !address.is_loopback()
+                && !address.is_unspecified()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+                && !address.is_multicast()
+                && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && segments[0] != 0x2002
+        }
+    }
+}
+
+async fn fetch_remote_wasm_component(
+    raw_url: &str,
+) -> Result<(String, Vec<u8>), RemoteComponentError> {
+    let mut url = reqwest::Url::parse(raw_url).map_err(|_| RemoteComponentError::InvalidUrl)?;
+    for redirect_count in 0..=5 {
+        if !safe_remote_component_url(&url) {
+            return Err(RemoteComponentError::InvalidUrl);
+        }
+        let host = url.host_str().ok_or(RemoteComponentError::InvalidUrl)?;
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host((host, 443)),
+        )
+        .await
+        .map_err(|_| RemoteComponentError::Dns)?
+        .map_err(|_| RemoteComponentError::Dns)?
+        .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(RemoteComponentError::Dns);
+        }
+        if addresses
+            .iter()
+            .any(|address| !public_download_ip(address.ip()))
+        {
+            return Err(RemoteComponentError::UnsafeAddress);
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| RemoteComponentError::Request)?;
+        let mut response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|_| RemoteComponentError::Request)?;
+        if response.status().is_redirection() {
+            if redirect_count == 5 {
+                return Err(RemoteComponentError::TooManyRedirects);
+            }
+            let location = response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .ok_or(RemoteComponentError::InvalidRedirect)?;
+            url = url
+                .join(location)
+                .map_err(|_| RemoteComponentError::InvalidRedirect)?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(RemoteComponentError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > crate::plugin_runtime::COMPONENT_FILE_LIMIT)
+        {
+            return Err(RemoteComponentError::TooLarge);
+        }
+        let filename = url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|filename| !filename.is_empty())
+            .ok_or(RemoteComponentError::InvalidFilename)?;
+        let Some(name) = filename.strip_suffix(".wasm") else {
+            return Err(RemoteComponentError::InvalidFilename);
+        };
+        if !crate::plugin_runtime::valid_plugin_name(name) {
+            return Err(RemoteComponentError::InvalidFilename);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| RemoteComponentError::Request)?
+        {
+            if bytes.len().saturating_add(chunk.len())
+                > crate::plugin_runtime::COMPONENT_FILE_LIMIT as usize
+            {
+                return Err(RemoteComponentError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return Ok((filename.to_owned(), bytes));
+    }
+    Err(RemoteComponentError::TooManyRedirects)
+}
 fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, std::io::Error> {
     let mut plugins = std::collections::BTreeMap::<String, (bool, bool)>::new();
     for filename in &state.wasm_plugins {
@@ -13437,8 +13683,8 @@ mod tests {
     use super::{
         AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
         PasswordResetPage, PluginConfigurationPage, RegisterPage, Rgba, RgbaImage, content_etag,
-        parse_legacy_datetime, render_cape_preview, render_skin_avatar, render_skin_preview,
-        router, valid_texture_hash,
+        parse_legacy_datetime, public_download_ip, render_cape_preview, render_skin_avatar,
+        render_skin_preview, router, safe_remote_component_url, valid_texture_hash,
     };
 
     async fn submit_test_registration(
@@ -13540,6 +13786,55 @@ mod tests {
         (cookie, answer)
     }
 
+    #[test]
+    fn remote_wasm_download_requires_public_https_urls() {
+        for raw in [
+            "http://example.com/plugin.wasm",
+            "https://localhost/plugin.wasm",
+            "https://plugin.local/plugin.wasm",
+            "https://127.0.0.1/plugin.wasm",
+            "https://example.com:8443/plugin.wasm",
+            "https://user@example.com/plugin.wasm",
+            "https://example.com/plugin.wasm#fragment",
+        ] {
+            assert!(
+                !safe_remote_component_url(&reqwest::Url::parse(raw).unwrap()),
+                "accepted unsafe component URL: {raw}"
+            );
+        }
+        assert!(safe_remote_component_url(
+            &reqwest::Url::parse("https://example.com/releases/plugin.wasm").unwrap()
+        ));
+    }
+
+    #[test]
+    fn remote_wasm_download_blocks_non_public_addresses() {
+        for raw in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "192.0.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "2002::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                !public_download_ip(raw.parse().unwrap()),
+                "accepted non-public address: {raw}"
+            );
+        }
+        assert!(public_download_ip("1.1.1.1".parse().unwrap()));
+        assert!(public_download_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
     #[test]
     fn plugin_configuration_page_preserves_app_subpaths_and_escapes_values() {
         let page = PluginConfigurationPage {
@@ -13843,6 +14138,8 @@ mod tests {
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
+        assert!(html.contains("id=\"download-form\""));
+        assert!(html.contains("/admin/plugins/wget"));
         assert!(!html.contains("window.blessing=JSON.parse"));
     }
 
@@ -15548,6 +15845,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied_plugin_upload.status(), StatusCode::FORBIDDEN);
+        let denied_plugin_wget = session_request(
+            &app,
+            &admin_cookie,
+            "POST",
+            "/admin/plugins/wget",
+            Some(r#"{"url":"https://example.com/component.wasm"}"#),
+        )
+        .await;
+        assert_eq!(denied_plugin_wget.status(), StatusCode::FORBIDDEN);
         sqlx::query("UPDATE users SET permission = 2 WHERE uid = 7")
             .execute(&pool)
             .await
@@ -15581,6 +15887,28 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("valid Blessing Skin WASM component")
+        );
+        let rejected_plugin_wget = session_request(
+            &app,
+            &admin_cookie,
+            "POST",
+            "/admin/plugins/wget",
+            Some(r#"{"url":"http://127.0.0.1/component.wasm"}"#),
+        )
+        .await;
+        assert_eq!(rejected_plugin_wget.status(), StatusCode::OK);
+        let rejected_plugin_wget: serde_json::Value = serde_json::from_slice(
+            &to_bytes(rejected_plugin_wget.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rejected_plugin_wget["code"], 1);
+        assert!(
+            rejected_plugin_wget["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTPS")
         );
         sqlx::query("UPDATE users SET permission = 1 WHERE uid = 7")
             .execute(&pool)

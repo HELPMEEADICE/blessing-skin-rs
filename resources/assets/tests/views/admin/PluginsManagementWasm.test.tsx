@@ -81,6 +81,33 @@ test('links migrated component documentation and configuration under app base UR
   )
 })
 
+test('downloads a WASM component from a remote URL for super administrators', async () => {
+  blessing.extra = { wasm_plugins: true, can_upload: true }
+  fetch.get.mockResolvedValue([])
+  fetch.post.mockResolvedValue({
+    code: 0,
+    message: 'WASM component installed. Restart the service to load it.',
+  })
+
+  const { getByLabelText, getByRole, findByText } = render(
+    <PluginsManagement />,
+  )
+  fireEvent.change(getByLabelText('Component URL'), {
+    target: { value: 'https://example.com/sample.wasm' },
+  })
+  fireEvent.click(getByRole('button', { name: 'Download component' }))
+
+  await waitFor(() =>
+    expect(fetch.post).toBeCalledWith('/admin/plugins/wget', {
+      url: 'https://example.com/sample.wasm',
+    }),
+  )
+  expect(
+    await findByText(
+      'WASM component installed. Restart the service to load it.',
+    ),
+  ).toBeInTheDocument()
+})
 test('uploads one WASM component for super administrators', async () => {
   blessing.extra = { wasm_plugins: true, can_upload: true }
   fetch.get.mockResolvedValue([])

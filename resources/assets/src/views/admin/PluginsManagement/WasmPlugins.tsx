@@ -22,6 +22,8 @@ const WasmPlugins: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true)
   const [file, setFile] = useState<File | null>(null)
   const [isUploading, setIsUploading] = useState(false)
+  const [remoteUrl, setRemoteUrl] = useState('')
+  const [isDownloading, setIsDownloading] = useState(false)
   const [workingPlugin, setWorkingPlugin] = useState<string | null>(null)
   const [status, setStatus] = useState('')
   const [hasError, setHasError] = useState(false)
@@ -142,6 +144,39 @@ const WasmPlugins: React.FC = () => {
     }
   }
 
+  const downloadComponent = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!remoteUrl) {
+      return
+    }
+
+    setIsDownloading(true)
+    setStatus('')
+    setHasError(false)
+    try {
+      const result = await fetch.post<fetch.ResponseBody>(
+        '/admin/plugins/wget',
+        { url: remoteUrl },
+      )
+      if (result.code !== 0) {
+        setHasError(true)
+        setStatus(result.message)
+        return
+      }
+      setRemoteUrl('')
+      await reloadPlugins()
+      setStatus(result.message)
+    } catch (error) {
+      setHasError(true)
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : say('Could not download the component.', '无法下载组件。'),
+      )
+    } finally {
+      setIsDownloading(false)
+    }
+  }
   return (
     <div className="row">
       <div className={canUpload ? 'col-lg-8' : 'col-12'}>
@@ -280,8 +315,8 @@ const WasmPlugins: React.FC = () => {
                 <div className="card-body">
                   <p>
                     {say(
-                      'Upload one valid component file up to 32 MiB. ZIP archives, PHP files, and remote URL downloads are not supported.',
-                      '只接受单个有效组件文件，最大 32 MiB。不支持 ZIP、PHP 文件或远程 URL 下载。',
+                      'Upload one valid component file up to 32 MiB. ZIP archives and PHP files are not supported.',
+                      '只接受单个有效组件文件，最大 32 MiB。不支持 ZIP 或 PHP 文件。',
                     )}
                   </p>
                   <label htmlFor="wasm-plugin-file">
@@ -307,6 +342,47 @@ const WasmPlugins: React.FC = () => {
                     {isUploading
                       ? say('Uploading…', '正在上传…')
                       : say('Upload component', '上传组件')}
+                  </button>
+                </div>
+              </form>
+            </div>
+            <div className="card card-primary card-outline">
+              <div className="card-header">
+                <h3 className="card-title">
+                  {say('Install from a component URL', '从组件 URL 安装')}
+                </h3>
+              </div>
+              <form onSubmit={downloadComponent}>
+                <div className="card-body">
+                  <p>
+                    {say(
+                      'Use a public HTTPS URL ending in .wasm. Redirects are rechecked, private network addresses are blocked, and downloads are limited to 32 MiB.',
+                      '使用以 .wasm 结尾的公网 HTTPS 地址。每次跳转都会重新检查目标，私有网络地址会被拒绝，下载上限为 32 MiB。',
+                    )}
+                  </p>
+                  <label htmlFor="wasm-plugin-url">
+                    {say('Component URL', '组件 URL')}
+                  </label>
+                  <input
+                    className="form-control"
+                    id="wasm-plugin-url"
+                    type="url"
+                    value={remoteUrl}
+                    required
+                    onChange={(event) =>
+                      setRemoteUrl(event.currentTarget.value)
+                    }
+                  />
+                </div>
+                <div className="card-footer clearfix">
+                  <button
+                    className="btn btn-primary float-right"
+                    type="submit"
+                    disabled={!remoteUrl || isDownloading}
+                  >
+                    {isDownloading
+                      ? say('Downloading…', '正在下载…')
+                      : say('Download component', '下载组件')}
                   </button>
                 </div>
               </form>
