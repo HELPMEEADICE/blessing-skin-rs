@@ -147,6 +147,9 @@ const DashboardPage: React.FC = () => {
         <a href={`${blessing.base_url}/admin/plugins/manage`}>
           {zh ? '插件' : 'Plugins'}
         </a>
+        <a href={`${blessing.base_url}/admin/update`}>
+          {zh ? '版本更新' : 'Updates'}
+        </a>
       </nav>
       <section className="notice">
         <h2>{zh ? '发送站内通知' : 'Send a site notification'}</h2>

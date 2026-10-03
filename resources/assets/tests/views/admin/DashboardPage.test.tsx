@@ -22,6 +22,15 @@ beforeEach(() => {
   })
 })
 
+test('links administrators to standalone Rust releases', () => {
+  const { getByRole } = render(<DashboardPage />)
+
+  expect(getByRole('link', { name: 'Updates' })).toHaveAttribute(
+    'href',
+    '/admin/update',
+  )
+})
+
 test('sends a notification to the selected user', async () => {
   fetch.post.mockResolvedValue({ code: 0, message: 'Notification sent' })
   const { getByLabelText, getByRole, getByText } = render(<DashboardPage />)

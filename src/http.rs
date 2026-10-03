@@ -178,6 +178,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin", get(web_admin_dashboard))
         .route("/admin/chart", get(web_admin_chart))
         .route("/admin/status", get(web_admin_status))
+        .route("/admin/update", get(web_admin_update))
+        .route("/admin/update/download", post(web_admin_update_download))
         .route("/admin/plugins/data", get(web_admin_plugins_data))
         .route(
             "/admin/plugins/manage",
@@ -2645,6 +2647,15 @@ struct AdminStatusPage {
 }
 
 #[derive(Template)]
+#[template(path = "admin_update.html")]
+struct AdminUpdatePage {
+    site_name: String,
+    locale: String,
+    version: String,
+    releases_url: String,
+}
+
+#[derive(Template)]
 #[template(path = "admin_plugins.html")]
 struct AdminPluginsPage {
     site_name: String,
@@ -3708,6 +3719,47 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let page = AdminUpdatePage {
+        site_name: site_name(&state).await,
+        locale: state.config.locale.clone(),
+        version: state.config.version.to_owned(),
+        releases_url: "https://github.com/HELPMEEADICE/blessing-skin-rs/releases".to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator release page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_update_download(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let message = if state.config.locale.starts_with("zh") {
+        "Rust 服务以独立程序发行。请下载对应平台的软件包，并按更新说明停止服务、替换程序后重新启动。"
+    } else {
+        "The Rust service is distributed as a standalone program. Download the package for your platform, then follow the update instructions to stop the service, replace the program, and restart it."
+    };
+    Json(serde_json::json!({ "code": 1, "message": message })).into_response()
 }
 
 async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -15302,6 +15354,39 @@ mod tests {
         let denied_users_page =
             session_request(&app, &registered_cookie, "GET", "/admin/users", None).await;
         assert_eq!(denied_users_page.status(), StatusCode::FORBIDDEN);
+        let denied_update_page =
+            session_request(&app, &registered_cookie, "GET", "/admin/update", None).await;
+        assert_eq!(denied_update_page.status(), StatusCode::FORBIDDEN);
+
+        let update_page = session_request(&app, &admin_cookie, "GET", "/admin/update", None).await;
+        assert_eq!(update_page.status(), StatusCode::OK);
+        let update_html = String::from_utf8(
+            to_bytes(update_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(update_html.contains("Rust service releases"));
+        assert!(update_html.contains("Current version"));
+        assert!(update_html.contains("https://github.com/HELPMEEADICE/blessing-skin-rs/releases"));
+        assert!(update_html.contains("storage"));
+        let update_download =
+            session_request(&app, &admin_cookie, "POST", "/admin/update/download", None).await;
+        assert_eq!(update_download.status(), StatusCode::OK);
+        let update_download: serde_json::Value = serde_json::from_slice(
+            &to_bytes(update_download.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update_download["code"], 1);
+        assert!(
+            update_download["message"]
+                .as_str()
+                .unwrap()
+                .contains("standalone")
+        );
 
         let users_page = session_request(&app, &admin_cookie, "GET", "/admin/users", None).await;
         assert_eq!(users_page.status(), StatusCode::OK);
