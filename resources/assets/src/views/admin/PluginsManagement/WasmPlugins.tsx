@@ -11,6 +11,8 @@ type WasmPlugin = {
   enabled: boolean
   loaded: boolean
   on_disk: boolean
+  readme: boolean
+  config: boolean
 }
 
 const WasmPlugins: React.FC = () => {
@@ -175,8 +177,8 @@ const WasmPlugins: React.FC = () => {
           <div className="card-body">
             <p>
               {say(
-                'Components implementing lifecycle API 1.0.0 run in a sandbox without filesystem, network, database, or WASI access. Changes require a service restart.',
-                '服务只加载通过 lifecycle API 1.0.0 校验的组件。组件在无文件、网络、数据库和 WASI 权限的沙箱中运行；状态变更需重启服务。',
+                'Components implementing lifecycle interface 1.0.0 run in a sandbox without filesystem, network, database, or WASI access. Optional exports add events, documentation, and JSON configuration. Restart the service after changing component files.',
+                '服务只加载通过 lifecycle interface 1.0.0 校验的组件。组件在无文件、网络、数据库和 WASI 权限的沙箱中运行；可选接口提供事件、说明和 JSON 配置。替换组件文件后需重启服务。',
               )}
             </p>
             <p
@@ -205,6 +207,22 @@ const WasmPlugins: React.FC = () => {
                     </span>
                   </div>
                   <div className="d-flex flex-wrap">
+                    {plugin.readme && (
+                      <a
+                        className="btn btn-default btn-sm mr-2 mb-1"
+                        href={`${blessing.base_url}/admin/plugins/readme/${encodeURIComponent(plugin.name)}`}
+                      >
+                        {say('Readme', '说明')}
+                      </a>
+                    )}
+                    {plugin.enabled && plugin.config && (
+                      <a
+                        className="btn btn-default btn-sm mr-2 mb-1"
+                        href={`${blessing.base_url}/admin/plugins/config/${encodeURIComponent(plugin.name)}`}
+                      >
+                        {say('Configure', '配置')}
+                      </a>
+                    )}
                     {plugin.on_disk && (
                       <>
                         <button
