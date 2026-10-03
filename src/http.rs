@@ -2593,6 +2593,9 @@ struct AdminPluginsPage {
 struct SetupWelcomePage {
     locale: String,
     version: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
 }
 
 #[derive(Template)]
@@ -5917,10 +5920,24 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
             None,
         );
     }
+    let version = state.config.version.to_owned();
+    let app_dir = state.public_dir.join("app");
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let i18n = load_frontend_translations(&app_dir, &state.config.locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        "Blessing Skin",
+        "setup",
+        serde_json::json!({ "setup_welcome": { "version": &version } }),
+        i18n,
+    );
     render_setup_page(
         &SetupWelcomePage {
             locale: state.config.locale.clone(),
-            version: state.config.version.to_owned(),
+            version,
+            frontend_script_available: frontend_script.is_some(),
+            frontend_script: frontend_script.unwrap_or_default(),
+            frontend_globals_b64,
         },
         &headers,
         None,
@@ -13152,6 +13169,7 @@ mod tests {
                 header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, SET_COOKIE},
             },
         };
+        use base64::Engine as _;
         use sqlx::sqlite::SqliteConnectOptions;
         use std::{path::PathBuf, sync::Arc};
         use tower::ServiceExt;
@@ -13200,6 +13218,7 @@ mod tests {
                 std::fs::create_dir_all(path.join("app")).unwrap();
                 std::fs::write(path.join("app/main.012abcd.js"), b"window.fixture = true;")
                     .unwrap();
+                std::fs::write(path.join("app/app.012abcd.js"), b"window.app = true;").unwrap();
                 path
             },
             wasm_plugins: Vec::new(),
@@ -13231,6 +13250,21 @@ mod tests {
         )
         .unwrap();
         assert!(welcome_html.contains("Welcome"));
+        assert!(welcome_html.contains("http://localhost/app/app.012abcd.js"));
+        let encoded_welcome_globals = welcome_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let welcome_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_welcome_globals)
+            .unwrap();
+        let welcome_globals: serde_json::Value =
+            serde_json::from_slice(&welcome_globals_bytes).unwrap();
+        assert_eq!(welcome_globals["route"], "setup");
+        assert_eq!(welcome_globals["extra"]["setup_welcome"]["version"], "test");
         let asset = app
             .clone()
             .oneshot(

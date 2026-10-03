@@ -10,6 +10,11 @@ type Route = {
 
 const routes: Route[] = [
   {
+    path: 'setup',
+    react: () => import('../views/setup/Welcome'),
+    el: '#setup-welcome-app',
+  },
+  {
     path: 'home',
     react: () => import('../views/Home'),
     el: '#home-app',

@@ -1,5 +1,9 @@
 <!doctype html>
-<html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{% if locale.starts_with("zh") %}安装程序{% else %}Install wizard{% endif %} - Blessing Skin</title><style>body{font:16px system-ui,sans-serif;background:#f4f6f9;color:#343a40;margin:0}main{max-width:760px;margin:8vh auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}a.button{display:inline-block;background:#007bff;color:#fff;padding:.7rem 1rem;border-radius:4px;text-decoration:none}p{line-height:1.6;color:#59636e}</style></head>
-<body><main><h1>Blessing Skin Server</h1><h2>{% if locale.starts_with("zh") %}欢迎{% else %}Welcome{% endif %}</h2>
+<html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{% if locale.starts_with("zh") %}安装程序{% else %}Install wizard{% endif %} - Blessing Skin</title><style>body{font:16px system-ui,sans-serif;background:#f4f6f9;color:#343a40;margin:0}main{max-width:760px;margin:8vh auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}a.button{display:inline-block;background:#007bff;color:#fff;padding:.7rem 1rem;border-radius:4px;text-decoration:none}p{line-height:1.6;color:#59636e}</style>
+{% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
+</head>
+<body><main id="setup-welcome-app"><h1>Blessing Skin Server</h1><h2>{% if locale.starts_with("zh") %}欢迎{% else %}Welcome{% endif %}</h2>
 <p>{% if locale.starts_with("zh") %}欢迎使用 Blessing Skin Server {{ version }}。安装向导将测试数据库连接、创建兼容旧版的数据表并建立首位超级管理员。{% else %}Welcome to Blessing Skin Server {{ version }}. The wizard tests the database connection, creates legacy-compatible tables, and sets up the first super administrator.{% endif %}</p>
-<p><a class="button" href="/setup/database">{% if locale.starts_with("zh") %}开始安装{% else %}Start setup{% endif %}</a></p></main></body></html>
+<p><a class="button" href="/setup/database">{% if locale.starts_with("zh") %}开始安装{% else %}Start setup{% endif %}</a></p></main>
+{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
+</body></html>
