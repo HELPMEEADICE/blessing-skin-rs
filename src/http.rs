@@ -56,11 +56,11 @@ use crate::{
 
 tokio::task_local! {
     static REQUEST_LOCALE: String;
-    static REQUEST_QUERY_LOCALE: Option<String>;
+    static REQUEST_INPUT_LOCALE: Option<String>;
 }
 
 fn explicit_request_locale() -> Option<String> {
-    REQUEST_QUERY_LOCALE.try_with(Clone::clone).ok().flatten()
+    REQUEST_INPUT_LOCALE.try_with(Clone::clone).ok().flatten()
 }
 
 pub(crate) fn request_locale(state: &AppState) -> String {
@@ -124,6 +124,69 @@ fn requested_query_locale(request: &axum::extract::Request) -> Option<String> {
     })
 }
 
+const MAX_LOCALE_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
+    let locale = if media_type == "application/json" || media_type.ends_with("+json") {
+        let language = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()?
+            .get("lang")?
+            .clone();
+        if language.is_null() {
+            return None;
+        }
+        language
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| language.to_string())
+    } else if media_type == "application/x-www-form-urlencoded" {
+        form_urlencoded::parse(body)
+            .filter_map(|(key, value)| (key == "lang").then(|| value.into_owned()))
+            .last()?
+    } else {
+        return None;
+    };
+
+    (!locale.trim().is_empty()).then_some(locale)
+}
+
+async fn buffer_request_body_for_locale(
+    request: axum::extract::Request,
+) -> Result<(axum::extract::Request, Option<String>), Response> {
+    if matches!(*request.method(), Method::GET | Method::HEAD) {
+        return Ok((request, None));
+    }
+    let Some(content_type) = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok((request, None));
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if media_type != "application/json"
+        && !media_type.ends_with("+json")
+        && media_type != "application/x-www-form-urlencoded"
+    {
+        return Ok((request, None));
+    }
+
+    let (parts, request_body) = request.into_parts();
+    let request_body = axum::body::to_bytes(request_body, MAX_LOCALE_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    let locale = body_locale(&request_body, &media_type);
+    Ok((
+        axum::extract::Request::from_parts(parts, Body::from(request_body)),
+        locale,
+    ))
+}
+
 fn is_user_facing_web_path(path: &str) -> bool {
     path == "/"
         || path == "/auth"
@@ -137,9 +200,11 @@ fn is_user_facing_web_path(path: &str) -> bool {
         || path.starts_with("/texture/")
 }
 
-fn select_request_locale(state: &AppState, request: &axum::extract::Request) -> String {
-    let query_locale = requested_query_locale(request);
-
+fn select_request_locale(
+    state: &AppState,
+    request: &axum::extract::Request,
+    input_locale: Option<&str>,
+) -> String {
     let cookie_locale = request
         .headers()
         .get(COOKIE)
@@ -150,7 +215,8 @@ fn select_request_locale(state: &AppState, request: &axum::extract::Request) -> 
                 (key == "locale").then(|| value.to_owned())
             })
         });
-    let requested = query_locale
+    let requested = input_locale
+        .map(str::to_owned)
         .or(cookie_locale)
         .or_else(|| browser_preferred_locale(request.headers()).map(str::to_owned));
     requested
@@ -167,16 +233,20 @@ async fn detect_locale_preference(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let (request, body_locale) = match buffer_request_body_for_locale(request).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let path = request.uri().path();
     let is_api = path == "/api" || path.starts_with("/api/");
-    let query_locale = requested_query_locale(&request);
-    let mut locale = select_request_locale(&state, &request);
+    let input_locale = body_locale.or_else(|| requested_query_locale(&request));
+    let mut locale = select_request_locale(&state, &request, input_locale.as_deref());
     if !is_api && is_user_facing_web_path(path) {
         if let (Some(user_id), Some(database)) = (
             session_user_id(&state, request.headers()),
             state.database.as_ref(),
         ) {
-            if let Some(requested) = query_locale.as_deref() {
+            if let Some(requested) = input_locale.as_deref() {
                 if let Some(requested) = normalize_locale(requested) {
                     if let Err(error) = database
                         .update_user_locale(&state.config.database.table_prefix, user_id, requested)
@@ -206,7 +276,7 @@ async fn detect_locale_preference(
     }
     let should_set_cookie = !is_api;
     let response = REQUEST_LOCALE.scope(locale.clone(), next.run(request));
-    let mut response = REQUEST_QUERY_LOCALE.scope(query_locale, response).await;
+    let mut response = REQUEST_INPUT_LOCALE.scope(input_locale, response).await;
     if should_set_cookie {
         if let Ok(cookie) = HeaderValue::from_str(&format!(
             "locale={locale}; Path=/; Max-Age=7200; SameSite=Lax"
@@ -14649,6 +14719,18 @@ mod tests {
             axum::http::HeaderValue::from_static("fr-CA;q=1, en-US;q=0.7, ru;q=0.9"),
         );
         assert_eq!(super::browser_preferred_locale(&headers), Some("ru_RU"));
+        assert_eq!(
+            super::body_locale(br#"{"lang":"zh_TW"}"#, "application/json"),
+            Some("zh_TW".to_owned())
+        );
+        assert_eq!(
+            super::body_locale(b"lang=en&lang=zh_TW", "application/x-www-form-urlencoded"),
+            Some("zh_TW".to_owned())
+        );
+        assert_eq!(
+            super::body_locale(br#"{"lang":""}"#, "application/json"),
+            None
+        );
     }
     #[test]
     fn database_frontend_translations_override_static_lines_with_locale_fallback() {
@@ -16547,6 +16629,31 @@ mod tests {
         assert_eq!(locale_change.status(), StatusCode::OK);
         assert!(
             locale_change
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie.to_str().unwrap().starts_with("locale=zh_TW;"))
+        );
+        assert_eq!(
+            crate::database::DatabasePool::Sqlite(pool.clone())
+                .user_locale("", 9)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zh_TW")
+        );
+
+        let body_locale_change = session_request(
+            &app,
+            &unbound_cookie,
+            "POST",
+            "/user/profile?lang=en",
+            Some(r#"{"action":"unsupported","lang":"zh_TW"}"#),
+        )
+        .await;
+        assert_eq!(body_locale_change.status(), StatusCode::OK);
+        assert!(
+            body_locale_change
                 .headers()
                 .get_all(SET_COOKIE)
                 .iter()
