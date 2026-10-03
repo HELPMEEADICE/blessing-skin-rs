@@ -4,6 +4,7 @@ mod config;
 mod database;
 mod defuse;
 mod http;
+mod image_cache;
 mod installer;
 mod mailer;
 mod oauth;
@@ -36,6 +37,7 @@ pub struct AppState {
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     pub mail_limits: Arc<Mutex<HashMap<String, Instant>>>,
+    pub image_cache: Arc<image_cache::ImageCache>,
     pub wasm_plugins: Vec<String>,
 }
 
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
         mail_limits: Arc::new(Mutex::new(HashMap::new())),
+        image_cache: image_cache::ImageCache::shared(),
         wasm_plugins,
     });
     let listener = TcpListener::bind(address).await?;

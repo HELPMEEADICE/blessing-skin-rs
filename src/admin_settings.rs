@@ -4,7 +4,7 @@ use askama::Template;
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{RawQuery, State},
     http::{HeaderMap, Method, StatusCode},
     response::{Html, IntoResponse, Response},
 };
@@ -269,7 +269,7 @@ pub async fn options_dispatch(
     method: Method,
     body: Bytes,
 ) -> Response {
-    dispatch_page(&state, &headers, "general", method, body).await
+    dispatch_page(&state, &headers, "general", method, body, false).await
 }
 pub async fn score_dispatch(
     State(state): State<AppState>,
@@ -277,7 +277,7 @@ pub async fn score_dispatch(
     method: Method,
     body: Bytes,
 ) -> Response {
-    dispatch_page(&state, &headers, "score", method, body).await
+    dispatch_page(&state, &headers, "score", method, body, false).await
 }
 pub async fn customize_dispatch(
     State(state): State<AppState>,
@@ -285,15 +285,21 @@ pub async fn customize_dispatch(
     method: Method,
     body: Bytes,
 ) -> Response {
-    dispatch_page(&state, &headers, "customize", method, body).await
+    dispatch_page(&state, &headers, "customize", method, body, false).await
 }
 pub async fn resource_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
     method: Method,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
-    dispatch_page(&state, &headers, "resource", method, body).await
+    let clear_cache = query.as_deref().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|part| part.split('=').next() == Some("clear-cache"))
+    });
+    dispatch_page(&state, &headers, "resource", method, body, clear_cache).await
 }
 
 async fn dispatch_page(
@@ -302,20 +308,29 @@ async fn dispatch_page(
     section: &str,
     method: Method,
     body: Bytes,
+    clear_cache: bool,
 ) -> Response {
-    if method == Method::POST {
-        save_page(state, headers, section, body).await
+    if clear_cache || method != Method::POST {
+        render_page(state, headers, section, clear_cache).await
     } else {
-        render_page(state, headers, section).await
+        save_page(state, headers, section, body).await
     }
 }
 
-async fn render_page(state: &AppState, headers: &HeaderMap, section: &str) -> Response {
+async fn render_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    section: &str,
+    clear_cache: bool,
+) -> Response {
     let Some(definitions) = definitions(section) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if let Err(response) = admin_user(state, headers).await {
         return response;
+    }
+    if clear_cache {
+        state.image_cache.clear();
     }
     let Some(database) = &state.database else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Database is not ready.").into_response();

@@ -50,6 +50,7 @@ use crate::{
         PlayerTextureOutcome, ReportManagementRecord, ReportSearchFilters, TextureInfoRecord,
         UserProfile,
     },
+    image_cache::{CachedImage, ImageCacheKey},
 };
 
 pub fn router(state: AppState) -> Router {
@@ -12016,11 +12017,27 @@ async fn preview_for_texture(
     if !valid_texture_hash(&texture.hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let height = query
+        .get("height")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|height| (1..=1024).contains(height))
+        .unwrap_or(200);
+    let use_png = query.contains_key("png");
     let path = state.config.textures_dir.join(&texture.hash);
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let cache_key = ImageCacheKey::Preview { tid, png: use_png };
+    if let Some(cached) = state.image_cache.get(&cache_key) {
+        let ttl = cache_ttl(state).await;
+        return image_response(
+            cached,
+            if use_png { "image/png" } else { "image/webp" },
+            ttl,
+            request_headers,
+        );
+    }
     let source = match tokio::fs::read(path).await {
         Ok(bytes) => match image::load_from_memory_with_format(&bytes, ImageFormat::Png) {
             Ok(image) => image.to_rgba8(),
@@ -12040,12 +12057,6 @@ async fn preview_for_texture(
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let height = query
-        .get("height")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|height| (1..=1024).contains(height))
-        .unwrap_or(200);
-    let use_png = query.contains_key("png");
     let format = if use_png {
         ImageFormat::Png
     } else {
@@ -12063,42 +12074,23 @@ async fn preview_for_texture(
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let etag = content_etag(&bytes);
+    let body = Bytes::from(bytes);
+    let cached = CachedImage {
+        etag: content_etag(&body),
+        body,
+        modified: metadata.modified().ok(),
+    };
+    let server_cache_ttl = image_response_cache_ttl(state, "enable_preview_cache").await;
+    state
+        .image_cache
+        .insert(cache_key, cached.clone(), server_cache_ttl);
     let ttl = cache_ttl(state).await;
-    let modified = metadata.modified().ok();
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(if use_png { "image/png" } else { "image/webp" }),
-    );
-    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
-    );
-    headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
-    );
-    if let Some(modified) = modified {
-        headers.insert(
-            LAST_MODIFIED,
-            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
-        );
-    }
-    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
-        || (!request_headers.contains_key(IF_NONE_MATCH)
-            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
-    {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        *response.headers_mut() = headers;
-        response.headers_mut().remove(CONTENT_TYPE);
-        response.headers_mut().remove(CONTENT_LENGTH);
-        return response;
-    }
-    let mut response = Response::new(Body::from(bytes));
-    *response.headers_mut() = headers;
-    response
+    image_response(
+        cached,
+        if use_png { "image/png" } else { "image/webp" },
+        ttl,
+        request_headers,
+    )
 }
 
 fn render_skin_preview(skin: &RgbaImage, is_alex: bool, height: u32) -> DynamicImage {
@@ -12392,6 +12384,7 @@ async fn render_avatar_response(
     };
     let mut modified = None;
     let mut source_skin = None;
+    let mut cache_key = None;
     if let Some(source) = source {
         if source.texture_type != "steve" && source.texture_type != "alex" {
             return StatusCode::UNPROCESSABLE_ENTITY.into_response();
@@ -12401,6 +12394,22 @@ async fn render_avatar_response(
             if let Ok(metadata) = tokio::fs::metadata(&path).await {
                 if metadata.is_file() {
                     modified = metadata.modified().ok();
+                    let key = ImageCacheKey::Avatar {
+                        texture_hash: source.hash.clone(),
+                        texture_type: source.texture_type.clone(),
+                        three_d,
+                        size,
+                        png: use_png,
+                    };
+                    if let Some(cached) = state.image_cache.get(&key) {
+                        let ttl = cache_ttl(state).await;
+                        return image_response(
+                            cached,
+                            if use_png { "image/png" } else { "image/webp" },
+                            ttl,
+                            request_headers,
+                        );
+                    }
                     if let Ok(bytes) = tokio::fs::read(path).await {
                         source_skin = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
                             .ok()
@@ -12408,6 +12417,9 @@ async fn render_avatar_response(
                                 image.width() == 64
                                     && (image.height() == 64 || image.height() == 32)
                             });
+                    }
+                    if source_skin.is_some() {
+                        cache_key = Some(key);
                     }
                 }
             }
@@ -12426,41 +12438,25 @@ async fn render_avatar_response(
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let etag = content_etag(&bytes);
+    let body = Bytes::from(bytes);
+    let cached = CachedImage {
+        etag: content_etag(&body),
+        body,
+        modified,
+    };
+    if let Some(key) = cache_key {
+        let server_cache_ttl = image_response_cache_ttl(state, "enable_avatar_cache").await;
+        state
+            .image_cache
+            .insert(key, cached.clone(), server_cache_ttl);
+    }
     let ttl = cache_ttl(state).await;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(if use_png { "image/png" } else { "image/webp" }),
-    );
-    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
-    );
-    headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
-    );
-    if let Some(modified) = modified {
-        headers.insert(
-            LAST_MODIFIED,
-            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
-        );
-    }
-    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
-        || (!request_headers.contains_key(IF_NONE_MATCH)
-            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
-    {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        *response.headers_mut() = headers;
-        response.headers_mut().remove(CONTENT_TYPE);
-        response.headers_mut().remove(CONTENT_LENGTH);
-        return response;
-    }
-    let mut response = Response::new(Body::from(bytes));
-    *response.headers_mut() = headers;
-    response
+    image_response(
+        cached,
+        if use_png { "image/png" } else { "image/webp" },
+        ttl,
+        request_headers,
+    )
 }
 
 fn default_avatar(three_d: bool) -> DynamicImage {
@@ -12617,6 +12613,68 @@ async fn cache_ttl(state: &AppState) -> u64 {
         .flatten()
         .and_then(|value| value.parse().ok())
         .unwrap_or(31_536_000)
+}
+
+async fn image_response_cache_ttl(state: &AppState, option_name: &str) -> Duration {
+    let enabled = if let Some(database) = &state.database {
+        database
+            .option(&state.config.database.table_prefix, option_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "(true)"
+                )
+            })
+    } else {
+        false
+    };
+    Duration::from_secs(if enabled { 31_536_000 } else { 60 })
+}
+
+fn image_response(
+    cached: CachedImage,
+    content_type: &str,
+    ttl: u64,
+    request_headers: &HeaderMap,
+) -> Response {
+    let CachedImage {
+        body,
+        etag,
+        modified,
+    } = cached;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
+    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string()).unwrap(),
+    );
+    if let Some(modified) = modified {
+        headers.insert(
+            LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
+        );
+    }
+    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
+        || (!request_headers.contains_key(IF_NONE_MATCH)
+            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        *response.headers_mut() = headers;
+        response.headers_mut().remove(CONTENT_TYPE);
+        response.headers_mut().remove(CONTENT_LENGTH);
+        return response;
+    }
+    let mut response = Response::new(Body::from(body));
+    *response.headers_mut() = headers;
+    response
 }
 
 fn header_has_etag(headers: &HeaderMap, etag: &str) -> bool {
@@ -13402,6 +13460,7 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
             storage_dir: setup_storage,
             env_file: setup_env.clone(),
             public_dir: {
@@ -13751,6 +13810,7 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
             storage_dir: finish_storage.clone(),
             env_file: finish_env.clone(),
             public_dir: finish_public.clone(),
@@ -14112,6 +14172,7 @@ mod tests {
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),
             mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
             storage_dir: setup_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
             public_dir: public_dir.clone(),

@@ -1968,6 +1968,7 @@ mod integration_tests {
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
             storage_dir: install_storage.clone(),
             env_file: std::path::PathBuf::from(".env"),
             public_dir: install_storage.clone(),
