@@ -12,11 +12,13 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.4.0";
+const HOST_API_VERSION: &str = "1.5.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
 const PLUGIN_EVENTS_INTERFACE: &str = "blessing-skin:plugin/events@1.0.0";
+const PLUGIN_DOCUMENTATION_INTERFACE: &str = "blessing-skin:plugin/documentation@1.0.0";
+const PLUGIN_CONFIGURATION_INTERFACE: &str = "blessing-skin:plugin/configuration@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const PLUGIN_LOG_MESSAGE_LIMIT: usize = 4 * 1024;
@@ -25,6 +27,8 @@ const PLUGIN_STATE_VALUE_LIMIT: usize = 64 * 1024;
 const PLUGIN_STATE_ENTRY_LIMIT: usize = 256;
 const PLUGIN_STATE_TOTAL_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
+const PLUGIN_CONFIGURATION_LIMIT: usize = 64 * 1024;
+const PLUGIN_README_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.logged-in",
     "user.registered",
@@ -63,6 +67,8 @@ struct LoadedPlugin {
     instance: Instance,
     lifecycle: ComponentExportIndex,
     events: Option<ComponentExportIndex>,
+    documentation: Option<ComponentExportIndex>,
+    configuration: Option<ComponentExportIndex>,
 }
 
 pub struct PluginRuntime {
@@ -146,6 +152,22 @@ impl PluginRuntime {
                     .to_string_lossy()
                     .into_owned()
             })
+            .collect()
+    }
+
+    pub fn plugin_readme_names(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.documentation.is_some())
+            .filter_map(|plugin| plugin.path.file_stem()?.to_str().map(str::to_owned))
+            .collect()
+    }
+
+    pub fn plugin_configuration_names(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.configuration.is_some())
+            .filter_map(|plugin| plugin.path.file_stem()?.to_str().map(str::to_owned))
             .collect()
     }
 
@@ -320,12 +342,50 @@ impl PluginRuntime {
                 &handle_export,
             )?;
         }
+        let documentation =
+            instance.get_export_index(&mut store, None, PLUGIN_DOCUMENTATION_INTERFACE);
+        if let Some(export) = &documentation {
+            let readme = instance
+                .get_export_index(&mut store, Some(export), "readme")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin documentation interface is missing readme",
+                    )
+                })?;
+            instance
+                .get_typed_func::<(), (Result<Option<String>, String>,)>(&mut store, &readme)?;
+        }
+        let configuration =
+            instance.get_export_index(&mut store, None, PLUGIN_CONFIGURATION_INTERFACE);
+        if let Some(export) = &configuration {
+            let get = instance
+                .get_export_index(&mut store, Some(export), "get")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin configuration interface is missing get",
+                    )
+                })?;
+            instance.get_typed_func::<(), (Result<Option<String>, String>,)>(&mut store, &get)?;
+            let set = instance
+                .get_export_index(&mut store, Some(export), "set")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin configuration interface is missing set",
+                    )
+                })?;
+            instance.get_typed_func::<(String,), (Result<(), String>,)>(&mut store, &set)?;
+        }
         self.plugins.push(LoadedPlugin {
             path: path.to_owned(),
             store,
             instance,
             lifecycle,
             events,
+            documentation,
+            configuration,
         });
         tracing::info!(plugin = %path.display(), host_api = HOST_API_VERSION, "WASM plugin initialized");
         Ok(())
@@ -379,10 +439,157 @@ impl PluginRuntime {
         }
     }
 
+    pub async fn read_plugin_readme(&mut self, name: &str) -> Result<Option<String>, String> {
+        let Some(plugin) = self.find_plugin_mut(name) else {
+            return Ok(None);
+        };
+        let Some(interface) = plugin.documentation.as_ref() else {
+            return Ok(None);
+        };
+        let export = plugin
+            .instance
+            .get_export_index(&mut plugin.store, Some(interface), "readme")
+            .ok_or_else(|| "missing plugin readme export".to_owned())?;
+        let readme = plugin
+            .instance
+            .get_typed_func::<(), (Result<Option<String>, String>,)>(&mut plugin.store, &export)
+            .map_err(|error| error.to_string())?;
+        plugin
+            .store
+            .set_fuel(COMPONENT_FUEL)
+            .map_err(|error| error.to_string())?;
+        let previous_state = plugin.store.data().state.clone();
+        let result = readme
+            .call(&mut plugin.store, ())
+            .map_err(|error| error.to_string());
+        plugin.store.data_mut().state = previous_state;
+        let (result,) = result?;
+        let result = result?;
+        if result
+            .as_ref()
+            .is_some_and(|value| value.len() > PLUGIN_README_LIMIT)
+        {
+            return Err(format!("plugin README exceeds {PLUGIN_README_LIMIT} bytes"));
+        }
+        Ok(result)
+    }
+
+    pub async fn read_plugin_configuration(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(plugin) = self.find_plugin_mut(name) else {
+            return Ok(None);
+        };
+        let Some(interface) = plugin.configuration.as_ref() else {
+            return Ok(None);
+        };
+        let export = plugin
+            .instance
+            .get_export_index(&mut plugin.store, Some(interface), "get")
+            .ok_or_else(|| "missing plugin configuration get export".to_owned())?;
+        let get = plugin
+            .instance
+            .get_typed_func::<(), (Result<Option<String>, String>,)>(&mut plugin.store, &export)
+            .map_err(|error| error.to_string())?;
+        plugin
+            .store
+            .set_fuel(COMPONENT_FUEL)
+            .map_err(|error| error.to_string())?;
+        let previous_state = plugin.store.data().state.clone();
+        let result = get
+            .call(&mut plugin.store, ())
+            .map_err(|error| error.to_string());
+        plugin.store.data_mut().state = previous_state;
+        let (result,) = result?;
+        let result = result?;
+        if let Some(configuration) = result.as_deref() {
+            validate_plugin_configuration(configuration)?;
+        }
+        Ok(result)
+    }
+
+    pub async fn save_plugin_configuration(
+        &mut self,
+        name: &str,
+        configuration: &str,
+    ) -> Result<bool, String> {
+        validate_plugin_configuration(configuration)?;
+        let database = self.database.clone();
+        let table_prefix = self.table_prefix.clone();
+        let Some(plugin) = self.find_plugin_mut(name) else {
+            return Ok(false);
+        };
+        let Some(interface) = plugin.configuration.as_ref() else {
+            return Ok(false);
+        };
+        let export = plugin
+            .instance
+            .get_export_index(&mut plugin.store, Some(interface), "set")
+            .ok_or_else(|| "missing plugin configuration set export".to_owned())?;
+        let set = plugin
+            .instance
+            .get_typed_func::<(String,), (Result<(), String>,)>(&mut plugin.store, &export)
+            .map_err(|error| error.to_string())?;
+        plugin
+            .store
+            .set_fuel(COMPONENT_FUEL)
+            .map_err(|error| error.to_string())?;
+        let previous_state = plugin.store.data().state.clone();
+        let result = set
+            .call(&mut plugin.store, (configuration.to_owned(),))
+            .map_err(|error| error.to_string());
+        let (result,) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                plugin.store.data_mut().state = previous_state;
+                return Err(error);
+            }
+        };
+        if let Err(error) = result {
+            plugin.store.data_mut().state = previous_state;
+            return Err(error);
+        }
+        if plugin.store.data().state != previous_state {
+            let Some(database) = database else {
+                plugin.store.data_mut().state = previous_state;
+                return Err("plugin state storage is unavailable".to_owned());
+            };
+            if let Err(error) = persist_plugin_state(&database, &table_prefix, plugin).await {
+                plugin.store.data_mut().state = previous_state;
+                return Err(error.to_string());
+            }
+        }
+        Ok(true)
+    }
+
+    fn find_plugin_mut(&mut self, name: &str) -> Option<&mut LoadedPlugin> {
+        if !valid_plugin_name(name) {
+            return None;
+        }
+        self.plugins
+            .iter_mut()
+            .find(|plugin| plugin.path.file_stem().and_then(|stem| stem.to_str()) == Some(name))
+    }
+
     #[cfg(test)]
     fn loaded_count(&self) -> usize {
         self.plugins.len()
     }
+}
+
+fn validate_plugin_configuration(configuration: &str) -> Result<(), String> {
+    if configuration.len() > PLUGIN_CONFIGURATION_LIMIT {
+        return Err(format!(
+            "plugin configuration exceeds {PLUGIN_CONFIGURATION_LIMIT} bytes"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(configuration)
+        .map_err(|_| "plugin configuration must be UTF-8 JSON".to_owned())?;
+    if !value.is_object() {
+        return Err("plugin configuration must be a JSON object".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_plugin_event(name: &str, payload: &[u8]) -> Result<(), String> {
@@ -620,10 +827,11 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT,
-        PluginRuntime, PluginStore, StoreLimitsBuilder, checkpoint_plugin_state,
-        log_plugin_message, plugin_state_delete, plugin_state_get, plugin_state_set,
-        validate_plugin_event, validated_plugin_state,
+        PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT,
+        PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore, StoreLimitsBuilder,
+        checkpoint_plugin_state, log_plugin_message, plugin_state_delete, plugin_state_get,
+        plugin_state_set, validate_plugin_configuration, validate_plugin_event,
+        validated_plugin_state,
     };
     use std::{
         collections::HashMap,
@@ -645,6 +853,22 @@ mod tests {
     #[test]
     fn component_validation_rejects_non_component_bytes() {
         assert!(PluginRuntime::validate_component_bytes(b"not a wasm component").is_err());
+    }
+
+    #[test]
+    fn plugin_configuration_is_a_bounded_json_object() {
+        assert!(validate_plugin_configuration("{}").is_ok());
+        assert!(validate_plugin_configuration(r#"{"enabled":true}"#).is_ok());
+        assert!(validate_plugin_configuration("[]").is_err());
+        assert!(validate_plugin_configuration("null").is_err());
+        assert!(validate_plugin_configuration("not json").is_err());
+        assert!(
+            validate_plugin_configuration(&format!(
+                "{{\"value\":\"{}\"}}",
+                "x".repeat(PLUGIN_CONFIGURATION_LIMIT)
+            ))
+            .is_err()
+        );
     }
 
     #[test]

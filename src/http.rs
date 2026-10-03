@@ -184,6 +184,11 @@ pub fn router(state: AppState) -> Router {
             get(web_admin_plugins_page).post(web_admin_plugins_manage),
         )
         .route(
+            "/admin/plugins/config/{name}",
+            get(web_admin_plugin_config).post(web_admin_plugin_config),
+        )
+        .route("/admin/plugins/readme/{name}", get(web_admin_plugin_readme))
+        .route(
             "/admin/plugins/upload",
             post(web_admin_plugins_upload).layer(DefaultBodyLimit::max(34 * 1024 * 1024)),
         )
@@ -2653,6 +2658,21 @@ struct AdminPluginsPage {
 }
 
 #[derive(Template)]
+#[template(
+    source = r#"<!doctype html><html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ plugin_name }} - {{ heading }}</title><style>body{font-family:system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem;color:#222}.message:empty{display:none}textarea{box-sizing:border-box;width:100%;min-height:26rem;font:13px ui-monospace,monospace;padding:.75rem}button{padding:.55rem 1rem} .message{padding:.75rem;background:#f3f4f6;margin:1rem 0;white-space:pre-wrap}</style></head><body><main><h1>{{ heading }}: {{ plugin_name }}</h1><p class="message">{{ message }}</p><form method="post" action="/admin/plugins/config/{{ plugin_name }}"><label for="configuration">JSON configuration</label><p>Settings are stored by this component and validated when saved.</p><textarea id="configuration" name="configuration" spellcheck="false">{{ configuration }}</textarea><p><button type="submit">{{ save_label }}</button> <a href="/admin/plugins/manage">{{ back_label }}</a></p></form></main></body></html>"#,
+    ext = "html"
+)]
+struct PluginConfigurationPage {
+    locale: String,
+    plugin_name: String,
+    heading: String,
+    configuration: String,
+    message: String,
+    save_label: String,
+    back_label: String,
+}
+
+#[derive(Template)]
 #[template(path = "setup_welcome.html")]
 struct SetupWelcomePage {
     locale: String,
@@ -3747,6 +3767,170 @@ async fn web_admin_plugins_data(State(state): State<AppState>, headers: HeaderMa
     }
 }
 
+async fn web_admin_plugin_readme(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(name): RoutePath<String>,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !crate::plugin_runtime::valid_plugin_name(&name) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let readme = state
+        .wasm_runtime
+        .lock()
+        .await
+        .read_plugin_readme(&name)
+        .await;
+    let markdown = match readme {
+        Ok(Some(markdown)) => markdown,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, plugin = %name, "failed to read WASM plugin documentation");
+            return unavailable();
+        }
+    };
+    let content = render_notification_markdown(&markdown);
+    let language = if state.config.locale.starts_with("zh") {
+        "zh-CN"
+    } else {
+        "en"
+    };
+    let html = format!(
+        "<!doctype html><html lang=\"{language}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{name}</title><style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;line-height:1.55}}img{{max-width:100%}}pre{{overflow:auto;padding:1rem;background:#f3f4f6}}</style></head><body><main><h1>{name}</h1>{content}</main></body></html>",
+    );
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'self'"),
+    );
+    response
+}
+
+async fn web_admin_plugin_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RoutePath(name): RoutePath<String>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 1 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !crate::plugin_runtime::valid_plugin_name(&name) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut message = String::new();
+    if method == Method::POST {
+        let configuration = if headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+        {
+            let value: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(value) => value,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            match serde_json::to_string(&value) {
+                Ok(value) => value,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        } else {
+            match form_urlencoded::parse(&body)
+                .find(|(key, _)| key == "configuration")
+                .map(|(_, value)| value.into_owned())
+            {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        };
+        match state
+            .wasm_runtime
+            .lock()
+            .await
+            .save_plugin_configuration(&name, &configuration)
+            .await
+        {
+            Ok(true) => {
+                message = if state.config.locale.starts_with("zh") {
+                    "配置已保存。".to_owned()
+                } else {
+                    "Configuration saved.".to_owned()
+                };
+            }
+            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::warn!(%error, plugin = %name, "WASM plugin rejected configuration");
+                message = if state.config.locale.starts_with("zh") {
+                    format!("配置未保存：{error}")
+                } else {
+                    format!("Configuration was not saved: {error}")
+                };
+            }
+        }
+    } else if method != Method::GET {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+
+    let configuration = match state
+        .wasm_runtime
+        .lock()
+        .await
+        .read_plugin_configuration(&name)
+        .await
+    {
+        Ok(Some(configuration)) => configuration,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, plugin = %name, "failed to read WASM plugin configuration");
+            return unavailable();
+        }
+    };
+    let chinese = state.config.locale.starts_with("zh");
+    let page = PluginConfigurationPage {
+        locale: state.config.locale.clone(),
+        plugin_name: name,
+        heading: if chinese {
+            "插件设置"
+        } else {
+            "Plugin configuration"
+        }
+        .to_owned(),
+        configuration: match serde_json::from_str::<serde_json::Value>(&configuration)
+            .and_then(|value| serde_json::to_string_pretty(&value))
+        {
+            Ok(configuration) => configuration,
+            Err(_) => configuration,
+        },
+        message,
+        save_label: if chinese { "保存" } else { "Save" }.to_owned(),
+        back_label: if chinese {
+            "返回插件管理"
+        } else {
+            "Back to plugins"
+        }
+        .to_owned(),
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render WASM plugin configuration page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn web_admin_plugins_manage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3969,7 +4153,17 @@ fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, st
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(plugins
                 .into_iter()
-                .map(|(name, (enabled, _))| admin_plugin_record(state, name, enabled, false))
+                .map(|(name, (enabled, _))| {
+                    let has_readme = state
+                        .wasm_plugin_readmes
+                        .iter()
+                        .any(|plugin| plugin == &name);
+                    let has_config = state
+                        .wasm_plugin_configurations
+                        .iter()
+                        .any(|plugin| plugin == &name);
+                    admin_plugin_record(state, name, enabled, false, has_readme, has_config)
+                })
                 .collect());
         }
         Err(error) => return Err(error),
@@ -4007,7 +4201,17 @@ fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, st
     }
     Ok(plugins
         .into_iter()
-        .map(|(name, (enabled, on_disk))| admin_plugin_record(state, name, enabled, on_disk))
+        .map(|(name, (enabled, on_disk))| {
+            let has_readme = state
+                .wasm_plugin_readmes
+                .iter()
+                .any(|plugin| plugin == &name);
+            let has_config = state
+                .wasm_plugin_configurations
+                .iter()
+                .any(|plugin| plugin == &name);
+            admin_plugin_record(state, name, enabled, on_disk, has_readme, has_config)
+        })
         .collect())
 }
 
@@ -4016,6 +4220,8 @@ fn admin_plugin_record(
     name: String,
     enabled: bool,
     on_disk: bool,
+    has_readme: bool,
+    has_config: bool,
 ) -> serde_json::Value {
     let filename = format!("{name}.wasm");
     let loaded = state.wasm_plugins.iter().any(|plugin| plugin == &filename);
@@ -4045,12 +4251,12 @@ fn admin_plugin_record(
         "name": name,
         "title": name,
         "description": description,
-        "version": "WASM lifecycle API 1.0.0",
+        "version": "WASM host API 1.5.0",
         "enabled": enabled,
         "loaded": loaded,
         "on_disk": on_disk,
-        "readme": false,
-        "config": false,
+        "readme": has_readme,
+        "config": has_config,
         "icon": {"fa": "puzzle-piece", "faType": "fas", "bg": "teal"}
     })
 }
@@ -13881,6 +14087,8 @@ mod tests {
                 path
             },
             wasm_plugins: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let login_before_install = app
@@ -14225,6 +14433,8 @@ mod tests {
             env_file: finish_env.clone(),
             public_dir: finish_public.clone(),
             wasm_plugins: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let finish_page = finish_app
@@ -14588,6 +14798,8 @@ mod tests {
             env_file: std::path::PathBuf::from(".env"),
             public_dir: public_dir.clone(),
             wasm_plugins: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
         let setup_page = app

@@ -1973,6 +1973,8 @@ mod integration_tests {
             env_file: std::path::PathBuf::from(".env"),
             public_dir: install_storage.clone(),
             wasm_plugins: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
 
