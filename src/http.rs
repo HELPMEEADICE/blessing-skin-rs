@@ -543,6 +543,13 @@ async fn detect_locale_preference(
     }
     response
 }
+fn user_score_updated_event(user_id: i64, previous_score: i64, score: i64) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": user_id,
+        "previous_score": previous_score,
+        "score": score,
+    })
+}
 async fn emit_plugin_event(state: &AppState, name: &str, payload: serde_json::Value) {
     let payload = match serde_json::to_vec(&payload) {
         Ok(payload) => payload,
@@ -6402,6 +6409,12 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .await
     {
         Ok(crate::database::UserSignOutcome::Signed(score)) => {
+            emit_plugin_event(
+                &state,
+                "user.score.updated",
+                user_score_updated_event(user.uid, user.score, score),
+            )
+            .await;
             let message = if request_locale(&state).starts_with("zh") {
                 format!("签到成功，获得了 {reward} 积分")
             } else {
@@ -12384,11 +12397,7 @@ async fn apply_admin_user_mutation(
             emit_plugin_event(
                 state,
                 "user.score.updated",
-                serde_json::json!({
-                    "user_id": target_uid,
-                    "previous_score": target.score,
-                    "score": score,
-                }),
+                user_score_updated_event(target_uid, target.score, score),
             )
             .await;
             admin_user_success(AdminUserMutation::Score, &request_locale(&state), None)
@@ -16033,6 +16042,17 @@ mod tests {
         assert_eq!(item["pivot"]["user_uid"], 7);
         assert_eq!(item["pivot"]["texture_tid"], 13);
         assert_eq!(item["pivot"]["item_name"], "Saved name");
+    }
+    #[test]
+    fn serializes_score_changes_for_plugin_events() {
+        assert_eq!(
+            super::user_score_updated_event(7, 5, 15),
+            serde_json::json!({
+                "user_id": 7,
+                "previous_score": 5,
+                "score": 15,
+            })
+        );
     }
     #[test]
     fn validates_legacy_texture_name_rules() {
