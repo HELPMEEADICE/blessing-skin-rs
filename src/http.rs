@@ -4360,7 +4360,7 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
         Ok(user) => user,
         Err(response) => return response,
     };
-    if user.permission < 1 {
+    if user.permission < 2 {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4384,7 +4384,7 @@ async fn web_admin_update_download(State(state): State<AppState>, headers: Heade
         Ok(user) => user,
         Err(response) => return response,
     };
-    if user.permission < 1 {
+    if user.permission < 2 {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -17097,35 +17097,12 @@ mod tests {
             session_request(&app, &registered_cookie, "GET", "/admin/update", None).await;
         assert_eq!(denied_update_page.status(), StatusCode::FORBIDDEN);
 
-        let update_page = session_request(&app, &admin_cookie, "GET", "/admin/update", None).await;
-        assert_eq!(update_page.status(), StatusCode::OK);
-        let update_html = String::from_utf8(
-            to_bytes(update_page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(update_html.contains("Rust service releases"));
-        assert!(update_html.contains("Current version"));
-        assert!(update_html.contains("https://github.com/HELPMEEADICE/blessing-skin-rs/releases"));
-        assert!(update_html.contains("storage"));
-        let update_download =
+        let denied_update_admin_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/update", None).await;
+        assert_eq!(denied_update_admin_page.status(), StatusCode::FORBIDDEN);
+        let denied_update_admin_download =
             session_request(&app, &admin_cookie, "POST", "/admin/update/download", None).await;
-        assert_eq!(update_download.status(), StatusCode::OK);
-        let update_download: serde_json::Value = serde_json::from_slice(
-            &to_bytes(update_download.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(update_download["code"], 1);
-        assert!(
-            update_download["message"]
-                .as_str()
-                .unwrap()
-                .contains("standalone")
-        );
+        assert_eq!(denied_update_admin_download.status(), StatusCode::FORBIDDEN);
 
         let users_page = session_request(&app, &admin_cookie, "GET", "/admin/users", None).await;
         assert_eq!(users_page.status(), StatusCode::OK);
@@ -17307,6 +17284,36 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let update_page = session_request(&app, &admin_cookie, "GET", "/admin/update", None).await;
+        assert_eq!(update_page.status(), StatusCode::OK);
+        let update_html = String::from_utf8(
+            to_bytes(update_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(update_html.contains("Rust service releases"));
+        assert!(update_html.contains("Current version"));
+        assert!(update_html.contains("https://github.com/HELPMEEADICE/blessing-skin-rs/releases"));
+        assert!(update_html.contains("storage"));
+        let update_download =
+            session_request(&app, &admin_cookie, "POST", "/admin/update/download", None).await;
+        assert_eq!(update_download.status(), StatusCode::OK);
+        let update_download: serde_json::Value = serde_json::from_slice(
+            &to_bytes(update_download.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update_download["code"], 1);
+        assert!(
+            update_download["message"]
+                .as_str()
+                .unwrap()
+                .contains("standalone")
+        );
+
         let market_page =
             session_request(&app, &admin_cookie, "GET", "/admin/plugins/market", None).await;
         assert_eq!(market_page.status(), StatusCode::OK);
