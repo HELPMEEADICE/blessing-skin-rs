@@ -84,6 +84,9 @@ jobs:
       - name: Build generated component
         working-directory: ${{ runner.temp }}/plugin-scaffold
         run: cargo component build --release
+      - name: Build SDK player counter example
+        working-directory: plugins/examples/player-counter
+        run: cargo component build --release
 
   build:
     name: ${{ matrix.name }}

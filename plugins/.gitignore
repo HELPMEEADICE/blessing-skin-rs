@@ -1,2 +1,7 @@
 *
 !.gitignore
+!sdk/
+!sdk/**
+!examples/
+!examples/**
+**/target/

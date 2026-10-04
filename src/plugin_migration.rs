@@ -374,45 +374,7 @@ impl bindings::exports::blessing_skin::plugin::configuration::Guest for Componen
 
 bindings::export!(Component with_types_in bindings);
 "##;
-    let wit = r#"package blessing-skin:plugin@1.0.0;
-
-interface host {
-    log: func(level: string, message: string) -> result<_, string>;
-}
-
-interface state {
-    get: func(key: string) -> result<option<list<u8>>, string>;
-    set: func(key: string, value: list<u8>) -> result<_, string>;
-    delete: func(key: string) -> result<bool, string>;
-}
-
-interface lifecycle {
-    initialize: func(host-api-version: string) -> result<_, string>;
-    shutdown: func();
-}
-
-interface events {
-    handle: func(name: string, payload: list<u8>) -> result<_, string>;
-}
-
-interface documentation {
-    readme: func() -> result<option<string>, string>;
-}
-
-interface configuration {
-    get: func() -> result<option<string>, string>;
-    set: func(configuration: string) -> result<_, string>;
-}
-
-world plugin {
-    import host;
-    import state;
-    export lifecycle;
-    export events;
-    export documentation;
-    export configuration;
-}
-"#;
+    let wit = include_str!("../plugins/sdk/wit/world.wit");
     let files = [
         (output.join("Cargo.toml"), package_toml),
         (output.join("README.md"), readme),
@@ -541,6 +503,8 @@ mod tests {
         let wit = fs::read_to_string(output.join("wit/world.wit")).unwrap();
         let source = fs::read_to_string(output.join("src/lib.rs")).unwrap();
         let readme = fs::read_to_string(output.join("README.md")).unwrap();
+        let sdk_wit = include_str!("../plugins/sdk/wit/world.wit");
+        let example_wit = include_str!("../plugins/examples/player-counter/wit/world.wit");
         assert!(manifest.contains("name = \"fancy-addon-plugin\""));
         assert!(readme.contains("Host API version 1.6"));
         assert!(wit.contains("blessing-skin:plugin@1.0.0"));
@@ -556,6 +520,8 @@ mod tests {
         assert!(wit.contains("get: func(key: string) -> result<option<list<u8>>, string>"));
         assert!(wit.contains("import host;"));
         assert!(wit.contains("import state;"));
+        assert_eq!(wit, sdk_wit);
+        assert_eq!(example_wit, sdk_wit);
         assert!(source.contains("blessing_skin::plugin::lifecycle::Guest"));
         assert!(source.contains("blessing_skin::plugin::host::log"));
         assert!(source.contains("blessing_skin::plugin::state::get"));

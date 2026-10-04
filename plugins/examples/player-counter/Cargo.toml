@@ -1,0 +1,18 @@
+[package]
+name = "blessing-skin-player-counter"
+version = "0.1.0"
+edition = "2024"
+description = "Example Blessing Skin WASM plugin with persistent event state"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.62"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
