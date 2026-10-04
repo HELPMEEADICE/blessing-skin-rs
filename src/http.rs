@@ -28,6 +28,7 @@ use axum::{
 };
 use base64::Engine as _;
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use fancy_regex::{BytesMode, RegexBuilder as FancyRegexBuilder};
 use hmac::{Hmac, Mac};
 use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage, Rgba, RgbaImage};
 use jsonwebtoken::{Algorithm, Header, encode};
@@ -9386,24 +9387,128 @@ fn custom_player_name_matches(name: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-    let (pattern, flags) = if let Some(inner) = pattern.strip_prefix('/') {
-        let Some(end) = inner.rfind('/') else {
-            return false;
-        };
-        (&inner[..end], &inner[end + 1..])
-    } else {
-        (pattern, "")
+    let Some((pattern, flags)) = split_php_delimited_regex(pattern) else {
+        return false;
     };
-    if pattern.len() > 512 {
+    if pattern.len() > 512
+        || flags.chars().any(|flag| {
+            !matches!(
+                flag,
+                'i' | 'm' | 's' | 'x' | 'A' | 'D' | 'S' | 'U' | 'X' | 'u'
+            )
+        })
+    {
         return false;
     }
-    let mut builder = RegexBuilder::new(pattern);
+
+    let pattern = if flags.contains('m') {
+        pattern.to_owned()
+    } else {
+        dollar_end_only_pattern(pattern, !flags.contains('D'))
+    };
+    let pattern = if flags.contains('U') {
+        format!("(?U){pattern}")
+    } else {
+        pattern
+    };
+    let mut builder = FancyRegexBuilder::new(&pattern);
     builder
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
         .dot_matches_new_line(flags.contains('s'))
-        .ignore_whitespace(flags.contains('x'));
-    builder.build().is_ok_and(|regex| regex.is_match(name))
+        .ignore_whitespace(flags.contains('x'))
+        .unicode_mode(flags.contains('u'))
+        .bytes_mode(if flags.contains('u') {
+            BytesMode::Unicode
+        } else {
+            BytesMode::Ascii
+        })
+        .backtrack_limit(100_000);
+    builder.build().is_ok_and(|regex| {
+        let match_start = if flags.contains('u') {
+            regex.find(name).ok().flatten().map(|found| found.start())
+        } else {
+            regex
+                .find(name.as_bytes())
+                .ok()
+                .flatten()
+                .map(|found| found.start())
+        };
+        match_start.is_some_and(|start| !flags.contains('A') || start == 0)
+    })
+}
+
+fn split_php_delimited_regex(pattern: &str) -> Option<(&str, &str)> {
+    let opening = pattern.chars().next()?;
+    if opening.is_ascii_alphanumeric() || opening.is_ascii_whitespace() || opening == '\\' {
+        return None;
+    }
+    let closing = match opening {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        delimiter => delimiter,
+    };
+    let pattern_start = opening.len_utf8();
+    let mut nesting = 1usize;
+    let mut escaped = false;
+    for (relative_offset, character) in pattern[pattern_start..].char_indices() {
+        let offset = pattern_start + relative_offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if opening != closing && character == opening {
+            nesting += 1;
+            continue;
+        }
+        if character == closing {
+            nesting -= 1;
+            if nesting == 0 {
+                let flags_start = offset + closing.len_utf8();
+                return Some((&pattern[pattern_start..offset], &pattern[flags_start..]));
+            }
+        }
+    }
+    None
+}
+
+fn dollar_end_only_pattern(pattern: &str, allow_final_newline: bool) -> String {
+    let mut output = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    let mut in_character_class = false;
+    for character in pattern.chars() {
+        if escaped {
+            output.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            output.push(character);
+            escaped = true;
+            continue;
+        }
+        if character == '[' {
+            in_character_class = true;
+        } else if character == ']' {
+            in_character_class = false;
+        }
+        if character == '$' && !in_character_class {
+            output.push_str(if allow_final_newline {
+                r"(?:\n)?\z"
+            } else {
+                r"\z"
+            });
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 async fn api_add_player(
@@ -20814,5 +20919,37 @@ mod tests {
         ));
         assert!(valid_player_name("ABC", "custom", "/^[a-z]+$/i", 3, 16));
         assert!(!valid_player_name("ABC1", "custom", "/^[a-z]+$/i", 3, 16));
+        assert!(valid_player_name("a/b", "custom", "/^[a-z\\/]+$/", 3, 16));
+
+        assert!(valid_player_name(
+            "Abc1",
+            "custom",
+            "~^(?=.*[A-Z])(?=.*\\d)[A-Za-z\\d]+$~",
+            3,
+            16
+        ));
+        assert!(!valid_player_name(
+            "abc1",
+            "custom",
+            "~^(?=.*[A-Z])(?=.*\\d)[A-Za-z\\d]+$~",
+            3,
+            16
+        ));
+        assert!(valid_player_name(
+            "Ab-Ab",
+            "custom",
+            "{^([A-Z]+)-\\1$}i",
+            3,
+            16
+        ));
+        assert!(valid_player_name("a/b", "custom", "#^[a-z/]+$#i", 3, 16));
+        assert!(!valid_player_name("abc", "custom", "^[a-z]+$", 3, 16));
+        assert!(valid_player_name("abc\n", "custom", "/^[a-z]+$/", 3, 16));
+        assert!(!valid_player_name("abc\n", "custom", "/^[a-z]+$/D", 3, 16));
+        assert!(!valid_player_name("é", "custom", "/^\\w+$/", 1, 16));
+        assert!(!valid_player_name("é", "custom", "/^.$/", 1, 16));
+        assert!(valid_player_name("é", "custom", "/^..$/", 1, 16));
+        assert!(valid_player_name("é", "custom", "/^.$/u", 1, 16));
+        assert!(valid_player_name("é", "custom", "/^\\w+$/u", 1, 16));
     }
 }

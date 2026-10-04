@@ -41,5 +41,6 @@ wasmtime = { version = "49.0.1", default-features = false, features = ["componen
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+fancy-regex = "0.19.2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
