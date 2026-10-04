@@ -9374,9 +9374,11 @@ fn valid_player_name(
                 || ch == '§'
                 || ('\u{4e00}'..='\u{9fff}').contains(&ch)
         }),
-        "utf8" => !name.chars().any(char::is_whitespace),
+        "utf8" => !name
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r')),
         "custom" => custom_player_name_matches(name, custom_rule),
-        _ => false,
+        _ => true,
     }
 }
 
@@ -20798,6 +20800,18 @@ mod tests {
         assert!(!valid_player_name("Alex!", "official", "", 3, 16));
         assert!(valid_player_name("玩家§2", "cjk", "", 3, 16));
         assert!(!valid_player_name("bad name", "utf8", "", 3, 16));
+        assert!(valid_player_name("a\u{00a0}b", "utf8", "", 3, 16));
+        for whitespace in ['\t', '\n', '\u{000b}', '\u{000c}', '\r', ' '] {
+            let name = format!("ab{whitespace}c");
+            assert!(!valid_player_name(&name, "utf8", "", 3, 16));
+        }
+        assert!(valid_player_name(
+            "玩家 @!",
+            "unknown-legacy-rule",
+            "",
+            3,
+            16
+        ));
         assert!(valid_player_name("ABC", "custom", "/^[a-z]+$/i", 3, 16));
         assert!(!valid_player_name("ABC1", "custom", "/^[a-z]+$/i", 3, 16));
     }
