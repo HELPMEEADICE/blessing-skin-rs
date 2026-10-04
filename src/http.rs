@@ -15289,7 +15289,7 @@ mod tests {
         assert!(html.contains("data-base-url=\"https://example.test/skin\""));
         assert!(html.contains("/admin/plugins/market/list"));
         assert!(html.contains("/admin/plugins/market/download"));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
 
         let bundled_page = super::AdminPluginMarketPage {
             site_name: "Blessing Skin".to_owned(),
@@ -15305,7 +15305,7 @@ mod tests {
         assert!(html.contains("WASM 插件市场"));
         assert!(html.contains(r#"class="content"><div class="container-fluid"></div>"#));
         assert!(html.contains("https://example.test/skin/app/app.js"));
-        assert!(html.contains("window.blessing=JSON.parse"));
+        assert!(html.contains("window.blessing = JSON.parse"));
     }
     #[test]
     fn admin_plugins_page_keeps_inline_fallback_without_frontend_bundle() {
@@ -15328,7 +15328,7 @@ mod tests {
         assert!(html.contains("plugin-migrate"));
         assert!(html.contains("id=\"download-form\""));
         assert!(html.contains("/admin/plugins/wget"));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -15351,7 +15351,7 @@ mod tests {
 
         assert!(html.contains(r#"id="verify-form""#));
         assert!(html.contains("action=\"/auth/verify/7?signature=abc\""));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -15370,7 +15370,7 @@ mod tests {
         assert!(html.contains(r#"id="bind-form""#));
         assert!(html.contains("/auth/bind"));
         assert!(html.contains("Email address"));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -15395,7 +15395,7 @@ mod tests {
         assert!(html.contains("expires=123"));
         assert!(html.contains("signature=abc"));
         assert!(html.contains("Unable to reset password."));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -15420,7 +15420,7 @@ mod tests {
 
         assert!(html.contains(r#"id="forgot-form""#));
         assert!(html.contains("/auth/captcha"));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -15449,7 +15449,7 @@ mod tests {
         assert!(html.contains(r#"id="register-form""#));
         assert!(html.contains("/auth/captcha"));
         assert!(html.contains("Player name"));
-        assert!(!html.contains("window.blessing=JSON.parse"));
+        assert!(!html.contains("window.blessing = JSON.parse"));
     }
 
     #[test]
@@ -17317,7 +17317,8 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(market_html.contains("WASM plugin market"));
+        let normalized_market_html = market_html.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_market_html.contains("WASM plugin market"));
         assert!(market_html.contains(r#"class="content"><div class="container-fluid"></div>"#));
         let encoded_market_globals = market_html
             .split("atob('")
