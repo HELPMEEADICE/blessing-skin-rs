@@ -26,28 +26,28 @@ cargo build --locked --release
 
 程序启动时会从当前工作目录读取 `.env`。旧站的 `.env` 可作为起点；将 [rust.env.example](../rust.env.example) 中的 Rust 专用项合并进去。PHP 专用项（例如 `CACHE_DRIVER`、`SESSION_DRIVER`、`QUEUE_CONNECTION`、`REDIS_*`）不会被 Rust 服务使用。 对旧 Laravel 保留值也保持兼容：`null` / `(null)` 按未配置处理，`empty` / `(empty)` 按空字符串处理；例如旧示例中的 `PLUGINS_DIR=null` 会采用 Rust 的默认插件目录。
 
-| 变量                                               | 用途与默认值                                                                                                                                   |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BS_LISTEN`                                        | 监听地址，默认 `127.0.0.1:3000`；建议仅绑定回环地址并由反向代理访问                                                                            |
-| `DB_CONNECTION`                                    | `sqlite`、`mysql`、`mariadb`、`pgsql`、`postgres` 或 `postgresql`，默认 `mysql`                                                                |
-| `DB_DATABASE`                                      | SQLite 文件路径（未设置时默认 database/database.sqlite）；MySQL/PostgreSQL 数据库名（默认 forge）                                              |
-| `DATABASE_URL`                                     | 可选的旧 Laravel 数据库 URL；设置后按 `DB_CONNECTION` 解析，并优先于独立的 `DB_HOST`、`DB_PORT`、`DB_DATABASE`、`DB_USERNAME` 和 `DB_PASSWORD` |
-| `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD` | 未设置 DATABASE_URL 时使用的 MySQL/PostgreSQL 连接参数                                                                                         |
-| `DB_SOCKET`                                        | 可选的 MySQL/MariaDB Unix socket 路径；设定后通过该 socket 连接                                                                                |
-| `DB_PREFIX`                                        | 旧表前缀，只允许 ASCII 字母、数字和下划线                                                                                                      |
-| `DB_FOREIGN_KEYS`                                  | SQLite 中设为 `false` 或 `0` 可关闭外键检查                                                                                                    |
-| `STORAGE_PATH`                                     | 默认 `storage`；Passport 公钥默认从此目录的 `oauth-public.key` 读取                                                                            |
-| `PUBLIC_PATH`                                      | 默认 `public`；提供 `app/` 前端 bundle 和其余公开静态文件；隐藏文件、`storage/` 路径和 PHP 源文件不会通过 Rust 服务                            |
-| `TEXTURES_DIR`                                     | 默认 `$STORAGE_PATH/textures`；请指向旧站实际纹理目录                                                                                          |
-| `PLUGINS_DIR`                                      | 默认 `$STORAGE_PATH/plugins`；只扫描 `.wasm` 组件，不运行 PHP 插件                                                                             |
-| `WASM_PLUGIN_REGISTRY_URL`                         | 可选；管理员插件市场使用的可信版本 1 JSON 清单 URL，必须为公网 HTTPS；未设置时市场安装功能关闭                                                 |
-| `APP_URL`                                          | 对外站点 URL，默认 `http://localhost`                                                                                                          |
-| `APP_LOCALE`                                       | 默认 `zh_CN`                                                                                                                                   |
-| `APP_KEY`                                          | 可选；新安装会在 `$STORAGE_PATH/app.key` 生成，用于签发网页登录 session。切换时用户需要重新登录                                                |
-| `PASSPORT_PUBLIC_KEY`                              | 可选；公钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-public.key`                                                             |
-| `PASSPORT_PRIVATE_KEY`                             | 签发 OAuth 令牌所需；私钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-private.key`。勿公开或更换旧私钥                         |
-| `PWD_METHOD`, `SALT`                               | 兼容旧密码格式所需设置；保留旧站的原值                                                                                                         |
-| `MAIL_MAILER`                                      | `smtp`、`log` 或 `array`；其余 SMTP 参数沿用 `MAIL_*`                                                                                          |
+| 变量                                               | 用途与默认值                                                                                                                                                     |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BS_LISTEN`                                        | 监听地址，默认 `127.0.0.1:3000`；建议仅绑定回环地址并由反向代理访问                                                                                              |
+| `DB_CONNECTION`                                    | `sqlite`、`mysql`、`mariadb`、`pgsql`、`postgres` 或 `postgresql`，默认 `mysql`                                                                                  |
+| `DB_DATABASE`                                      | SQLite 文件路径（未设置时默认 database/database.sqlite）；MySQL/PostgreSQL 数据库名（默认 forge）                                                                |
+| `DATABASE_URL`                                     | 可选的旧 Laravel 数据库 URL；设置后按 `DB_CONNECTION` 解析，并优先于独立的 `DB_HOST`、`DB_PORT`、`DB_DATABASE`、`DB_USERNAME` 和 `DB_PASSWORD`                   |
+| `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD` | 未设置 DATABASE_URL 时使用的 MySQL/PostgreSQL 连接参数                                                                                                           |
+| `DB_SOCKET`                                        | 可选的 MySQL/MariaDB Unix socket 路径；设定后通过该 socket 连接                                                                                                  |
+| `DB_PREFIX`                                        | 旧表前缀，只允许 ASCII 字母、数字和下划线                                                                                                                        |
+| `DB_FOREIGN_KEYS`                                  | SQLite 中设为 `false` 或 `0` 可关闭外键检查                                                                                                                      |
+| `STORAGE_PATH`                                     | 默认 `storage`；Passport 公钥默认从此目录的 `oauth-public.key` 读取                                                                                              |
+| `PUBLIC_PATH`                                      | 默认 `public`；提供 `app/` 前端 bundle 和其余公开静态文件；隐藏文件、`storage/` 路径和 PHP 源文件不会通过 Rust 服务                                              |
+| `TEXTURES_DIR`                                     | 默认 `$STORAGE_PATH/textures`；请指向旧站实际纹理目录                                                                                                            |
+| `PLUGINS_DIR`                                      | 默认 `$STORAGE_PATH/plugins`；只扫描 `.wasm` 组件，不运行 PHP 插件                                                                                               |
+| `WASM_PLUGIN_REGISTRY_URL`                         | 可选；管理员插件市场使用的可信版本 1 JSON 清单 URL，必须为公网 HTTPS；未设置时市场安装功能关闭                                                                   |
+| `APP_URL`                                          | 对外站点 URL，默认 `http://localhost`                                                                                                                            |
+| `APP_LOCALE`                                       | 默认 `zh_CN`                                                                                                                                                     |
+| `APP_KEY`                                          | 可选；新安装会在 `$STORAGE_PATH/app.key` 生成，用于签发网页登录 session。切换时用户需要重新登录                                                                  |
+| `PASSPORT_PUBLIC_KEY`                              | 可选；公钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-public.key`                                                                               |
+| `PASSPORT_PRIVATE_KEY`                             | 签发 OAuth 令牌所需；私钥文本或 `file:///绝对路径`。未设置时读取 `$STORAGE_PATH/oauth-private.key`。勿公开或更换旧私钥                                           |
+| `PWD_METHOD`, `SALT`                               | 兼容旧密码格式所需设置；保留旧站的原值                                                                                                                           |
+| `MAIL_MAILER`, `MAIL_*`                            | `MAIL_MAILER` 支持 `smtp`、`log`、`array`，默认 `smtp`；其余邮件配置未设置时沿用 Laravel 默认值（`smtp.mailgun.org:587`、`tls`、`hello@example.com`、`Example`） |
 
 Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password` 与 `refresh_token` 授权，并沿用默认的一年令牌期限；密码授权需要旧数据库中有效的 `password_client`。Rust 已提供 Passport `/oauth/token` 的 password/refresh_token 授权、登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。WASM 插件市场需要通过 `WASM_PLUGIN_REGISTRY_URL` 显式配置可信注册表，契约见 [plugin-registry-v1.md](plugin-registry-v1.md)；注册表不可用时市场安装会失败关闭。
 

@@ -71,16 +71,7 @@ pub struct MailConfig {
 
 impl Default for MailConfig {
     fn default() -> Self {
-        Self {
-            mailer: String::new(),
-            host: String::new(),
-            port: 465,
-            username: None,
-            password: None,
-            encryption: String::new(),
-            from_address: "hello@example.com".to_owned(),
-            from_name: "Blessing Skin".to_owned(),
-        }
+        Self::from_values(|_| None)
     }
 }
 
@@ -169,16 +160,20 @@ impl Config {
 
 impl MailConfig {
     fn from_env() -> Self {
+        Self::from_values(legacy_env)
+    }
+
+    fn from_values(mut value: impl FnMut(&str) -> Option<String>) -> Self {
         Self {
-            mailer: legacy_env("MAIL_MAILER").unwrap_or_else(|| "smtp".to_owned()),
-            host: legacy_env("MAIL_HOST").unwrap_or_default(),
-            port: parse_port("MAIL_PORT", 465),
-            username: legacy_env("MAIL_USERNAME").filter(|value| !value.is_empty()),
-            password: legacy_env("MAIL_PASSWORD").filter(|value| !value.is_empty()),
-            encryption: legacy_env("MAIL_ENCRYPTION").unwrap_or_default(),
-            from_address: legacy_env("MAIL_FROM_ADDRESS")
+            mailer: value("MAIL_MAILER").unwrap_or_else(|| "smtp".to_owned()),
+            host: value("MAIL_HOST").unwrap_or_else(|| "smtp.mailgun.org".to_owned()),
+            port: parse_port_value(value("MAIL_PORT"), 587),
+            username: value("MAIL_USERNAME").filter(|value| !value.is_empty()),
+            password: value("MAIL_PASSWORD").filter(|value| !value.is_empty()),
+            encryption: value("MAIL_ENCRYPTION").unwrap_or_else(|| "tls".to_owned()),
+            from_address: value("MAIL_FROM_ADDRESS")
                 .unwrap_or_else(|| "hello@example.com".to_owned()),
-            from_name: legacy_env("MAIL_FROM_NAME").unwrap_or_else(|| "Blessing Skin".to_owned()),
+            from_name: value("MAIL_FROM_NAME").unwrap_or_else(|| "Example".to_owned()),
         }
     }
 }
@@ -464,7 +459,11 @@ fn sqlite_database_path(database: Option<String>) -> String {
 }
 
 fn parse_port(name: &str, default: u16) -> u16 {
-    legacy_env(name)
+    parse_port_value(legacy_env(name), default)
+}
+
+fn parse_port_value(value: Option<String>, default: u16) -> u16 {
+    value
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
@@ -478,8 +477,8 @@ fn valid_table_prefix(prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, DatabaseConfig, DatabaseConnection, is_legacy_false, mysql_connect_options,
-        parse_legacy_env_os, parse_legacy_env_value, valid_table_prefix,
+        ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
+        mysql_connect_options, parse_legacy_env_os, parse_legacy_env_value, valid_table_prefix,
     };
     use std::{ffi::OsString, path::Path};
 
@@ -534,6 +533,37 @@ mod tests {
         assert!(is_legacy_false("0"));
         assert!(!is_legacy_false("true"));
         assert!(!is_legacy_false("1"));
+    }
+
+    #[test]
+    fn mail_configuration_matches_laravel_defaults_when_unset() {
+        let mail = MailConfig::from_values(|_| None);
+        assert_eq!(mail.mailer, "smtp");
+        assert_eq!(mail.host, "smtp.mailgun.org");
+        assert_eq!(mail.port, 587);
+        assert_eq!(mail.encryption, "tls");
+        assert_eq!(mail.from_address, "hello@example.com");
+        assert_eq!(mail.from_name, "Example");
+        assert!(mail.username.is_none());
+        assert!(mail.password.is_none());
+    }
+
+    #[test]
+    fn mail_configuration_keeps_explicit_legacy_smtp_values() {
+        let mail = MailConfig::from_values(|name| match name {
+            "MAIL_MAILER" => Some("smtp".to_owned()),
+            "MAIL_HOST" => Some("mail.example.test".to_owned()),
+            "MAIL_PORT" => Some("2525".to_owned()),
+            "MAIL_USERNAME" => Some("blessing".to_owned()),
+            "MAIL_PASSWORD" => Some("secret".to_owned()),
+            "MAIL_ENCRYPTION" => Some("ssl".to_owned()),
+            _ => None,
+        });
+        assert_eq!(mail.host, "mail.example.test");
+        assert_eq!(mail.port, 2525);
+        assert_eq!(mail.encryption, "ssl");
+        assert_eq!(mail.username.as_deref(), Some("blessing"));
+        assert_eq!(mail.password.as_deref(), Some("secret"));
     }
 
     #[test]
