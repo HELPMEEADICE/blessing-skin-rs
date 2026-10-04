@@ -6190,6 +6190,7 @@ async fn web_user_reports(
 async fn web_user_report_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<UserReportsQuery>,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -6201,6 +6202,11 @@ async fn web_user_report_list(
     };
     const PER_PAGE: i64 = 10;
     let page = query.page.unwrap_or(1).max(1);
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     let (reports, total) = match user_report_page_data(
         database,
         &state.config.database.table_prefix,
@@ -6216,22 +6222,14 @@ async fn web_user_report_list(
             return unavailable();
         }
     };
-    let last_page = total
-        .saturating_add(PER_PAGE - 1)
-        .div_euclid(PER_PAGE)
-        .max(1);
-    let offset = page.saturating_sub(1).saturating_mul(PER_PAGE);
-    let from = (!reports.is_empty()).then_some(offset + 1);
-    let to = (!reports.is_empty()).then_some(offset + reports.len() as i64);
-    Json(serde_json::json!({
-        "current_page": page,
-        "data": reports,
-        "last_page": last_page,
-        "per_page": PER_PAGE,
-        "from": from,
-        "to": to,
-        "total": total,
-    }))
+    Json(legacy_paginator_json(
+        reports,
+        total,
+        page,
+        PER_PAGE,
+        &path,
+        uri.query(),
+    ))
     .into_response()
 }
 
@@ -12030,7 +12028,7 @@ async fn skinlib_list(
     );
     if uploader_filter.is_some() && uploader.is_none() {
         return Json(legacy_paginator_json(
-            Vec::new(),
+            Vec::<serde_json::Value>::new(),
             0,
             page,
             per_page,
@@ -12075,8 +12073,8 @@ async fn skinlib_list(
     }
 }
 
-fn legacy_paginator_json(
-    data: Vec<serde_json::Value>,
+fn legacy_paginator_json<T: Serialize>(
+    data: Vec<T>,
     total: i64,
     page: i64,
     per_page: i64,
@@ -13849,6 +13847,7 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
 async fn admin_report_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminReportListQuery>,
 ) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
@@ -13857,11 +13856,18 @@ async fn admin_report_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, user_id)
         .await
     {
-        Ok(Some(user)) if user.permission >= 1 => admin_reports_response(&state, query).await,
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_reports_response(&state, query, &path, uri.query()).await
+        }
         Ok(Some(_)) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "message": "This action is unauthorized." })),
@@ -13878,6 +13884,7 @@ async fn admin_report_list(
 async fn api_admin_report_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminReportListQuery>,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -13890,11 +13897,18 @@ async fn api_admin_report_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, identity.user_id)
         .await
     {
-        Ok(Some(user)) if user.permission >= 1 => admin_reports_response(&state, query).await,
+        Ok(Some(user)) if user.permission >= 1 => {
+            admin_reports_response(&state, query, &path, uri.query()).await
+        }
         Ok(Some(_)) | Ok(None) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "message": "This action is unauthorized." })),
@@ -14348,7 +14362,12 @@ async fn read_bool_option(
         .unwrap_or(default))
 }
 
-async fn admin_reports_response(state: &AppState, query: AdminReportListQuery) -> Response {
+async fn admin_reports_response(
+    state: &AppState,
+    query: AdminReportListQuery,
+    path: &str,
+    raw_query: Option<&str>,
+) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -14371,19 +14390,9 @@ async fn admin_reports_response(state: &AppState, query: AdminReportListQuery) -
                 .into_iter()
                 .map(report_management_json)
                 .collect::<Vec<_>>();
-            let last_page = total.saturating_add(PER_PAGE - 1) / PER_PAGE;
-            let offset = page.saturating_sub(1).saturating_mul(PER_PAGE);
-            let from = (!data.is_empty()).then_some(offset + 1);
-            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
-            Json(serde_json::json!({
-                "current_page": page,
-                "data": data,
-                "last_page": last_page.max(1),
-                "per_page": PER_PAGE,
-                "from": from,
-                "to": to,
-                "total": total
-            }))
+            Json(legacy_paginator_json(
+                data, total, page, PER_PAGE, path, raw_query,
+            ))
             .into_response()
         }
         Err(error) => {
@@ -16087,7 +16096,7 @@ mod tests {
     #[test]
     fn skinlib_paginator_preserves_query_and_builds_page_window() {
         let paginator = super::legacy_paginator_json(
-            Vec::new(),
+            Vec::<serde_json::Value>::new(),
             2_000,
             50,
             20,
@@ -19181,6 +19190,20 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(tracked_report_list["data"].as_array().unwrap().len(), 1);
+        assert_eq!(tracked_report_list["per_page"], 10);
+        assert!(
+            tracked_report_list["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/user/reports/list")
+        );
+        assert!(
+            tracked_report_list["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/user/reports/list?page=1")
+        );
+        assert!(tracked_report_list["links"].as_array().is_some());
         sqlx::query("DELETE FROM reports WHERE reason IN ('my tracked report','another user private report')")
             .execute(&pool)
             .await
@@ -20960,6 +20983,20 @@ mod tests {
         assert_eq!(report_page["data"][0]["tid"], 2);
         assert_eq!(report_page["data"][0]["texture"]["hash"], "reported-hash");
         assert_eq!(report_page["data"][0]["informer"]["ip"], "");
+        assert_eq!(report_page["per_page"], 9);
+        assert!(
+            report_page["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/reports/list")
+        );
+        assert!(
+            report_page["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/reports/list?q=status%3A0+sort%3A-report_at&page=1")
+        );
+        assert!(report_page["links"].as_array().is_some());
 
         let rejected = app
             .clone()
