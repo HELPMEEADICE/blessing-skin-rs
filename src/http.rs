@@ -15315,9 +15315,12 @@ fn header_has_etag(headers: &HeaderMap, etag: &str) -> bool {
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|item| item.trim() == "*" || item.trim() == etag)
+            let response_tag = etag.strip_prefix("W/").unwrap_or(etag);
+            value.split(',').any(|item| {
+                let request_tag = item.trim();
+                request_tag == "*"
+                    || request_tag.strip_prefix("W/").unwrap_or(request_tag) == response_tag
+            })
         })
 }
 
@@ -16646,6 +16649,27 @@ mod tests {
     #[test]
     fn uses_content_md5_for_legacy_texture_etags() {
         assert_eq!(content_etag(b"abc"), "\"900150983cd24fb0d6963f7d28e17f72\"");
+    }
+
+    #[test]
+    fn weak_if_none_match_values_match_legacy_image_etags() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("\"older\", W/\"current\""),
+        );
+        assert!(super::header_has_etag(&headers, "\"current\""));
+
+        headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("W/\"older\""),
+        );
+        assert!(!super::header_has_etag(&headers, "\"current\""));
+        headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("*"),
+        );
+        assert!(super::header_has_etag(&headers, "\"current\""));
     }
 
     #[tokio::test]
