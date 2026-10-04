@@ -18664,7 +18664,8 @@ mod tests {
         .unwrap();
         assert!(update_html.contains("Rust service releases"));
         assert!(update_html.contains("Current version"));
-        assert!(update_html.contains("Release checks are disabled."));
+        let normalized_update_html = update_html.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_update_html.contains("Release checks are disabled."));
         assert!(update_html.contains("https://github.com/HELPMEEADICE/blessing-skin-rs/releases"));
         assert!(update_html.contains("storage"));
         let update_download =
