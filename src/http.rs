@@ -14070,7 +14070,7 @@ async fn preview_by_texture(
     let Some(tid) = tid.parse::<i64>().ok() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    preview_for_texture(&state, tid, &query, &request_headers).await
+    preview_for_texture(&state, tid, &query, &request_headers, true).await
 }
 
 async fn preview_by_hash(
@@ -14096,7 +14096,7 @@ async fn preview_by_hash(
             return unavailable();
         }
     };
-    preview_for_texture(&state, tid, &query, &request_headers).await
+    preview_for_texture(&state, tid, &query, &request_headers, false).await
 }
 
 async fn preview_for_texture(
@@ -14104,6 +14104,7 @@ async fn preview_for_texture(
     tid: i64,
     query: &HashMap<String, String>,
     request_headers: &HeaderMap,
+    http_cache: bool,
 ) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -14141,6 +14142,7 @@ async fn preview_for_texture(
             if use_png { "image/png" } else { "image/webp" },
             ttl,
             request_headers,
+            http_cache,
         );
     }
     let mut source = match tokio::fs::read(path).await {
@@ -14199,6 +14201,7 @@ async fn preview_for_texture(
         if use_png { "image/png" } else { "image/webp" },
         ttl,
         request_headers,
+        http_cache,
     )
 }
 
@@ -14252,7 +14255,7 @@ async fn avatar_by_player(
         .skin_hash
         .zip(profile.skin_type)
         .map(|(hash, texture_type)| AvatarSource { hash, texture_type });
-    render_avatar_response(&state, source, &query, &request_headers).await
+    render_avatar_response(&state, source, &query, &request_headers, true).await
 }
 
 async fn avatar_by_user(
@@ -14295,7 +14298,7 @@ async fn avatar_by_user(
         },
         None => None,
     };
-    render_avatar_response(&state, source, &query, &request_headers).await
+    render_avatar_response(&state, source, &query, &request_headers, true).await
 }
 
 async fn avatar_by_hash(
@@ -14335,7 +14338,7 @@ async fn avatar_by_hash(
     } else {
         None
     };
-    render_avatar_response(&state, source, &query, &request_headers).await
+    render_avatar_response(&state, source, &query, &request_headers, false).await
 }
 
 async fn avatar_by_texture(
@@ -14364,7 +14367,7 @@ async fn avatar_by_texture(
             return unavailable();
         }
     };
-    render_avatar_response(&state, source, &query, &request_headers).await
+    render_avatar_response(&state, source, &query, &request_headers, true).await
 }
 
 async fn render_avatar_response(
@@ -14372,6 +14375,7 @@ async fn render_avatar_response(
     source: Option<AvatarSource>,
     query: &HashMap<String, String>,
     request_headers: &HeaderMap,
+    http_cache: bool,
 ) -> Response {
     let three_d = query.contains_key("3d");
     let size = query
@@ -14411,6 +14415,7 @@ async fn render_avatar_response(
                             if use_png { "image/png" } else { "image/webp" },
                             ttl,
                             request_headers,
+                            http_cache,
                         );
                     }
                     if let Ok(bytes) = tokio::fs::read(path).await {
@@ -14458,6 +14463,7 @@ async fn render_avatar_response(
         if use_png { "image/png" } else { "image/webp" },
         ttl,
         request_headers,
+        http_cache,
     )
 }
 
@@ -14568,6 +14574,7 @@ fn image_response(
     content_type: &str,
     ttl: u64,
     request_headers: &HeaderMap,
+    http_cache: bool,
 ) -> Response {
     let CachedImage {
         body,
@@ -14576,11 +14583,20 @@ fn image_response(
     } = cached;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
-    headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
-    );
+    if http_cache {
+        headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_str(&format!("public, max-age={ttl}")).unwrap(),
+        );
+    } else {
+        let policy = if modified.is_some() {
+            "private, must-revalidate"
+        } else {
+            "no-cache, private"
+        };
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
     headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&body.len().to_string()).unwrap(),
@@ -14591,9 +14607,11 @@ fn image_response(
             HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
         );
     }
-    if (request_headers.contains_key(IF_NONE_MATCH) && header_has_etag(request_headers, &etag))
-        || (!request_headers.contains_key(IF_NONE_MATCH)
-            && modified.is_some_and(|time| not_modified_since(request_headers, time)))
+    if http_cache
+        && ((request_headers.contains_key(IF_NONE_MATCH)
+            && header_has_etag(request_headers, &etag))
+            || (!request_headers.contains_key(IF_NONE_MATCH)
+                && modified.is_some_and(|time| not_modified_since(request_headers, time))))
     {
         let mut response = StatusCode::NOT_MODIFIED.into_response();
         *response.headers_mut() = headers;
@@ -20019,12 +20037,32 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/preview/hash/{preview_cape_hash}?png&height=160"))
+                    .header(axum::http::header::IF_NONE_MATCH, "*")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(cape_preview.status(), StatusCode::OK);
+        assert!(
+            cape_preview
+                .headers()
+                .get(axum::http::header::ETAG)
+                .is_none()
+        );
+        assert_eq!(
+            cape_preview
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "private, must-revalidate"
+        );
+        assert!(
+            cape_preview
+                .headers()
+                .get(axum::http::header::LAST_MODIFIED)
+                .is_some()
+        );
         let cape_preview_bytes = to_bytes(cape_preview.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -20033,6 +20071,37 @@ mod tests {
         assert_eq!(
             (decoded_cape_preview.width(), decoded_cape_preview.height()),
             (100, 160)
+        );
+        let avatar_by_hash = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/avatar/hash/{preview_skin_hash}?png&size=64"))
+                    .header(axum::http::header::IF_NONE_MATCH, "*")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(avatar_by_hash.status(), StatusCode::OK);
+        assert!(
+            avatar_by_hash
+                .headers()
+                .get(axum::http::header::ETAG)
+                .is_none()
+        );
+        assert_eq!(
+            avatar_by_hash
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "private, must-revalidate"
+        );
+        assert!(
+            avatar_by_hash
+                .headers()
+                .get(axum::http::header::LAST_MODIFIED)
+                .is_some()
         );
         std::fs::remove_dir_all(&texture_test_dir).unwrap();
 
