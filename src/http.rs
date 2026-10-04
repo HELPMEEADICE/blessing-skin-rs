@@ -4177,6 +4177,7 @@ async fn web_admin_translations(
 async fn web_admin_language_lines(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminTranslationsQuery>,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -4191,6 +4192,11 @@ async fn web_admin_language_lines(
     };
     const PER_PAGE: i64 = 10;
     let page = query.page.unwrap_or(1).max(1);
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     let (lines, total) = match database
         .language_lines_page(&state.config.database.table_prefix, page, PER_PAGE)
         .await
@@ -4218,50 +4224,16 @@ async fn web_admin_language_lines(
             })
         })
         .collect::<Vec<_>>();
-    let last_page = (total.saturating_add(PER_PAGE - 1) / PER_PAGE).max(1);
-    let from = if data.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!((page - 1).saturating_mul(PER_PAGE) + 1)
-    };
-    let to = if data.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!((page - 1).saturating_mul(PER_PAGE) + data.len() as i64)
-    };
-    let page_url = |number: i64| format!("/admin/i18n/list?page={number}");
-    let previous = if page > 1 {
-        Some(page_url(page - 1))
-    } else {
-        None
-    };
-    let next = if page < last_page {
-        Some(page_url(page + 1))
-    } else {
-        None
-    };
-    Json(serde_json::json!({
-        "current_page": page,
-        "data": data,
-        "first_page_url": page_url(1),
-        "from": from,
-        "last_page": last_page,
-        "last_page_url": page_url(last_page),
-        "links": [
-            { "url": previous, "label": "&laquo; Previous", "active": false },
-            { "url": page_url(page), "label": page.to_string(), "active": true },
-            { "url": next, "label": "Next &raquo;", "active": false }
-        ],
-        "next_page_url": next,
-        "path": "/admin/i18n/list",
-        "per_page": PER_PAGE,
-        "prev_page_url": previous,
-        "to": to,
-        "total": total
-    }))
+    Json(legacy_paginator_json(
+        data,
+        total,
+        page,
+        PER_PAGE,
+        &path,
+        uri.query(),
+    ))
     .into_response()
 }
-
 async fn web_create_language_line(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -12758,6 +12730,7 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
 async fn admin_player_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminPlayerListQuery>,
 ) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
@@ -12766,12 +12739,17 @@ async fn admin_player_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, user_id)
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_players_response(&state, query, "/admin/players/list").await
+            admin_players_response(&state, query, &path, uri.query()).await
         }
         Ok(Some(_)) => forbidden_action(),
         Ok(None) => Redirect::to("/auth/login").into_response(),
@@ -12785,6 +12763,7 @@ async fn admin_player_list(
 async fn api_admin_player_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminPlayerListQuery>,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -12797,12 +12776,17 @@ async fn api_admin_player_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, identity.user_id)
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_players_response(&state, query, "/api/admin/players").await
+            admin_players_response(&state, query, &path, uri.query()).await
         }
         Ok(Some(_)) | Ok(None) => forbidden_action(),
         Err(error) => {
@@ -12811,11 +12795,11 @@ async fn api_admin_player_list(
         }
     }
 }
-
 async fn admin_players_response(
     state: &AppState,
     query: AdminPlayerListQuery,
     path: &str,
+    raw_query: Option<&str>,
 ) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -12838,44 +12822,11 @@ async fn admin_players_response(
             return unavailable();
         }
     };
-    let last_page = (total.saturating_add(per_page - 1) / per_page).max(1);
-    let first_page_url = admin_users_page_url(path, query.q.as_deref(), 1);
-    let last_page_url = admin_users_page_url(path, query.q.as_deref(), last_page);
-    let prev_page_url =
-        (page > 1).then(|| admin_users_page_url(path, query.q.as_deref(), page - 1));
-    let next_page_url =
-        (page < last_page).then(|| admin_users_page_url(path, query.q.as_deref(), page + 1));
-    let from = (!players.is_empty()).then_some(offset + 1);
-    let to = (!players.is_empty()).then_some(offset + players.len() as i64);
-    let mut links = vec![
-        serde_json::json!({"url": prev_page_url, "label": "&laquo; Previous", "active": false}),
-    ];
-    for number in 1..=last_page.min(100) {
-        links.push(serde_json::json!({
-            "url": admin_users_page_url(path, query.q.as_deref(), number),
-            "label": number.to_string(),
-            "active": number == page
-        }));
-    }
-    links.push(serde_json::json!({"url": next_page_url, "label": "Next &raquo;", "active": false}));
-    Json(serde_json::json!({
-        "current_page": page,
-        "data": players,
-        "first_page_url": first_page_url,
-        "from": from,
-        "last_page": last_page,
-        "last_page_url": last_page_url,
-        "links": links,
-        "next_page_url": next_page_url,
-        "path": path,
-        "per_page": per_page,
-        "prev_page_url": prev_page_url,
-        "to": to,
-        "total": total
-    }))
+    Json(legacy_paginator_json(
+        players, total, page, per_page, path, raw_query,
+    ))
     .into_response()
 }
-
 #[derive(Clone, Copy)]
 enum AdminPlayerMutation {
     Name,
@@ -13340,6 +13291,7 @@ async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap)
 async fn admin_user_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminUserListQuery>,
 ) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
@@ -13348,12 +13300,17 @@ async fn admin_user_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, user_id)
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_users_response(&state, query, "/admin/users/list").await
+            admin_users_response(&state, query, &path, uri.query()).await
         }
         Ok(Some(_)) => forbidden_action(),
         Ok(None) => Redirect::to("/auth/login").into_response(),
@@ -13367,6 +13324,7 @@ async fn admin_user_list(
 async fn api_admin_user_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<AdminUserListQuery>,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -13379,12 +13337,17 @@ async fn api_admin_user_list(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .user_profile(&state.config.database.table_prefix, identity.user_id)
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_users_response(&state, query, "/api/admin/users").await
+            admin_users_response(&state, query, &path, uri.query()).await
         }
         Ok(Some(_)) | Ok(None) => forbidden_action(),
         Err(error) => {
@@ -13393,8 +13356,12 @@ async fn api_admin_user_list(
         }
     }
 }
-
-async fn admin_users_response(state: &AppState, query: AdminUserListQuery, path: &str) -> Response {
+async fn admin_users_response(
+    state: &AppState,
+    query: AdminUserListQuery,
+    path: &str,
+    raw_query: Option<&str>,
+) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -13416,64 +13383,11 @@ async fn admin_users_response(state: &AppState, query: AdminUserListQuery, path:
             return unavailable();
         }
     };
-    let last_page = (total.saturating_add(per_page - 1) / per_page).max(1);
-    let first_page_url = admin_users_page_url(path, query.q.as_deref(), 1);
-    let last_page_url = admin_users_page_url(path, query.q.as_deref(), last_page);
-    let prev_page_url =
-        (page > 1).then(|| admin_users_page_url(path, query.q.as_deref(), page - 1));
-    let next_page_url =
-        (page < last_page).then(|| admin_users_page_url(path, query.q.as_deref(), page + 1));
-    let from = (!users.is_empty()).then_some(offset + 1);
-    let to = (!users.is_empty()).then_some(offset + users.len() as i64);
-    let mut links = vec![
-        serde_json::json!({"url": prev_page_url, "label": "&laquo; Previous", "active": false}),
-    ];
-    for number in 1..=last_page.min(100) {
-        links.push(serde_json::json!({
-            "url": admin_users_page_url(path, query.q.as_deref(), number),
-            "label": number.to_string(),
-            "active": number == page
-        }));
-    }
-    links.push(serde_json::json!({"url": next_page_url, "label": "Next &raquo;", "active": false}));
-    Json(serde_json::json!({
-        "current_page": page,
-        "data": users,
-        "first_page_url": first_page_url,
-        "from": from,
-        "last_page": last_page,
-        "last_page_url": last_page_url,
-        "links": links,
-        "next_page_url": next_page_url,
-        "path": path,
-        "per_page": per_page,
-        "prev_page_url": prev_page_url,
-        "to": to,
-        "total": total
-    }))
+    Json(legacy_paginator_json(
+        users, total, page, per_page, path, raw_query,
+    ))
     .into_response()
 }
-
-fn admin_users_page_url(path: &str, query: Option<&str>, page: i64) -> String {
-    let mut params = vec![format!("page={page}")];
-    if let Some(query) = query.filter(|query| !query.is_empty()) {
-        params.push(format!("q={}", encode_query_value(query)));
-    }
-    format!("{path}?{}", params.join("&"))
-}
-
-fn encode_query_value(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 fn forbidden_action() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -18717,6 +18631,15 @@ mod tests {
         assert_eq!(list["total"], 1);
         assert_eq!(list["data"][0]["group"], "front-end");
         assert_eq!(list["data"][0]["key"], "nav.home");
+        assert_eq!(list["per_page"], 10);
+        assert!(list["path"].as_str().unwrap().ends_with("/admin/i18n/list"));
+        assert!(
+            list["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/i18n/list?page=1")
+        );
+        assert!(list["links"].as_array().is_some());
         let line_id = list["data"][0]["id"].as_i64().unwrap();
         sqlx::query(
             "UPDATE language_lines SET text = '{\"en\":\"Home\",\"fr\":\"Accueil\"}' WHERE id = ?",
@@ -20770,6 +20693,20 @@ mod tests {
         assert_eq!(managed_players["total"], 1);
         assert_eq!(managed_players["data"][0]["pid"], 3);
         assert_eq!(managed_players["data"][0]["uid"], 7);
+        assert_eq!(managed_players["per_page"], 10);
+        assert!(
+            managed_players["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/players/list")
+        );
+        assert!(
+            managed_players["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/players/list?q=name%3AAlex&page=1")
+        );
+        assert!(managed_players["links"].as_array().is_some());
 
         sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (13,'Admin texture','alex','admin-hash',8,7,1,'2026-10-01 10:05:00',0)")
             .execute(&pool)
@@ -20940,6 +20877,20 @@ mod tests {
         assert_eq!(users["data"][0]["email"], "alex@example.test");
         assert_eq!(users["data"][0]["ip"], "");
         assert!(users["data"][0].get("password").is_none());
+        assert_eq!(users["per_page"], 10);
+        assert!(
+            users["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/users/list")
+        );
+        assert!(
+            users["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/users/list?q=alex&page=1")
+        );
+        assert!(users["links"].as_array().is_some());
 
         let combined_user_filter = app
             .clone()
@@ -20962,6 +20913,12 @@ mod tests {
         assert_eq!(combined_user_filter["total"], 2);
         assert_eq!(combined_user_filter["data"][0]["uid"], 7);
         assert_eq!(combined_user_filter["data"][1]["uid"], 8);
+        assert!(
+            combined_user_filter["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/admin/users/list?q=email%3Aalex%40example.test+or+uid%3A8&page=1")
+        );
 
         let reports = app
             .clone()
