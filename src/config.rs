@@ -53,6 +53,7 @@ pub struct Config {
     pub passport_private_key: Option<Vec<u8>>,
     pub password_method: String,
     pub password_salt: String,
+    pub bcrypt_rounds: u32,
     pub app_key: Option<String>,
     pub mail: MailConfig,
 }
@@ -150,6 +151,7 @@ impl Config {
             ),
             password_method: legacy_env("PWD_METHOD").unwrap_or_else(|| "BCRYPT".to_owned()),
             password_salt: legacy_env("SALT").unwrap_or_default(),
+            bcrypt_rounds: parse_bcrypt_rounds(legacy_env("BCRYPT_ROUNDS")),
             app_key: legacy_env("APP_KEY")
                 .filter(|value| !value.is_empty())
                 .or_else(|| std::fs::read_to_string(storage.join("app.key")).ok())
@@ -468,6 +470,10 @@ fn with_mysql_ssl_ca(
     }
 }
 
+fn parse_bcrypt_rounds(value: Option<String>) -> u32 {
+    value.and_then(|rounds| rounds.parse().ok()).unwrap_or(10)
+}
+
 fn parse_setup_port(value: &str, default: u16) -> Result<u16, ConfigError> {
     if value.trim().is_empty() {
         return Ok(default);
@@ -505,8 +511,8 @@ fn valid_table_prefix(prefix: &str) -> bool {
 mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
-        mysql_connect_options, parse_legacy_env_os, parse_legacy_env_value, valid_table_prefix,
-        with_mysql_ssl_ca,
+        mysql_connect_options, parse_bcrypt_rounds, parse_legacy_env_os, parse_legacy_env_value,
+        valid_table_prefix, with_mysql_ssl_ca,
     };
     use sqlx::{ConnectOptions, mysql::MySqlConnectOptions};
     use std::{ffi::OsString, path::Path};
@@ -621,6 +627,13 @@ mod tests {
             super::sqlite_database_path(Some("storage/custom.sqlite".to_owned())),
             "storage/custom.sqlite"
         );
+    }
+
+    #[test]
+    fn parses_bcrypt_rounds_with_the_laravel_default() {
+        assert_eq!(parse_bcrypt_rounds(None), 10);
+        assert_eq!(parse_bcrypt_rounds(Some("12".to_owned())), 12);
+        assert_eq!(parse_bcrypt_rounds(Some("not-an-integer".to_owned())), 10);
     }
 
     #[test]

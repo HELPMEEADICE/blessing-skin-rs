@@ -97,9 +97,13 @@ pub async fn install_with_details(
     if site_name.trim().is_empty() || site_name.chars().any(char::is_control) {
         return Err(InstallError::InvalidInput("site name"));
     }
-    let password_hash =
-        hash_legacy_password(password, &config.password_method, &config.password_salt)
-            .ok_or(InstallError::UnsupportedPasswordMethod)?;
+    let password_hash = hash_legacy_password(
+        password,
+        &config.password_method,
+        &config.password_salt,
+        config.bcrypt_rounds,
+    )
+    .ok_or(InstallError::UnsupportedPasswordMethod)?;
     let admin = Admin {
         email: email.to_owned(),
         nickname: nickname.to_owned(),
@@ -630,7 +634,7 @@ mod tests {
         seed_options(&pool, "bs_", "Test Skin", "https://skin.example")
             .await
             .unwrap();
-        let password_hash = hash_legacy_password("correct horse", "BCRYPT", "").unwrap();
+        let password_hash = hash_legacy_password("correct horse", "BCRYPT", "", 10).unwrap();
         let admin = Admin {
             email: "admin@example.test".to_owned(),
             nickname: "Admin".to_owned(),

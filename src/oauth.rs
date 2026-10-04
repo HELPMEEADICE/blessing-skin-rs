@@ -1973,6 +1973,7 @@ mod integration_tests {
             passport_private_key: Some(private_key.to_vec()),
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
+            bcrypt_rounds: 10,
             app_key: Some(session_secret.to_owned()),
             mail: MailConfig::default(),
         };

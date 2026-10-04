@@ -2000,6 +2000,7 @@ async fn handle_password_reset(
         password,
         &state.config.password_method,
         &state.config.password_salt,
+        state.config.bcrypt_rounds,
     ) else {
         tracing::error!(method = %state.config.password_method, "configured legacy password method cannot hash passwords");
         return unavailable();
@@ -2878,6 +2879,7 @@ async fn handle_register(
         password,
         &state.config.password_method,
         &state.config.password_salt,
+        state.config.bcrypt_rounds,
     ) else {
         tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
         return unavailable();
@@ -7379,6 +7381,7 @@ async fn user_profile_update(
                 new_password,
                 &state.config.password_method,
                 &state.config.password_salt,
+                state.config.bcrypt_rounds,
             ) else {
                 tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
                 return unavailable();
@@ -12476,6 +12479,7 @@ async fn apply_admin_user_mutation(
                 password,
                 &state.config.password_method,
                 &state.config.password_salt,
+                state.config.bcrypt_rounds,
             ) else {
                 tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
                 return unavailable();
@@ -16891,6 +16895,7 @@ mod tests {
             passport_private_key: None,
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
+            bcrypt_rounds: 10,
             app_key: None,
             mail: crate::config::MailConfig::default(),
         };
@@ -17589,6 +17594,7 @@ mod tests {
             passport_private_key: None,
             password_method: "BCRYPT".to_owned(),
             password_salt: String::new(),
+            bcrypt_rounds: 10,
             app_key: Some(secret.clone()),
             mail: crate::config::MailConfig {
                 mailer: "array".to_owned(),

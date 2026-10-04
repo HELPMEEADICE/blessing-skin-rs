@@ -117,9 +117,14 @@ pub fn verify_legacy_password(password: &str, encoded: &str, method: &str, salt:
     }
 }
 
-pub fn hash_legacy_password(password: &str, method: &str, salt: &str) -> Option<String> {
+pub fn hash_legacy_password(
+    password: &str,
+    method: &str,
+    salt: &str,
+    bcrypt_rounds: u32,
+) -> Option<String> {
     match method.to_ascii_uppercase().as_str() {
-        "BCRYPT" | "PHP_PASSWORD_HASH" => bcrypt::hash(password, 10).ok(),
+        "BCRYPT" | "PHP_PASSWORD_HASH" => bcrypt::hash(password, bcrypt_rounds).ok(),
         "ARGON2I" => {
             let argon = Argon2::new(ArgonAlgorithm::Argon2i, Version::V0x13, Params::default());
             let salt = SaltString::generate(&mut rand::thread_rng());
@@ -295,14 +300,15 @@ mod tests {
 
     #[test]
     fn hashes_new_passwords_in_configured_legacy_formats() {
-        let bcrypt = super::hash_legacy_password("correct horse", "BCRYPT", "").unwrap();
+        let bcrypt = super::hash_legacy_password("correct horse", "BCRYPT", "", 4).unwrap();
+        assert_eq!(bcrypt.split('$').nth(2), Some("04"));
         assert!(super::verify_legacy_password(
             "correct horse",
             &bcrypt,
             "BCRYPT",
             ""
         ));
-        let argon = super::hash_legacy_password("correct horse", "ARGON2I", "").unwrap();
+        let argon = super::hash_legacy_password("correct horse", "ARGON2I", "", 10).unwrap();
         assert!(argon.starts_with("$argon2i$"));
         assert!(super::verify_legacy_password(
             "correct horse",
@@ -318,12 +324,13 @@ mod tests {
             "SHA512",
             "SALTED2SHA512",
         ] {
-            let hash = super::hash_legacy_password("correct horse", method, "legacy-salt").unwrap();
+            let hash =
+                super::hash_legacy_password("correct horse", method, "legacy-salt", 10).unwrap();
             assert!(
                 super::verify_legacy_password("correct horse", &hash, method, "legacy-salt"),
                 "{method}"
             );
         }
-        assert!(super::hash_legacy_password("x", "UNKNOWN", "").is_none());
+        assert!(super::hash_legacy_password("x", "UNKNOWN", "", 10).is_none());
     }
 }
