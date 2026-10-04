@@ -38,7 +38,6 @@ use rand::{
     Rng,
     distributions::{Alphanumeric, DistString},
 };
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -10906,7 +10905,7 @@ async fn upload_texture(
         }
     };
     if legacy_option_bool(Some(&name_rule)) {
-        if RegexBuilder::new(&name_rule).build().is_err() {
+        if !legacy_texture_name_rule_is_valid(&name_rule) {
             tracing::error!("invalid legacy texture name validation regex");
             return unavailable();
         }
@@ -11290,10 +11289,69 @@ fn valid_texture_name(name: &str, rule: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    !legacy_option_bool(Some(rule))
-        || RegexBuilder::new(rule)
-            .build()
-            .is_ok_and(|regex| regex.is_match(name))
+    !legacy_option_bool(Some(rule)) || legacy_texture_name_rule_matches(name, rule)
+}
+
+fn legacy_texture_name_rule_is_valid(rule: &str) -> bool {
+    !legacy_option_bool(Some(rule)) || legacy_texture_name_regex(rule).is_some()
+}
+
+fn legacy_texture_name_rule_matches(name: &str, rule: &str) -> bool {
+    let Some((regex, unicode, anchored)) = legacy_texture_name_regex(rule) else {
+        return false;
+    };
+    let match_start = if unicode {
+        regex.find(name).ok().flatten().map(|found| found.start())
+    } else {
+        regex
+            .find(name.as_bytes())
+            .ok()
+            .flatten()
+            .map(|found| found.start())
+    };
+    match_start.is_some_and(|start| !anchored || start == 0)
+}
+
+fn legacy_texture_name_regex(rule: &str) -> Option<(fancy_regex::Regex, bool, bool)> {
+    let (pattern, flags) = split_php_delimited_regex(rule).unwrap_or((rule, ""));
+    if pattern.len() > 512
+        || flags.chars().any(|flag| {
+            !matches!(
+                flag,
+                'i' | 'm' | 's' | 'x' | 'A' | 'D' | 'S' | 'U' | 'X' | 'u'
+            )
+        })
+    {
+        return None;
+    }
+
+    let pattern = if flags.contains('m') {
+        pattern.to_owned()
+    } else {
+        dollar_end_only_pattern(pattern, !flags.contains('D'))
+    };
+    let pattern = if flags.contains('U') {
+        format!("(?U){pattern}")
+    } else {
+        pattern
+    };
+    let mut builder = FancyRegexBuilder::new(&pattern);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'))
+        .ignore_whitespace(flags.contains('x'))
+        .unicode_mode(flags.contains('u'))
+        .bytes_mode(if flags.contains('u') {
+            BytesMode::Unicode
+        } else {
+            BytesMode::Ascii
+        })
+        .backtrack_limit(100_000);
+    builder
+        .build()
+        .ok()
+        .map(|regex| (regex, flags.contains('u'), flags.contains('A')))
 }
 
 fn valid_texture_type(texture_type: &str) -> bool {
@@ -11331,7 +11389,7 @@ async fn rename_texture(
         }
     };
     if legacy_option_bool(Some(&name_rule)) {
-        if RegexBuilder::new(&name_rule).build().is_err() {
+        if !legacy_texture_name_rule_is_valid(&name_rule) {
             tracing::error!("invalid legacy texture name validation regex");
             return unavailable();
         }
@@ -15841,6 +15899,15 @@ mod tests {
         assert!(!super::valid_texture_name("", ""));
         assert!(super::valid_texture_name("skin_01", "^[a-z0-9_]+$"));
         assert!(!super::valid_texture_name("Skin 01", "^[a-z0-9_]+$"));
+        assert!(super::valid_texture_name(
+            "A_skin1",
+            "/^(?=.*[A-Z])[A-Za-z0-9_]+$/"
+        ));
+        assert!(super::valid_texture_name("skinskin", r"/^(skin)\1$/"));
+        assert!(super::valid_texture_name("skin\n", "/^skin$/"));
+        assert!(super::valid_texture_name("foo/bar", r"/^foo\/bar$/"));
+        assert!(super::valid_texture_name("SKIN", "/^skin$/i"));
+        assert!(super::valid_texture_name("皮肤", "/^皮肤$/u"));
         assert!(!super::valid_texture_name("anything", "["));
     }
 
