@@ -8747,21 +8747,27 @@ mod language_line_tests {
             std::process::id(),
             rand::random::<u32>()
         );
+        // Keep this fixture aligned with the final schema produced by the legacy PHP migrations.
+        let (integer_type, timestamp_type, long_text_type) = match &database {
+            DatabasePool::Sqlite(_) => ("INTEGER", "DATETIME", "TEXT"),
+            DatabasePool::MySql(_) => ("INT UNSIGNED", "DATETIME", "LONGTEXT"),
+            DatabasePool::Postgres(_) => ("INTEGER", "TIMESTAMP", "TEXT"),
+        };
         let statements = [
             format!(
-                "CREATE TABLE {prefix}users (uid BIGINT PRIMARY KEY, email VARCHAR(100) NOT NULL, nickname VARCHAR(50) NOT NULL DEFAULT '', locale VARCHAR(255), score BIGINT NOT NULL DEFAULT 0, avatar BIGINT NOT NULL DEFAULT 0, password VARCHAR(255) NOT NULL, ip VARCHAR(45) NOT NULL DEFAULT '', permission INTEGER NOT NULL DEFAULT 0, last_sign_at TIMESTAMP NOT NULL, register_at TIMESTAMP NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, is_dark_mode BOOLEAN NOT NULL DEFAULT FALSE)"
+                "CREATE TABLE {prefix}users (uid {integer_type} PRIMARY KEY, email VARCHAR(100) NOT NULL, nickname VARCHAR(50) NOT NULL DEFAULT '', locale VARCHAR(255) NULL, score INTEGER NOT NULL, avatar INTEGER NOT NULL DEFAULT 0, password VARCHAR(255) NOT NULL, ip VARCHAR(45) NOT NULL, is_dark_mode BOOLEAN NOT NULL DEFAULT FALSE, permission INTEGER NOT NULL DEFAULT 0, last_sign_at {timestamp_type} NOT NULL, register_at {timestamp_type} NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, verification_token VARCHAR(255) NOT NULL DEFAULT '', remember_token VARCHAR(100) NULL)"
             ),
             format!(
-                "CREATE TABLE {prefix}players (pid BIGINT PRIMARY KEY, uid BIGINT NOT NULL, name VARCHAR(50) NOT NULL, tid_skin BIGINT NOT NULL DEFAULT -1, tid_cape BIGINT NOT NULL DEFAULT 0, last_modified TIMESTAMP NOT NULL)"
+                "CREATE TABLE {prefix}players (pid {integer_type} PRIMARY KEY, uid {integer_type} NOT NULL, name VARCHAR(50) NOT NULL, tid_cape INTEGER NOT NULL DEFAULT 0, last_modified {timestamp_type} NOT NULL, tid_skin INTEGER NOT NULL DEFAULT -1)"
             ),
             format!(
-                "CREATE TABLE {prefix}textures (tid BIGINT PRIMARY KEY, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size BIGINT NOT NULL, uploader BIGINT NOT NULL, public BOOLEAN NOT NULL DEFAULT FALSE, upload_at TIMESTAMP NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
+                "CREATE TABLE {prefix}textures (tid {integer_type} PRIMARY KEY, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size INTEGER NOT NULL, uploader {integer_type} NOT NULL, public BOOLEAN NOT NULL, upload_at {timestamp_type} NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
             ),
             format!(
-                "CREATE TABLE {prefix}options (id BIGINT PRIMARY KEY, option_name VARCHAR(50) NOT NULL, option_value TEXT NOT NULL)"
+                "CREATE TABLE {prefix}options (id {integer_type} PRIMARY KEY, option_name VARCHAR(50) NOT NULL, option_value {long_text_type} NOT NULL)"
             ),
             format!(
-                "CREATE TABLE {prefix}oauth_access_tokens (id VARCHAR(100) PRIMARY KEY, user_id BIGINT NULL, client_id BIGINT NOT NULL, name VARCHAR(100) NULL, scopes TEXT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP NULL, updated_at TIMESTAMP NULL, expires_at TIMESTAMP NULL)"
+                "CREATE TABLE {prefix}oauth_access_tokens (id VARCHAR(100) PRIMARY KEY, user_id BIGINT NULL, client_id BIGINT NOT NULL, name VARCHAR(100) NULL, scopes TEXT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at {timestamp_type} NULL, updated_at {timestamp_type} NULL, expires_at {timestamp_type} NULL)"
             ),
         ];
         for statement in &statements {
@@ -8789,7 +8795,7 @@ mod language_line_tests {
         execute_legacy_fixture_sql(
             &database,
             &format!(
-                "INSERT INTO {prefix}textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Legacy skin', 'alex', '0123456789abcdef0123456789abcdef', 128, 7, TRUE, '2026-09-30 12:00:00', 3)"
+                "INSERT INTO {prefix}textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (11, 'Legacy skin', 'alex', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 128, 7, TRUE, '2026-09-30 12:00:00', 3)"
             ),
         )
         .await
@@ -8798,6 +8804,14 @@ mod language_line_tests {
             &database,
             &format!(
                 "INSERT INTO {prefix}options (id, option_name, option_value) VALUES (1, 'site_name', 'Legacy Skin')"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}oauth_access_tokens (id, user_id, client_id, name, scopes, revoked, created_at, updated_at, expires_at) VALUES ('legacy-token', 7, 19, 'Legacy client', '[\"User.Read\"]', FALSE, '2026-09-30 12:00:00', '2026-09-30 12:00:00', '2037-12-31 23:59:59')"
             ),
         )
         .await
@@ -8815,11 +8829,14 @@ mod language_line_tests {
             .unwrap();
         assert_eq!(
             profile.skin_hash.as_deref(),
-            Some("0123456789abcdef0123456789abcdef")
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
         assert_eq!(
             database
-                .texture_id_by_hash(&prefix, "0123456789abcdef0123456789abcdef")
+                .texture_id_by_hash(
+                    &prefix,
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                )
                 .await
                 .unwrap(),
             Some(11)
@@ -8858,6 +8875,15 @@ mod language_line_tests {
                 .as_deref(),
             Some("Rust-backed Legacy Skin")
         );
+
+        let legacy_token = database
+            .access_token(&prefix, "legacy-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_token.user_id, Some(7));
+        assert_eq!(legacy_token.client_id, 19);
+        assert!(!legacy_token.revoked);
 
         database
             .issue_oauth_client_credentials_token(
@@ -8955,6 +8981,16 @@ mod language_line_tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_legacy_database_compatibility() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        verifies_legacy_schema_read_write(DatabasePool::Sqlite(pool)).await;
     }
 
     #[tokio::test]
