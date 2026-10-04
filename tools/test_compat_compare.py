@@ -198,5 +198,22 @@ class CompatCompareTests(unittest.TestCase):
         self.assertTrue(differences[1].startswith("body:sha256"))
 
 
+    def test_compares_content_length_for_binary_protocol_responses(self):
+        php = compat.HttpResponse(
+            200,
+            {"content-type": "image/png", "content-length": "3"},
+            b"abc",
+        )
+        rust = compat.HttpResponse(
+            200,
+            {"content-type": "image/png", "content-length": "4"},
+            b"abc",
+        )
+        self.assertEqual(
+            compat.compare_responses(php, rust, []),
+            ["header:content-length"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

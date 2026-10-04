@@ -20,6 +20,7 @@ from typing import Any
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HEADER_NAMES = (
     "content-type",
+    "content-length",
     "content-language",
     "cache-control",
     "etag",
