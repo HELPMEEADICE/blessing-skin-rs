@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
     net::IpAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,6 +56,152 @@ use crate::{
     },
     image_cache::{CachedImage, ImageCacheKey},
 };
+
+const LEGACY_API_RATE_LIMIT: u64 = 60;
+const LEGACY_API_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Default)]
+struct ApiRateLimiter {
+    state: Arc<std::sync::Mutex<ApiRateLimiterState>>,
+}
+
+#[derive(Default)]
+struct ApiRateLimiterState {
+    windows: HashMap<String, ApiRateWindow>,
+    requests_since_sweep: u64,
+}
+
+struct ApiRateWindow {
+    reset_at: Instant,
+    attempts: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ApiRateDecision {
+    allowed: bool,
+    remaining: u64,
+    retry_after: Duration,
+}
+
+impl ApiRateLimiter {
+    fn hit(&self, key: String, now: Instant) -> ApiRateDecision {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.requests_since_sweep = state.requests_since_sweep.saturating_add(1);
+        if state.requests_since_sweep >= 64 {
+            state.windows.retain(|_, window| window.reset_at > now);
+            state.requests_since_sweep = 0;
+        }
+        let window = state.windows.entry(key).or_insert_with(|| ApiRateWindow {
+            reset_at: now + LEGACY_API_RATE_WINDOW,
+            attempts: 0,
+        });
+        if now >= window.reset_at {
+            window.reset_at = now + LEGACY_API_RATE_WINDOW;
+            window.attempts = 0;
+        }
+        if window.attempts >= LEGACY_API_RATE_LIMIT {
+            return ApiRateDecision {
+                allowed: false,
+                remaining: 0,
+                retry_after: window.reset_at.saturating_duration_since(now),
+            };
+        }
+        window.attempts += 1;
+        ApiRateDecision {
+            allowed: true,
+            remaining: LEGACY_API_RATE_LIMIT - window.attempts,
+            retry_after: window.reset_at.saturating_duration_since(now),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ApiRateThrottleState {
+    passport_key: Option<jsonwebtoken::DecodingKey>,
+    limiter: ApiRateLimiter,
+}
+
+fn legacy_api_throttle_layer<S>(
+    app: Router<S>,
+    passport_key: Option<jsonwebtoken::DecodingKey>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.layer(axum::middleware::from_fn_with_state(
+        ApiRateThrottleState {
+            passport_key,
+            limiter: ApiRateLimiter::default(),
+        },
+        legacy_api_throttle,
+    ))
+}
+
+async fn legacy_api_throttle(
+    State(state): State<ApiRateThrottleState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    if path != "/api" && !path.starts_with("/api/") {
+        return next.run(request).await;
+    }
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|axum::extract::ConnectInfo(address)| address.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let user_id = if path == "/api" || path == "/api/" {
+        None
+    } else {
+        state.passport_key.as_ref().and_then(|key| {
+            bearer_token(request.headers())
+                .and_then(|token| decode_access_token(token, key))
+                .filter(|claims| claims.exp > jsonwebtoken::get_current_timestamp())
+                .and_then(|claims| claims.sub.parse::<i64>().ok())
+        })
+    };
+    let key = user_id
+        .map(|user_id| format!("user:{user_id}"))
+        .unwrap_or_else(|| format!("ip:{peer_ip}"));
+    let decision = state.limiter.hit(key, Instant::now());
+    let mut response = if decision.allowed {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "message": "Too Many Attempts." })),
+        )
+            .into_response()
+    };
+    response
+        .headers_mut()
+        .insert("x-ratelimit-limit", HeaderValue::from_static("60"));
+    response.headers_mut().insert(
+        "x-ratelimit-remaining",
+        HeaderValue::from_str(&decision.remaining.to_string()).unwrap(),
+    );
+    if !decision.allowed {
+        let retry_after = decision.retry_after.as_secs().max(1);
+        let reset_at = SystemTime::now() + Duration::from_secs(retry_after);
+        let reset_epoch = reset_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        response.headers_mut().insert(
+            "retry-after",
+            HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+        );
+        response.headers_mut().insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&reset_epoch.to_string()).unwrap(),
+        );
+    }
+    response
+}
 
 tokio::task_local! {
     static REQUEST_LOCALE: String;
@@ -317,7 +466,7 @@ async fn emit_player_textures_updated(state: &AppState, player: &PlayerRecord) {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/health/live", any(live))
         .route("/health/ready", any(ready))
         .route("/app/{*path}", get(frontend_asset))
@@ -578,8 +727,15 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             detect_locale_preference,
-        ))
-        .with_state(state)
+        ));
+    let app = if !cfg!(test)
+        && std::env::var("APP_ENV").unwrap_or_else(|_| "production".to_owned()) != "testing"
+    {
+        legacy_api_throttle_layer(app, state.passport_key.clone())
+    } else {
+        app
+    };
+    app.with_state(state)
 }
 
 #[derive(Template)]
@@ -15104,6 +15260,131 @@ mod tests {
         assert_eq!(first.as_bytes()[14], b'4');
         assert_ne!(first, second);
     }
+    #[test]
+    fn legacy_api_rate_limit_is_sixty_per_key_and_resets_after_a_minute() {
+        let limiter = super::ApiRateLimiter::default();
+        let start = std::time::Instant::now();
+        let key = "user:42".to_owned();
+        for attempt in 1..=super::LEGACY_API_RATE_LIMIT {
+            let decision = limiter.hit(key.clone(), start);
+            assert!(decision.allowed);
+            assert_eq!(decision.remaining, super::LEGACY_API_RATE_LIMIT - attempt);
+        }
+        let denied = limiter.hit(key.clone(), start);
+        assert!(!denied.allowed);
+        assert_eq!(denied.remaining, 0);
+        assert_eq!(denied.retry_after, super::LEGACY_API_RATE_WINDOW);
+        assert!(limiter.hit("ip:192.0.2.1".to_owned(), start).allowed);
+        assert!(
+            limiter
+                .hit(key, start + super::LEGACY_API_RATE_WINDOW)
+                .allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_api_throttle_returns_headers_and_limits_each_ip() {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            extract::ConnectInfo,
+            http::{Request, StatusCode},
+            routing::{any, get},
+        };
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/api", any(|| async { StatusCode::OK }))
+            .route("/health/live", get(|| async { StatusCode::OK }));
+        let app = super::legacy_api_throttle_layer(app, None);
+        let address: std::net::SocketAddr = "192.0.2.7:3210".parse().unwrap();
+        for expected_remaining in (0..super::LEGACY_API_RATE_LIMIT).rev() {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api")
+                        .extension(ConnectInfo(address))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-ratelimit-limit")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "60"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                expected_remaining.to_string()
+            );
+        }
+
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api")
+                    .extension(ConnectInfo(address))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = blocked
+            .headers()
+            .get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after));
+        assert!(blocked.headers().get("x-ratelimit-reset").is_some());
+        let body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["message"], "Too Many Attempts.");
+
+        let other_address: std::net::SocketAddr = "192.0.2.8:3210".parse().unwrap();
+        let other_client = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api")
+                    .extension(ConnectInfo(other_address))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_client.status(), StatusCode::OK);
+
+        let unrelated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/live")
+                    .extension(ConnectInfo(address))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::OK);
+        assert!(unrelated.headers().get("x-ratelimit-limit").is_none());
+    }
+
     #[test]
     fn parses_legacy_boolean_options() {
         assert!(super::legacy_option_bool(Some("true")));
