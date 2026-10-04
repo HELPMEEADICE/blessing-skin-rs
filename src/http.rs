@@ -9615,6 +9615,14 @@ fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
         .unwrap_or(if negative { i64::MIN } else { i64::MAX })
 }
 
+fn private_texture_status_code(value: Option<&str>) -> StatusCode {
+    if legacy_option_integer(value, 403) == 404 {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::FORBIDDEN
+    }
+}
+
 fn legacy_option_bool(value: Option<&str>) -> bool {
     match value.map(str::to_ascii_lowercase).as_deref() {
         Some("true" | "(true)") => true,
@@ -10029,10 +10037,7 @@ async fn skinlib_show_page(
             )
             .await
         {
-            Ok(value) => value
-                .and_then(|value| value.parse::<u16>().ok())
-                .and_then(|value| StatusCode::from_u16(value).ok())
-                .unwrap_or(StatusCode::FORBIDDEN),
+            Ok(value) => private_texture_status_code(value.as_deref()),
             Err(error) => {
                 tracing::error!(%error, "failed to read private texture status option");
                 return unavailable();
@@ -10334,22 +10339,19 @@ async fn skinlib_info(
         None => (None, false),
     };
     if !texture.is_public && user_id != Some(texture.uploader) && !is_admin {
-        let status_code = match database
+        let status = match database
             .option(
                 &state.config.database.table_prefix,
                 "status_code_for_private",
             )
             .await
         {
-            Ok(value) => value.and_then(|value| value.parse::<u16>().ok()),
+            Ok(value) => private_texture_status_code(value.as_deref()),
             Err(error) => {
                 tracing::error!(%error, "failed to read private texture status option");
                 return unavailable();
             }
         };
-        let status = status_code
-            .and_then(|code| StatusCode::from_u16(code).ok())
-            .unwrap_or(StatusCode::FORBIDDEN);
         let message = if request_locale(&state).starts_with("zh") {
             if status == StatusCode::NOT_FOUND {
                 "请求的材质文件已经被删除"
@@ -19128,6 +19130,29 @@ mod tests {
         let hidden_texture =
             session_request(&app, &registered_cookie, "GET", "/skinlib/show/21", None).await;
         assert_eq!(hidden_texture.status(), StatusCode::FORBIDDEN);
+        sqlx::query("INSERT OR REPLACE INTO options (option_name, option_value) VALUES ('status_code_for_private', '410')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let hidden_texture =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/show/21", None).await;
+        assert_eq!(hidden_texture.status(), StatusCode::FORBIDDEN);
+        let hidden_texture_info =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/info/21", None).await;
+        assert_eq!(hidden_texture_info.status(), StatusCode::FORBIDDEN);
+
+        sqlx::query(
+            "UPDATE options SET option_value = '404' WHERE option_name = 'status_code_for_private'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deleted_texture =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/show/21", None).await;
+        assert_eq!(deleted_texture.status(), StatusCode::NOT_FOUND);
+        let deleted_texture_info =
+            session_request(&app, &registered_cookie, "GET", "/skinlib/info/21", None).await;
+        assert_eq!(deleted_texture_info.status(), StatusCode::NOT_FOUND);
 
         sqlx::query(
             "UPDATE options SET option_value = '100' WHERE option_name = 'score_per_player'",
