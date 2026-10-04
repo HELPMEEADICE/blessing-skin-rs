@@ -808,6 +808,211 @@ impl DatabasePool {
         Ok(())
     }
 
+    pub async fn ensure_web_session_revocations_schema(
+        &self,
+        prefix: &str,
+    ) -> Result<(), sqlx::Error> {
+        let session_hash_type = match self {
+            Self::MySql(_) => "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin",
+            Self::Sqlite(_) | Self::Postgres(_) => "VARCHAR(64)",
+        };
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {prefix}rust_web_session_revocations (session_hash {session_hash_type} NOT NULL PRIMARY KEY, expires_at BIGINT NOT NULL)"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn active_web_session_revocations(
+        &self,
+        prefix: &str,
+        now: i64,
+    ) -> Result<Vec<(String, u64)>, sqlx::Error> {
+        let marker = if matches!(self, Self::Postgres(_)) {
+            "$1"
+        } else {
+            "?"
+        };
+        let delete_sql = format!(
+            "DELETE FROM {prefix}rust_web_session_revocations WHERE expires_at <= {marker}"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        let sql = format!(
+            "SELECT session_hash, expires_at FROM {prefix}rust_web_session_revocations WHERE expires_at > {marker} ORDER BY session_hash"
+        );
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|(session_hash, expires_at)| {
+                u64::try_from(expires_at)
+                    .ok()
+                    .map(|expires_at| (session_hash, expires_at))
+            })
+            .collect())
+    }
+
+    pub async fn web_session_is_revoked(
+        &self,
+        prefix: &str,
+        session_hash: &str,
+        now: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let marker = if matches!(self, Self::Postgres(_)) {
+            "$1"
+        } else {
+            "?"
+        };
+        let sql = format!(
+            "SELECT expires_at FROM {prefix}rust_web_session_revocations WHERE session_hash = {marker}"
+        );
+        let expires_at = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::MySql(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(expires_at.is_some_and(|expires_at| expires_at > now))
+    }
+
+    pub async fn revoke_web_session(
+        &self,
+        prefix: &str,
+        session_hash: &str,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        match self {
+            Self::Sqlite(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}rust_web_session_revocations (session_hash, expires_at) VALUES (?, ?) ON CONFLICT(session_hash) DO UPDATE SET expires_at = excluded.expires_at"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}rust_web_session_revocations (session_hash, expires_at) VALUES (?, ?) ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                let sql = format!(
+                    "INSERT INTO {prefix}rust_web_session_revocations (session_hash, expires_at) VALUES ($1, $2) ON CONFLICT (session_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(session_hash)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_expired_web_session_revocations(
+        &self,
+        prefix: &str,
+        now: i64,
+    ) -> Result<(), sqlx::Error> {
+        let marker = if matches!(self, Self::Postgres(_)) {
+            "$1"
+        } else {
+            "?"
+        };
+        let sql = format!(
+            "DELETE FROM {prefix}rust_web_session_revocations WHERE expires_at <= {marker}"
+        );
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn ensure_wasm_plugin_state_schema(&self, prefix: &str) -> Result<(), sqlx::Error> {
         let value_type = match self {
             Self::Sqlite(_) => "BLOB",
@@ -8968,6 +9173,70 @@ mod language_line_tests {
         assert!(!machine_token.revoked);
 
         database
+            .ensure_web_session_revocations_schema(&prefix)
+            .await
+            .unwrap();
+        database
+            .ensure_web_session_revocations_schema(&prefix)
+            .await
+            .unwrap();
+        database
+            .revoke_web_session(&prefix, &"a".repeat(64), 200)
+            .await
+            .unwrap();
+        database
+            .revoke_web_session(&prefix, &"b".repeat(64), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .active_web_session_revocations(&prefix, 150)
+                .await
+                .unwrap(),
+            vec![("a".repeat(64), 200)]
+        );
+        assert!(
+            database
+                .web_session_is_revoked(&prefix, &"a".repeat(64), 150)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .web_session_is_revoked(&prefix, &"a".repeat(64), 200)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .web_session_is_revoked(&prefix, &"c".repeat(64), 150)
+                .await
+                .unwrap()
+        );
+        database
+            .revoke_web_session(&prefix, &"a".repeat(64), 250)
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .active_web_session_revocations(&prefix, 200)
+                .await
+                .unwrap(),
+            vec![("a".repeat(64), 250)]
+        );
+        database
+            .delete_expired_web_session_revocations(&prefix, 250)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .active_web_session_revocations(&prefix, 250)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        database
             .ensure_wasm_plugin_state_schema(&prefix)
             .await
             .unwrap();
@@ -9031,6 +9300,7 @@ mod language_line_tests {
 
         for suffix in [
             "wasm_plugin_state",
+            "rust_web_session_revocations",
             "oauth_access_tokens",
             "options",
             "user_closet",

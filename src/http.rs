@@ -47,7 +47,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     AppState,
     auth::{
-        audience_matches, bearer_token, decode_access_token, decode_web_session,
+        WebSessionClaims, audience_matches, bearer_token, decode_access_token, decode_web_session,
         hash_legacy_password, verify_legacy_password,
     },
     database::{
@@ -511,6 +511,12 @@ async fn detect_locale_preference(
     };
     let path = request.uri().path();
     let is_api = path == "/api" || path.starts_with("/api/");
+    if (is_user_facing_web_path(path) || path.starts_with("/oauth/"))
+        && let Err(error) = refresh_web_session_revocation(&state, request.headers()).await
+    {
+        tracing::error!(%error, path, "failed to verify web session revocation state");
+        return unavailable();
+    }
     let input_locale = body_locale.or_else(|| requested_query_locale(&request));
     let mut locale = select_request_locale(&state, &request, input_locale.as_deref());
     if !is_api && is_user_facing_web_path(path) {
@@ -2934,6 +2940,7 @@ async fn handle_register(
             }
             let now_epoch = jsonwebtoken::get_current_timestamp();
             let claims = crate::auth::WebSessionClaims {
+                jti: Some(Alphanumeric.sample_string(&mut rand::thread_rng(), 32)),
                 sub: uid.to_string(),
                 iat: now_epoch,
                 exp: now_epoch + 60 * 60 * 12,
@@ -3152,6 +3159,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         60 * 60 * 12
     };
     let claims = crate::auth::WebSessionClaims {
+        jti: Some(Alphanumeric.sample_string(&mut rand::thread_rng(), 32)),
         sub: credential.uid.to_string(),
         iat: now,
         exp: now + max_age,
@@ -7319,6 +7327,9 @@ async fn user_profile_update(
         Ok(user) => user,
         Err(response) => return response,
     };
+    let Some((session_token, session_claims)) = web_session_claims(&state, &headers) else {
+        return unauthenticated();
+    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -7435,6 +7446,13 @@ async fn user_profile_update(
                 serde_json::json!({"user_id": user.uid, "action": "password"}),
             )
             .await;
+            if let Err(error) =
+                persist_web_session_revocation(&state, database, &session_token, &session_claims)
+                    .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to revoke session after password change");
+                return unavailable();
+            }
             let response = login_result(
                 0,
                 if chinese {
@@ -7516,6 +7534,13 @@ async fn user_profile_update(
                 serde_json::json!({"user_id": user.uid, "action": "email"}),
             )
             .await;
+            if let Err(error) =
+                persist_web_session_revocation(&state, database, &session_token, &session_claims)
+                    .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to revoke session after email change");
+                return unavailable();
+            }
             let response = login_result(
                 0,
                 if chinese {
@@ -7569,6 +7594,13 @@ async fn user_profile_update(
                     },
                     None,
                 );
+            }
+            if let Err(error) =
+                persist_web_session_revocation(&state, database, &session_token, &session_claims)
+                    .await
+            {
+                tracing::error!(%error, user_id = user.uid, "failed to revoke session before account deletion");
+                return unavailable();
             }
             match database.delete_user(prefix, user.uid).await {
                 Ok(true) => {
@@ -7745,6 +7777,31 @@ fn illegal_parameters_message(locale: &str) -> &'static str {
     }
 }
 
+async fn persist_web_session_revocation(
+    state: &AppState,
+    database: &DatabasePool,
+    token: &str,
+    claims: &WebSessionClaims,
+) -> Result<(), sqlx::Error> {
+    let session_hash = web_session_fingerprint(token);
+    // Keep the record through jsonwebtoken's default 60-second expiration leeway.
+    let revoke_until = claims.exp.saturating_add(61);
+    let revoke_until_i64 = i64::try_from(revoke_until).unwrap_or(i64::MAX);
+    database
+        .revoke_web_session(
+            &state.config.database.table_prefix,
+            &session_hash,
+            revoke_until_i64,
+        )
+        .await?;
+    state
+        .revoked_web_sessions
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_hash, revoke_until);
+    Ok(())
+}
+
 fn expire_web_session(state: &AppState, mut response: Response) -> Response {
     let secure = if request_app_url(&state).starts_with("https://") {
         "; Secure"
@@ -7760,6 +7817,9 @@ fn expire_web_session(state: &AppState, mut response: Response) -> Response {
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some((token, claims)) = web_session_claims(&state, &headers) else {
+        return (StatusCode::FOUND, [(LOCATION, "/auth/login")]).into_response();
+    };
     let Some(user_id) = session_user_id(&state, &headers) else {
         return (StatusCode::FOUND, [(LOCATION, "/auth/login")]).into_response();
     };
@@ -7776,6 +7836,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
             tracing::error!(%error, user_id, "failed to load account for logout");
             return unavailable();
         }
+    }
+    if let Err(error) = persist_web_session_revocation(&state, database, &token, &claims).await {
+        tracing::error!(%error, user_id, "failed to revoke web session during logout");
+        return unavailable();
     }
     let response = login_result(
         0,
@@ -7818,13 +7882,73 @@ async fn authenticated_guest_redirect(state: &AppState, headers: &HeaderMap) -> 
     }
 }
 
-pub(crate) fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+fn web_session_token(headers: &HeaderMap) -> Option<&str> {
     let cookie_header = headers.get(COOKIE)?.to_str().ok()?;
-    let token = cookie_header.split(';').find_map(|cookie| {
+    cookie_header.split(';').find_map(|cookie| {
         let (name, value) = cookie.trim().split_once('=')?;
         (name == "blessing_skin_session" && !value.is_empty()).then_some(value)
-    })?;
-    decode_web_session(token, state.config.app_key.as_deref()?)
+    })
+}
+
+fn web_session_fingerprint(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn web_session_claims(state: &AppState, headers: &HeaderMap) -> Option<(String, WebSessionClaims)> {
+    let token = web_session_token(headers)?;
+    let claims = decode_web_session(token, state.config.app_key.as_deref()?)?;
+    Some((token.to_owned(), claims))
+}
+
+async fn refresh_web_session_revocation(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), sqlx::Error> {
+    let Some((token, claims)) = web_session_claims(state, headers) else {
+        return Ok(());
+    };
+    let session_hash = web_session_fingerprint(&token);
+    let now = jsonwebtoken::get_current_timestamp();
+    if state
+        .revoked_web_sessions
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&session_hash)
+        .is_some_and(|expires_at| *expires_at > now)
+    {
+        return Ok(());
+    }
+    let Some(database) = &state.database else {
+        return Ok(());
+    };
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+    if database
+        .web_session_is_revoked(&state.config.database.table_prefix, &session_hash, now_i64)
+        .await?
+    {
+        state
+            .revoked_web_sessions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_hash, claims.exp.saturating_add(61));
+    }
+    Ok(())
+}
+
+pub(crate) fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+    let (token, claims) = web_session_claims(state, headers)?;
+    let session_hash = web_session_fingerprint(&token);
+    let now = jsonwebtoken::get_current_timestamp();
+    if state
+        .revoked_web_sessions
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&session_hash)
+        .is_some_and(|expires_at| *expires_at > now)
+    {
+        return None;
+    }
+    claims.sub.parse().ok()
 }
 
 fn looks_like_email(value: &str) -> bool {
@@ -15722,6 +15846,55 @@ mod tests {
             .unwrap()
     }
 
+    async fn login_test_account(
+        app: &axum::Router,
+        email: &str,
+        password: &str,
+        ip: &str,
+    ) -> String {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, StatusCode, header::SET_COOKIE},
+        };
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("x-real-ip", ip)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "identification": email,
+                            "password": password,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], 0);
+        cookie
+    }
+
     async fn session_request(
         app: &axum::Router,
         cookie: &str,
@@ -16963,6 +17136,7 @@ mod tests {
             passport_key: None,
             passport_signing_key: None,
             session_key: None,
+            revoked_web_sessions: Default::default(),
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
@@ -17316,6 +17490,7 @@ mod tests {
             passport_key: None,
             passport_signing_key: None,
             session_key: None,
+            revoked_web_sessions: Default::default(),
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
@@ -17708,12 +17883,20 @@ mod tests {
             r#"{"auth":{"login":"Log In"}}"#,
         )
         .unwrap();
+        let database = crate::database::DatabasePool::Sqlite(pool.clone());
+        database
+            .ensure_web_session_revocations_schema("")
+            .await
+            .unwrap();
+        let revoked_web_sessions =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let app = router(crate::AppState {
             config: Arc::new(config),
-            database: Some(crate::database::DatabasePool::Sqlite(pool.clone())),
+            database: Some(database.clone()),
             passport_key: None,
             passport_signing_key: None,
             session_key: Some(jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())),
+            revoked_web_sessions: revoked_web_sessions.clone(),
             login_failures: Default::default(),
             captcha_challenges: captcha_challenges.clone(),
             mail_limits: Default::default(),
@@ -17929,6 +18112,7 @@ mod tests {
         );
         let now = jsonwebtoken::get_current_timestamp();
         let unbound_claims = crate::auth::WebSessionClaims {
+            jti: None,
             sub: "9".to_owned(),
             iat: now,
             exp: now + 3600,
@@ -18242,6 +18426,7 @@ mod tests {
         }
         let stale_now = jsonwebtoken::get_current_timestamp();
         let stale_claims = crate::auth::WebSessionClaims {
+            jti: None,
             sub: "999".to_owned(),
             iat: stale_now,
             exp: stale_now + 3600,
@@ -18438,6 +18623,7 @@ mod tests {
         assert_eq!(non_admin_chart.status(), StatusCode::FORBIDDEN);
         let admin_now = jsonwebtoken::get_current_timestamp();
         let admin_claims = crate::auth::WebSessionClaims {
+            jti: None,
             sub: "7".to_owned(),
             iat: admin_now,
             exp: admin_now + 3600,
@@ -20649,6 +20835,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changed_password["code"], 0);
+        let stale_password_cookie = cookie.clone();
+        let cookie =
+            login_test_account(&app, "alex@example.test", "new secure password", login_ip).await;
+        let stale_password_session =
+            session_request(&app, &stale_password_cookie, "GET", "/user", None).await;
+        assert_eq!(stale_password_session.status(), StatusCode::SEE_OTHER);
         let restored_password = app
             .clone()
             .oneshot(
@@ -20671,6 +20863,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored_password["code"], 0);
+        let cookie = login_test_account(&app, "alex@example.test", "correct horse", login_ip).await;
         let stored_password: String =
             sqlx::query_scalar("SELECT password FROM users WHERE uid = 7")
                 .fetch_one(&pool)
@@ -20683,6 +20876,7 @@ mod tests {
             ""
         ));
 
+        let stale_email_cookie = cookie.clone();
         let changed_email = app
             .clone()
             .oneshot(
@@ -20723,6 +20917,11 @@ mod tests {
             changed_email_state,
             ("changed@example.test".to_owned(), false)
         );
+        let stale_email_session =
+            session_request(&app, &stale_email_cookie, "GET", "/user", None).await;
+        assert_eq!(stale_email_session.status(), StatusCode::SEE_OTHER);
+        let cookie =
+            login_test_account(&app, "changed@example.test", "correct horse", login_ip).await;
         let restored_email = app
             .clone()
             .oneshot(
@@ -20745,6 +20944,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored_email["code"], 0);
+        let cookie = login_test_account(&app, "alex@example.test", "correct horse", login_ip).await;
         sqlx::query("UPDATE users SET verified = 1 WHERE uid = 7")
             .execute(&pool)
             .await
@@ -21961,6 +22161,57 @@ mod tests {
                 .unwrap()
                 .contains("Max-Age=0")
         );
+        let persisted_revocations = database
+            .active_web_session_revocations(
+                "",
+                i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap(),
+            )
+            .await
+            .unwrap();
+        revoked_web_sessions.write().unwrap().clear();
+        let cross_instance_replay =
+            session_request(&app, &registered_cookie, "GET", "/user", None).await;
+        assert_eq!(cross_instance_replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(cross_instance_replay.headers()[LOCATION], "/auth/login");
+        let registered_token = registered_cookie.split_once('=').unwrap().1;
+        let registered_hash = super::web_session_fingerprint(registered_token);
+        assert!(
+            revoked_web_sessions
+                .read()
+                .unwrap()
+                .contains_key(&registered_hash)
+        );
+
+        let mut restored_revocations = revoked_web_sessions.write().unwrap();
+        restored_revocations.clear();
+        restored_revocations.extend(persisted_revocations);
+        drop(restored_revocations);
+        let replayed_logout_session =
+            session_request(&app, &registered_cookie, "GET", "/user", None).await;
+        assert_eq!(replayed_logout_session.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replayed_logout_session.headers()[LOCATION], "/auth/login");
+
+        let legacy_now = jsonwebtoken::get_current_timestamp();
+        let legacy_claims = crate::auth::WebSessionClaims {
+            jti: None,
+            sub: "7".to_owned(),
+            iat: legacy_now,
+            exp: legacy_now + 3600,
+        };
+        let legacy_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &legacy_claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        let legacy_cookie = format!("blessing_skin_session={legacy_token}");
+        let legacy_logout =
+            session_request(&app, &legacy_cookie, "POST", "/auth/logout", None).await;
+        assert_eq!(legacy_logout.status(), StatusCode::OK);
+        let legacy_replay = session_request(&app, &legacy_cookie, "GET", "/user", None).await;
+        assert_eq!(legacy_replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(legacy_replay.headers()[LOCATION], "/auth/login");
+
         std::fs::remove_dir_all(&setup_storage).unwrap();
         std::fs::remove_dir_all(&public_dir).unwrap();
     }

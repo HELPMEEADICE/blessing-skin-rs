@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
@@ -36,6 +36,7 @@ pub struct AppState {
     pub passport_key: Option<DecodingKey>,
     pub passport_signing_key: Option<EncodingKey>,
     pub session_key: Option<EncodingKey>,
+    pub revoked_web_sessions: Arc<RwLock<HashMap<String, u64>>>,
     pub login_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub captcha_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     pub mail_limits: Arc<Mutex<HashMap<String, Instant>>>,
@@ -87,6 +88,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    let revoked_web_sessions = Arc::new(RwLock::new(HashMap::new()));
+    if let Some(database) = &database {
+        database
+            .ensure_web_session_revocations_schema(&config.database.table_prefix)
+            .await?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+        let revoked = database
+            .active_web_session_revocations(&config.database.table_prefix, now_i64)
+            .await?;
+        *revoked_web_sessions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = revoked.into_iter().collect();
+
+        let database = database.clone();
+        let table_prefix = config.database.table_prefix.clone();
+        let revoked_web_sessions = revoked_web_sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+                let now = jsonwebtoken::get_current_timestamp();
+                let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+                if let Err(error) = database
+                    .delete_expired_web_session_revocations(&table_prefix, now_i64)
+                    .await
+                {
+                    tracing::warn!(%error, "could not clean expired web session revocations");
+                    continue;
+                }
+                revoked_web_sessions
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, expires_at| *expires_at > now);
+            }
+        });
+    }
+
     let plugins = plugin_runtime::PluginRuntime::load(
         &config.plugins_dir,
         database.clone(),
@@ -130,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         passport_key,
         passport_signing_key,
         session_key,
+        revoked_web_sessions,
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         captcha_challenges: Arc::new(Mutex::new(HashMap::new())),
         mail_limits: Arc::new(Mutex::new(HashMap::new())),

@@ -10,6 +10,8 @@ use subtle::ConstantTimeEq;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebSessionClaims {
+    #[serde(default)]
+    pub jti: Option<String>,
     pub sub: String,
     pub iat: u64,
     pub exp: u64,
@@ -45,16 +47,13 @@ pub fn decode_access_token(token: &str, key: &DecodingKey) -> Option<PassportCla
         .map(|data| data.claims)
 }
 
-pub fn decode_web_session(token: &str, secret: &str) -> Option<i64> {
+pub fn decode_web_session(token: &str, secret: &str) -> Option<WebSessionClaims> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_aud = false;
     decode::<WebSessionClaims>(token, &key, &validation)
-        .ok()?
-        .claims
-        .sub
-        .parse()
         .ok()
+        .map(|data| data.claims)
 }
 
 pub fn has_scope(claims: &PassportClaims, required: &str) -> bool {

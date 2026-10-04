@@ -59,6 +59,8 @@ cargo build --locked --release
 默认 `failover` 先通过 SMTP 发送；失败时记录到 Rust 日志，对应 Laravel 默认的 `smtp` → `log` 顺序。
 `MAIL_ENCRYPTION=tls` 会在服务器支持时使用 STARTTLS（465 端口采用隐式 TLS）；设为 `starttls` 时必须成功升级，未设置加密时使用普通 SMTP。`MAIL_URL` 的 URL scheme 应为 `smtp`。
 
+Rust 启动时会幂等创建 `{DB_PREFIX}rust_web_session_revocations`，保存网页登录 session 的 SHA-256 指纹，以便登出后即使请求方重放旧 cookie 也会被拒绝；受保护网页和网页登录 OAuth 请求会检查共享数据库，因此多实例部署也能立即识别撤销。服务启动时恢复未过期记录，并每 15 分钟清理过期记录。数据库账号需要对该 Rust 专属表拥有建表、查询、插入和删除权限。该表不修改 PHP 核心表，回退到 PHP 不依赖它。
+
 Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password`、`authorization_code`、`refresh_token` 与 `client_credentials` 授权，并沿用默认的一年访问令牌期限；密码授权需要旧数据库中有效的 `password_client`。机机令牌使用旧 Passport 表且 `user_id` 为空，不签发 refresh token，也不能访问绑定用户身份的 API 路由。Passport 的 `*` scope 在 password 和 client_credentials grant 中允许所有 scope。Rust 还提供登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。WASM 插件市场需要通过 `WASM_PLUGIN_REGISTRY_URL` 显式配置可信注册表，契约见 [plugin-registry-v1.md](plugin-registry-v1.md)；注册表不可用时市场安装会失败关闭。
 
 官方发行包包含 `public/app` 下的旧站前端 bundle 和站点背景图、favicon；从源码部署时，运行 `yarn install --frozen-lockfile` 和 `yarn build` 后，还需将 `resources/assets/src/images/bg.webp` 与 `resources/assets/src/images/favicon.ico` 复制到 `public/app/`。Rust 服务通过 `PUBLIC_PATH/app` 提供这些资源。

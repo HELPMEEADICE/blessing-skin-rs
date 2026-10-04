@@ -1942,6 +1942,7 @@ mod integration_tests {
     fn session_cookie(user_id: i64, secret: &str) -> String {
         let now = jsonwebtoken::get_current_timestamp();
         let claims = crate::auth::WebSessionClaims {
+            jti: None,
             sub: user_id.to_string(),
             iat: now,
             exp: now + 3600,
@@ -2042,12 +2043,18 @@ mod integration_tests {
             app_key: Some(session_secret.to_owned()),
             mail: MailConfig::default(),
         };
+        let database = DatabasePool::Sqlite(pool.clone());
+        database
+            .ensure_web_session_revocations_schema("")
+            .await
+            .unwrap();
         let app = http::router(AppState {
             config: Arc::new(config),
-            database: Some(DatabasePool::Sqlite(pool.clone())),
+            database: Some(database),
             passport_key: Some(DecodingKey::from_rsa_pem(public_key).unwrap()),
             passport_signing_key: Some(EncodingKey::from_rsa_pem(private_key).unwrap()),
             session_key: Some(EncodingKey::from_secret(session_secret.as_bytes())),
+            revoked_web_sessions: Default::default(),
             login_failures: Default::default(),
             captcha_challenges: Default::default(),
             mail_limits: Default::default(),
