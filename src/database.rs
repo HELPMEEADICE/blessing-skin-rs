@@ -8865,7 +8865,7 @@ mod language_line_tests {
                 "machine-token",
                 19,
                 r#"["Plugin.Custom"]"#,
-                "2099-01-01 00:00:00",
+                "2037-12-31 23:59:59",
             )
             .await
             .unwrap();
