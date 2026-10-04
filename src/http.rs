@@ -3210,7 +3210,9 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let copyright_prefer = site_option(&state, &copyright_prefer_key)
         .await
         .or(site_option(&state, "copyright_prefer").await)
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| {
+            legacy_boolean_option_index(&value).or_else(|| value.parse::<usize>().ok())
+        })
         .filter(|value| *value <= 6)
         .unwrap_or_default();
     let copyright_text = localized_site_option(&state, "copyright_text")
@@ -14013,8 +14015,20 @@ async fn api_root(State(state): State<AppState>) -> Response {
     }
 }
 
+fn legacy_boolean_option_index(value: &str) -> Option<usize> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "(true)" => Some(1),
+        "false" | "(false)" => Some(0),
+        _ => None,
+    }
+}
+
 fn copyright_for_preference(preference: Option<&str>) -> Option<&'static str> {
-    let key = preference.unwrap_or("0");
+    let key = match preference.and_then(legacy_boolean_option_index) {
+        Some(0) => "0",
+        Some(1) => "1",
+        _ => preference.unwrap_or("0"),
+    };
     COPYRIGHTS
         .iter()
         .enumerate()
@@ -15163,6 +15177,22 @@ mod tests {
         assert_eq!(
             super::copyright_for_preference(Some("6")),
             Some(super::COPYRIGHTS[6])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("true")),
+            Some(super::COPYRIGHTS[1])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("(TRUE)")),
+            Some(super::COPYRIGHTS[1])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("false")),
+            Some(super::COPYRIGHTS[0])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("(FALSE)")),
+            Some(super::COPYRIGHTS[0])
         );
         for invalid in ["7", "01", "-1", "1.0", "invalid", ""] {
             assert_eq!(
