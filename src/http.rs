@@ -1295,12 +1295,7 @@ async fn login_page(
                 }
             };
             let invisible = match database.option(prefix, "recaptcha_invisible").await {
-                Ok(value) => value.is_some_and(|value| {
-                    matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                }),
+                Ok(value) => legacy_option_bool(value.as_deref()),
                 Err(error) => {
                     tracing::warn!(%error, "failed to read reCAPTCHA mode for login page");
                     false
@@ -1429,6 +1424,13 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let recaptcha_invisible = match database.option(prefix, "recaptcha_invisible").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to read registration CAPTCHA mode");
+            return unavailable();
+        }
+    };
     let recaptcha_sitekey = if recaptcha_secret.is_empty() {
         String::new()
     } else {
@@ -1453,7 +1455,7 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         serde_json::json!({
             "player": player_name_registration,
             "recaptcha": if use_recaptcha { recaptcha_sitekey.as_str() } else { "" },
-            "invisible": false,
+            "invisible": recaptcha_invisible,
         }),
         i18n,
     );
@@ -1510,6 +1512,13 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    let recaptcha_invisible = match database.option(prefix, "recaptcha_invisible").await {
+        Ok(value) => legacy_option_bool(value.as_deref()),
+        Err(error) => {
+            tracing::error!(%error, "failed to load forgot-password CAPTCHA mode");
+            return unavailable();
+        }
+    };
     let (recaptcha_sitekey, recaptcha_secret) = match (
         database.option(prefix, "recaptcha_sitekey").await,
         database.option(prefix, "recaptcha_secretkey").await,
@@ -1532,7 +1541,7 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
         "auth/forgot",
         serde_json::json!({
             "recaptcha": if use_recaptcha { recaptcha_sitekey.as_str() } else { "" },
-            "invisible": false,
+            "invisible": recaptcha_invisible,
         }),
         i18n,
     );
@@ -17412,6 +17421,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('recaptcha_invisible','(true)')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let login_page = app
             .clone()
             .oneshot(
@@ -17443,6 +17456,7 @@ mod tests {
         assert_eq!(globals["route"], "auth/login");
         assert_eq!(globals["base_url"], "http://localhost");
         assert_eq!(globals["extra"]["redirectTo"], "/skinlib");
+        assert_eq!(globals["extra"]["invisible"], true);
         assert_eq!(globals["i18n"]["auth"]["login"], "Log In");
 
         for (method, path, body) in [
@@ -17509,7 +17523,7 @@ mod tests {
         let forgot_globals: serde_json::Value =
             serde_json::from_slice(&forgot_globals_bytes).unwrap();
         assert_eq!(forgot_globals["route"], "auth/forgot");
-        assert_eq!(forgot_globals["extra"]["invisible"], false);
+        assert_eq!(forgot_globals["extra"]["invisible"], true);
 
         let register_page = app
             .clone()
@@ -17542,7 +17556,7 @@ mod tests {
             serde_json::from_slice(&register_globals_bytes).unwrap();
         assert_eq!(register_globals["route"], "auth/register");
         assert_eq!(register_globals["extra"]["player"], true);
-        assert_eq!(register_globals["extra"]["invisible"], false);
+        assert_eq!(register_globals["extra"]["invisible"], true);
         sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('register_with_player_name','true'), ('user_initial_score','73'), ('regs_per_ip','2')")
             .execute(&pool)
             .await
