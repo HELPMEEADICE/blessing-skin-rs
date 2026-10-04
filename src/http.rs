@@ -14598,7 +14598,7 @@ async fn preview_by_hash(
             return unavailable();
         }
     };
-    preview_for_texture(&state, tid, &query, &request_headers, false).await
+    preview_for_texture(&state, tid, &query, &request_headers, true).await
 }
 
 async fn preview_for_texture(
@@ -20934,36 +20934,38 @@ mod tests {
             .unwrap();
         assert_eq!(cached_skin_preview.status(), StatusCode::NOT_MODIFIED);
 
+        let cape_preview_uri = format!("/preview/hash/{preview_cape_hash}?png&height=160");
         let cape_preview = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/preview/hash/{preview_cape_hash}?png&height=160"))
-                    .header(axum::http::header::IF_NONE_MATCH, "*")
+                    .uri(&cape_preview_uri)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(cape_preview.status(), StatusCode::OK);
-        assert!(
-            cape_preview
-                .headers()
-                .get(axum::http::header::ETAG)
-                .is_none()
-        );
         assert_eq!(
             cape_preview
                 .headers()
-                .get(axum::http::header::CACHE_CONTROL)
+                .get(axum::http::header::CONTENT_TYPE)
                 .unwrap(),
-            "private, must-revalidate"
+            "image/png"
         );
+        let cape_preview_etag = cape_preview
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .clone();
         assert!(
             cape_preview
                 .headers()
-                .get(axum::http::header::LAST_MODIFIED)
-                .is_some()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("public, max-age=")
         );
         let cape_preview_bytes = to_bytes(cape_preview.into_body(), usize::MAX)
             .await
@@ -20974,6 +20976,18 @@ mod tests {
             (decoded_cape_preview.width(), decoded_cape_preview.height()),
             (100, 160)
         );
+        let cached_cape_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&cape_preview_uri)
+                    .header(axum::http::header::IF_NONE_MATCH, cape_preview_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_cape_preview.status(), StatusCode::NOT_MODIFIED);
         let avatar_by_hash = app
             .clone()
             .oneshot(
