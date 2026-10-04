@@ -12079,6 +12079,38 @@ async fn toggle_texture_privacy(
             return unavailable();
         }
     };
+    let return_closet_score = match read_bool_option(
+        database,
+        &state.config.database.table_prefix,
+        "return_score",
+        true,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to read closet score return option");
+            return unavailable();
+        }
+    };
+    let closet_score_refund = if return_closet_score {
+        match read_score_option(
+            database,
+            &state.config.database.table_prefix,
+            "score_per_closet_item",
+            0,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "failed to read closet item score");
+                return unavailable();
+            }
+        }
+    } else {
+        0
+    };
     let score_diff = texture_privacy_score_diff(
         &texture,
         public_cost_per_kb,
@@ -12094,6 +12126,9 @@ async fn toggle_texture_privacy(
             &texture.hash,
             texture.is_public,
             score_diff,
+            &texture.texture_type,
+            return_closet_score,
+            closet_score_refund,
         )
         .await
     {

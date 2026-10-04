@@ -2286,8 +2286,16 @@ impl DatabasePool {
         hash: &str,
         was_public: bool,
         score_diff: i64,
+        texture_type: &str,
+        return_score: bool,
+        closet_score_refund: i64,
     ) -> Result<TexturePrivacyOutcome, sqlx::Error> {
         let is_public = !was_public;
+        let texture_column = if texture_type == "cape" {
+            "tid_cape"
+        } else {
+            "tid_skin"
+        };
         match self {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -2333,6 +2341,58 @@ impl DatabasePool {
                     .bind(tid)
                     .execute(&mut *transaction)
                     .await?;
+                if !is_public {
+                    let liker_count_sql = format!(
+                        "SELECT COUNT(*) FROM {prefix}user_closet \
+                         WHERE texture_tid = ? AND user_uid <> ?"
+                    );
+                    let liker_count =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(liker_count_sql))
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .fetch_one(&mut *transaction)
+                            .await?;
+                    if return_score && closet_score_refund != 0 {
+                        let refund_sql = format!(
+                            "UPDATE {prefix}users SET score = score + ? \
+                             WHERE uid IN (SELECT user_uid FROM {prefix}user_closet \
+                                          WHERE texture_tid = ? AND user_uid <> ?)"
+                        );
+                        sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                            .bind(closet_score_refund)
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    let remove_closet_sql = format!(
+                        "DELETE FROM {prefix}user_closet \
+                         WHERE texture_tid = ? AND user_uid <> ?"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(remove_closet_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    let reset_players_sql = format!(
+                        "UPDATE {prefix}players SET {texture_column} = 0 \
+                         WHERE {texture_column} = ? AND uid <> ?"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    if liker_count > 0 {
+                        let update_likes_sql =
+                            format!("UPDATE {prefix}textures SET likes = likes - ? WHERE tid = ?");
+                        sqlx::query(sqlx::AssertSqlSafe(update_likes_sql))
+                            .bind(liker_count)
+                            .bind(tid)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
                 transaction.commit().await?;
             }
             Self::MySql(pool) => {
@@ -2380,6 +2440,58 @@ impl DatabasePool {
                     .bind(tid)
                     .execute(&mut *transaction)
                     .await?;
+                if !is_public {
+                    let liker_count_sql = format!(
+                        "SELECT COUNT(*) FROM {prefix}user_closet \
+                         WHERE texture_tid = ? AND user_uid <> ?"
+                    );
+                    let liker_count =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(liker_count_sql))
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .fetch_one(&mut *transaction)
+                            .await?;
+                    if return_score && closet_score_refund != 0 {
+                        let refund_sql = format!(
+                            "UPDATE {prefix}users SET score = score + ? \
+                             WHERE uid IN (SELECT user_uid FROM {prefix}user_closet \
+                                          WHERE texture_tid = ? AND user_uid <> ?)"
+                        );
+                        sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                            .bind(closet_score_refund)
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    let remove_closet_sql = format!(
+                        "DELETE FROM {prefix}user_closet \
+                         WHERE texture_tid = ? AND user_uid <> ?"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(remove_closet_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    let reset_players_sql = format!(
+                        "UPDATE {prefix}players SET {texture_column} = 0 \
+                         WHERE {texture_column} = ? AND uid <> ?"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    if liker_count > 0 {
+                        let update_likes_sql =
+                            format!("UPDATE {prefix}textures SET likes = likes - ? WHERE tid = ?");
+                        sqlx::query(sqlx::AssertSqlSafe(update_likes_sql))
+                            .bind(liker_count)
+                            .bind(tid)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
                 transaction.commit().await?;
             }
             Self::Postgres(pool) => {
@@ -2427,6 +2539,59 @@ impl DatabasePool {
                     .bind(tid)
                     .execute(&mut *transaction)
                     .await?;
+                if !is_public {
+                    let liker_count_sql = format!(
+                        "SELECT COUNT(*) FROM {prefix}user_closet \
+                         WHERE texture_tid = $1 AND user_uid <> $2"
+                    );
+                    let liker_count =
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(liker_count_sql))
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .fetch_one(&mut *transaction)
+                            .await?;
+                    if return_score && closet_score_refund != 0 {
+                        let refund_sql = format!(
+                            "UPDATE {prefix}users SET score = score + $1 \
+                             WHERE uid IN (SELECT user_uid FROM {prefix}user_closet \
+                                          WHERE texture_tid = $2 AND user_uid <> $3)"
+                        );
+                        sqlx::query(sqlx::AssertSqlSafe(refund_sql))
+                            .bind(closet_score_refund)
+                            .bind(tid)
+                            .bind(uploader_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                    let remove_closet_sql = format!(
+                        "DELETE FROM {prefix}user_closet \
+                         WHERE texture_tid = $1 AND user_uid <> $2"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(remove_closet_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    let reset_players_sql = format!(
+                        "UPDATE {prefix}players SET {texture_column} = 0 \
+                         WHERE {texture_column} = $1 AND uid <> $2"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                        .bind(tid)
+                        .bind(uploader_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    if liker_count > 0 {
+                        let update_likes_sql = format!(
+                            "UPDATE {prefix}textures SET likes = likes - $1 WHERE tid = $2"
+                        );
+                        sqlx::query(sqlx::AssertSqlSafe(update_likes_sql))
+                            .bind(liker_count)
+                            .bind(tid)
+                            .execute(&mut *transaction)
+                            .await?;
+                    }
+                }
                 transaction.commit().await?;
             }
         }
@@ -8457,30 +8622,82 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("UPDATE bs_players SET tid_skin = 13 WHERE pid IN (3, 4)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bs_user_closet (user_uid, texture_tid, item_name) VALUES (7, 13, 'Other liker'), (8, 13, 'Uploader item')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE bs_textures SET likes = 1 WHERE tid = 13")
+            .execute(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             database
-                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", true, -4)
+                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", true, -4, "alex", true, 5)
                 .await
                 .unwrap(),
             super::TexturePrivacyOutcome::Updated { is_public: false }
         );
+        let cleared_liker_skin: (i64, i64) =
+            sqlx::query_as("SELECT tid_skin, tid_cape FROM bs_players WHERE pid = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared_liker_skin, (0, 12));
+        let retained_uploader_skin: i64 =
+            sqlx::query_scalar("SELECT tid_skin FROM bs_players WHERE pid = 4")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retained_uploader_skin, 13);
+        let remaining_texture_likes: i64 =
+            sqlx::query_scalar("SELECT likes FROM bs_textures WHERE tid = 13")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_texture_likes, 0);
+        let remaining_closet_entries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bs_user_closet WHERE texture_tid = 13")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_closet_entries, 1);
+        let refunded_liker_score: i64 =
+            sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(refunded_liker_score, 45);
         assert_eq!(
             database
-                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", false, -100)
+                .toggle_texture_privacy("bs_", 13, 8, "not-in-closet", false, -100, "alex", true, 5)
                 .await
                 .unwrap(),
             super::TexturePrivacyOutcome::InsufficientScore
         );
         assert_eq!(
             database
-                .toggle_texture_privacy("bs_", 15, 7, "owner-private-hash", false, -1)
+                .toggle_texture_privacy(
+                    "bs_",
+                    15,
+                    7,
+                    "owner-private-hash",
+                    false,
+                    -1,
+                    "alex",
+                    true,
+                    5
+                )
                 .await
                 .unwrap(),
             super::TexturePrivacyOutcome::DuplicatePublicTexture(16)
         );
         assert_eq!(
             database
-                .toggle_texture_privacy("bs_", 14, 8, "private-hash", false, -1)
+                .toggle_texture_privacy("bs_", 14, 8, "private-hash", false, -1, "steve", true, 5)
                 .await
                 .unwrap(),
             super::TexturePrivacyOutcome::Updated { is_public: true }
@@ -8536,7 +8753,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(rewarded_user_score, 42);
+        assert_eq!(rewarded_user_score, 47);
         assert_eq!(refunded_uploader_score, 42);
         assert_eq!(
             database
@@ -8598,7 +8815,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(upload_score, 37);
+        assert_eq!(upload_score, 42);
         let shared_texture = database.texture_info("bs_", 15).await.unwrap().unwrap();
         assert!(
             !database
@@ -9429,6 +9646,156 @@ mod language_line_tests {
             .expect("legacy player remains after closet cleanup");
         assert_eq!(legacy_player.tid_skin, 0);
         assert_eq!(legacy_player.tid_cape, 0);
+
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}users (uid, email, nickname, locale, score, avatar, password, ip, permission, last_sign_at, register_at, verified, is_dark_mode) VALUES (99, 'liker@example.test', 'Liker', 'en', 0, 0, 'legacy-password-hash', '127.0.0.1', 0, '2026-10-04 12:00:00', '2026-10-04 12:00:00', TRUE, FALSE)"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}players (pid, uid, name, tid_skin, tid_cape, last_modified) VALUES (99, 99, 'LikerPlayer', 11, 0, '2026-10-04 12:00:00')"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!("UPDATE {prefix}players SET tid_skin = 11 WHERE pid = 3"),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!("UPDATE {prefix}textures SET likes = 1 WHERE tid = 11"),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (7, 11, 'Uploader skin'), (99, 11, 'Other liker skin')"
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            database
+                .toggle_texture_privacy(
+                    &prefix,
+                    11,
+                    7,
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    true,
+                    0,
+                    "alex",
+                    true,
+                    5,
+                )
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::Updated { is_public: false }
+        ));
+        let uploader_player = database.players_for_user(&prefix, 7).await.unwrap();
+        let uploader_player = uploader_player
+            .iter()
+            .find(|player| player.pid == 3)
+            .expect("uploader player remains after privacy cleanup");
+        assert_eq!(uploader_player.tid_skin, 11);
+        let liker_player = database.players_for_user(&prefix, 99).await.unwrap();
+        assert_eq!(liker_player.len(), 1);
+        assert_eq!(liker_player[0].tid_skin, 0);
+        let uploader_closet_items = database.closet_item_ids(&prefix, 7).await.unwrap();
+        assert!(uploader_closet_items.contains(&11));
+        assert!(
+            database
+                .closet_item_ids(&prefix, 99)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let liker_score = database
+            .user_profile(&prefix, 99)
+            .await
+            .unwrap()
+            .unwrap()
+            .score;
+        assert_eq!(liker_score, 5);
+        let private_texture = database.texture_info(&prefix, 11).await.unwrap().unwrap();
+        assert!(!private_texture.is_public);
+        assert_eq!(private_texture.likes, 0);
+
+        execute_legacy_fixture_sql(
+            &database,
+            &format!("UPDATE {prefix}players SET tid_cape = 20 WHERE pid IN (3, 99)"),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!("UPDATE {prefix}textures SET likes = 1 WHERE tid = 20"),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (7, 20, 'Uploader cape'), (99, 20, 'Other liker cape')"
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            database
+                .toggle_texture_privacy(
+                    &prefix,
+                    20,
+                    7,
+                    "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    true,
+                    0,
+                    "cape",
+                    false,
+                    5,
+                )
+                .await
+                .unwrap(),
+            super::TexturePrivacyOutcome::Updated { is_public: false }
+        ));
+        let uploader_cape_player = database.players_for_user(&prefix, 7).await.unwrap();
+        assert_eq!(
+            uploader_cape_player
+                .iter()
+                .find(|player| player.pid == 3)
+                .unwrap()
+                .tid_cape,
+            20
+        );
+        let liker_cape_player = database.players_for_user(&prefix, 99).await.unwrap();
+        assert_eq!(liker_cape_player[0].tid_cape, 0);
+        assert!(
+            database
+                .closet_item_ids(&prefix, 99)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .user_profile(&prefix, 99)
+                .await
+                .unwrap()
+                .unwrap()
+                .score,
+            5
+        );
+        let private_cape = database.texture_info(&prefix, 20).await.unwrap().unwrap();
+        assert!(!private_cape.is_public);
+        assert_eq!(private_cape.likes, 0);
 
         for suffix in [
             "wasm_plugin_state",
