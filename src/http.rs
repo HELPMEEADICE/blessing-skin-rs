@@ -14,7 +14,8 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Form, Multipart, OriginalUri, Path as RoutePath, Query, RawQuery, State,
+        DefaultBodyLimit, Form, FromRequestParts, Multipart, OriginalUri, Path as RoutePath, Query,
+        RawQuery, State,
     },
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -22,6 +23,7 @@ use axum::{
             CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_MODIFIED_SINCE,
             IF_NONE_MATCH, LAST_MODIFIED, LOCATION, SET_COOKIE,
         },
+        request::Parts,
     },
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, delete, get, post, put},
@@ -115,6 +117,25 @@ impl ApiRateLimiter {
             remaining: LEGACY_API_RATE_LIMIT - window.attempts,
             retry_after: window.reset_at.saturating_duration_since(now),
         }
+    }
+}
+
+// Keep malformed IDs from short-circuiting legacy authentication and authorization checks.
+#[derive(Clone, Copy)]
+struct LegacyRouteId(i64);
+
+impl<S> FromRequestParts<S> for LegacyRouteId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let id = match RoutePath::<i64>::from_request_parts(parts, state).await {
+            Ok(RoutePath(id)) => id,
+            Err(_) => i64::MIN,
+        };
+        Ok(Self(id))
     }
 }
 
@@ -3923,7 +3944,7 @@ async fn oauth_client_create(
 async fn oauth_client_update(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -3986,7 +4007,7 @@ async fn oauth_client_update(
 async fn oauth_client_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -4304,7 +4325,7 @@ async fn web_create_language_line(
 async fn web_update_language_line(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
     Json(form): Json<LanguageLineTextForm>,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -4352,7 +4373,7 @@ async fn web_update_language_line(
 async fn web_delete_language_line(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -12185,7 +12206,7 @@ macro_rules! define_admin_user_mutation_handlers {
             async fn $web(
                 State(state): State<AppState>,
                 headers: HeaderMap,
-                RoutePath(uid): RoutePath<i64>,
+                LegacyRouteId(uid): LegacyRouteId,
                 body: Bytes,
             ) -> Response {
                 web_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
@@ -12194,7 +12215,7 @@ macro_rules! define_admin_user_mutation_handlers {
             async fn $api(
                 State(state): State<AppState>,
                 headers: HeaderMap,
-                RoutePath(uid): RoutePath<i64>,
+                LegacyRouteId(uid): LegacyRouteId,
                 body: Bytes,
             ) -> Response {
                 api_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
@@ -12857,7 +12878,7 @@ macro_rules! define_admin_player_mutation_handlers {
             async fn $web(
                 State(state): State<AppState>,
                 headers: HeaderMap,
-                RoutePath(pid): RoutePath<i64>,
+                LegacyRouteId(pid): LegacyRouteId,
                 body: Bytes,
             ) -> Response {
                 web_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
@@ -12866,7 +12887,7 @@ macro_rules! define_admin_player_mutation_handlers {
             async fn $api(
                 State(state): State<AppState>,
                 headers: HeaderMap,
-                RoutePath(pid): RoutePath<i64>,
+                LegacyRouteId(pid): LegacyRouteId,
                 body: Bytes,
             ) -> Response {
                 api_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
@@ -13415,7 +13436,7 @@ fn forbidden_action() -> Response {
 async fn web_admin_closet_add(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(uid): RoutePath<i64>,
+    LegacyRouteId(uid): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let Some(actor_uid) = session_user_id(&state, &headers) else {
@@ -13443,7 +13464,7 @@ async fn web_admin_closet_add(
 async fn web_admin_closet_remove(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(uid): RoutePath<i64>,
+    LegacyRouteId(uid): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let Some(actor_uid) = session_user_id(&state, &headers) else {
@@ -13471,7 +13492,7 @@ async fn web_admin_closet_remove(
 async fn api_admin_closet_list(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(uid): RoutePath<i64>,
+    LegacyRouteId(uid): LegacyRouteId,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
         Ok(identity) => identity,
@@ -13523,7 +13544,7 @@ async fn api_admin_closet_list(
 async fn api_admin_closet_add(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(uid): RoutePath<i64>,
+    LegacyRouteId(uid): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -13554,7 +13575,7 @@ async fn api_admin_closet_add(
 async fn api_admin_closet_remove(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(uid): RoutePath<i64>,
+    LegacyRouteId(uid): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -13854,7 +13875,7 @@ async fn api_admin_report_list(
 async fn web_review_report(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
@@ -13888,7 +13909,7 @@ async fn web_review_report(
 async fn api_review_report(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RoutePath(id): RoutePath<i64>,
+    LegacyRouteId(id): LegacyRouteId,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -15408,6 +15429,63 @@ mod tests {
         public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview, router,
         safe_remote_component_url, valid_texture_hash,
     };
+
+    #[tokio::test]
+    async fn malformed_protected_route_ids_reach_authentication_before_resource_lookup() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        };
+        use tower::ServiceExt;
+
+        let app = Router::new().route(
+            "/{id}",
+            get(
+                |headers: super::HeaderMap, route_id: super::LegacyRouteId| async move {
+                    if !headers.contains_key("authorization") {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if route_id.0 == i64::MIN {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    StatusCode::OK.into_response()
+                },
+            ),
+        );
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::get("/not-a-number").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated_invalid = app
+            .clone()
+            .oneshot(
+                Request::get("/not-a-number")
+                    .header("authorization", "Bearer test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_invalid.status(), StatusCode::NOT_FOUND);
+
+        let authenticated_valid = app
+            .oneshot(
+                Request::get("/42")
+                    .header("authorization", "Bearer test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_valid.status(), StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn client_ip_prefers_valid_proxy_headers_then_uses_the_socket_peer() {
