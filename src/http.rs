@@ -834,6 +834,10 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            serve_public_assets,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             detect_locale_preference,
         ));
     let app = if !cfg!(test)
@@ -7930,6 +7934,137 @@ fn frontend_asset_content_type(asset_path: &str) -> &'static str {
     }
 }
 
+async fn serve_public_assets(
+    State(state): State<AppState>,
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_head = request.method() == Method::HEAD;
+    if (request.method() == Method::GET || is_head) && !path.starts_with("/app/") {
+        let headers = request.headers().clone();
+        if let Some(response) = serve_public_asset(&state, path, &headers, is_head).await {
+            return response;
+        }
+    }
+    next.run(request).await
+}
+
+async fn serve_public_asset(
+    state: &AppState,
+    uri_path: &str,
+    request_headers: &HeaderMap,
+    head_only: bool,
+) -> Option<Response> {
+    let decoded_path = decode_uri_path(uri_path)?;
+    let relative_path = decoded_path.strip_prefix('/')?;
+    if relative_path.is_empty() || relative_path.contains(['\\', ':']) {
+        return None;
+    }
+    let relative = std::path::PathBuf::from(relative_path);
+    if relative.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return true;
+        };
+        name.to_string_lossy().starts_with('.')
+    }) {
+        return None;
+    }
+    let extension = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "php" | "php3" | "php4" | "php5" | "php7" | "php8" | "phtml" | "phar" | "inc"
+    ) {
+        return None;
+    }
+
+    let public_root = tokio::fs::canonicalize(&state.public_dir).await.ok()?;
+    let asset_path = tokio::fs::canonicalize(state.public_dir.join(&relative))
+        .await
+        .ok()?;
+    let public_storage_path = relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == "storage");
+    let is_public = asset_path.starts_with(&public_root);
+    let is_legacy_storage_public = if public_storage_path {
+        tokio::fs::canonicalize(state.storage_dir.join("app/public"))
+            .await
+            .is_ok_and(|storage_public_root| asset_path.starts_with(&storage_public_root))
+    } else {
+        false
+    };
+    if !is_public && !is_legacy_storage_public {
+        return None;
+    }
+    let metadata = tokio::fs::metadata(&asset_path).await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let contents = tokio::fs::read(&asset_path).await.ok()?;
+    let etag = content_etag(&contents);
+    let modified = metadata.modified().ok();
+    let not_modified = if request_headers.contains_key(IF_NONE_MATCH) {
+        header_has_etag(request_headers, &etag)
+    } else {
+        modified.is_some_and(|time| not_modified_since(request_headers, time))
+    };
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let body = if head_only {
+            Body::empty()
+        } else {
+            Body::from(contents)
+        };
+        Response::new(body)
+    };
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag).expect("MD5 ETag is ASCII"),
+    );
+    if let Some(modified) = modified {
+        response.headers_mut().insert(
+            LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).unwrap(),
+        );
+    }
+    if not_modified {
+        response.headers_mut().remove(CONTENT_TYPE);
+        response.headers_mut().remove(CONTENT_LENGTH);
+    } else {
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(frontend_asset_content_type(relative_path)),
+        );
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&metadata.len().to_string()).unwrap(),
+        );
+    }
+    Some(response)
+}
+
+fn decode_uri_path(uri_path: &str) -> Option<String> {
+    let path = uri_path.as_bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'%' {
+            let hex = std::str::from_utf8(path.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(path[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
 async fn redirect_uninstalled(
     State(state): State<AppState>,
     request: axum::http::Request<Body>,
@@ -17003,8 +17138,11 @@ mod tests {
         use axum::{
             body::{Body, to_bytes},
             http::{
-                Request, StatusCode,
-                header::{LOCATION, SET_COOKIE},
+                Method, Request, StatusCode,
+                header::{
+                    CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
+                    SET_COOKIE,
+                },
             },
         };
         use base64::Engine as _;
@@ -17163,6 +17301,10 @@ mod tests {
             super::setup_csrf_token()
         ));
         std::fs::create_dir_all(public_dir.join("app/i18n")).unwrap();
+        std::fs::create_dir_all(public_dir.join("uploads")).unwrap();
+        std::fs::write(public_dir.join("uploads/banner.svg"), b"<svg>banner</svg>").unwrap();
+        std::fs::write(public_dir.join("index.php"), b"<?php").unwrap();
+        std::fs::write(public_dir.join(".env"), b"SECRET=private").unwrap();
         std::fs::write(
             public_dir.join("app/app.012abcd.js"),
             "window.fixture = true;",
@@ -17216,6 +17358,66 @@ mod tests {
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
+        let public_upload = app
+            .clone()
+            .oneshot(
+                Request::get("/uploads/banner.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_upload.status(), StatusCode::OK);
+        assert_eq!(public_upload.headers()[CONTENT_TYPE], "image/svg+xml");
+        let public_upload_etag = public_upload.headers()[ETAG].clone();
+        assert!(public_upload.headers().contains_key(LAST_MODIFIED));
+        assert_eq!(
+            to_bytes(public_upload.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"<svg>banner</svg>"
+        );
+        let public_upload_head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/uploads/banner.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_upload_head.status(), StatusCode::OK);
+        assert_eq!(public_upload_head.headers()[CONTENT_LENGTH], "17");
+        assert!(
+            to_bytes(public_upload_head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let cached_public_upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/uploads/banner.svg")
+                    .header(IF_NONE_MATCH, public_upload_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_public_upload.status(), StatusCode::NOT_MODIFIED);
+        for uri in ["/index.php", "/.env", "/uploads/%2e%2e/index.php"] {
+            let protected_public_path = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(protected_public_path.status(), StatusCode::OK, "{uri}");
+        }
+
         let query_locale_page = app
             .clone()
             .oneshot(
