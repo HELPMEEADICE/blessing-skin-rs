@@ -11980,6 +11980,7 @@ struct SkinLibraryQuery {
 async fn skinlib_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<SkinLibraryQuery>,
 ) -> Response {
     let Some(database) = &state.database else {
@@ -12013,16 +12014,20 @@ async fn skinlib_list(
     let sort = query.sort.as_deref().unwrap_or("time");
     let page = query.page.unwrap_or(1).max(1);
     let per_page = 20_i64;
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     if uploader_filter.is_some() && uploader.is_none() {
-        return Json(serde_json::json!({
-            "current_page": page,
-            "data": [],
-            "last_page": 1,
-            "per_page": per_page,
-            "from": null,
-            "to": null,
-            "total": 0
-        }))
+        return Json(skinlib_list_paginator(
+            Vec::new(),
+            0,
+            page,
+            per_page,
+            &path,
+            uri.query(),
+        ))
         .into_response();
     }
     match database
@@ -12044,19 +12049,14 @@ async fn skinlib_list(
                 .into_iter()
                 .map(skin_library_item_json)
                 .collect::<Vec<_>>();
-            let last_page = total.saturating_add(per_page - 1) / per_page;
-            let offset = page.saturating_sub(1).saturating_mul(per_page);
-            let from = (!data.is_empty()).then_some(offset + 1);
-            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
-            Json(serde_json::json!({
-                "current_page": page,
-                "data": data,
-                "last_page": last_page.max(1),
-                "per_page": per_page,
-                "from": from,
-                "to": to,
-                "total": total
-            }))
+            Json(skinlib_list_paginator(
+                data,
+                total,
+                page,
+                per_page,
+                &path,
+                uri.query(),
+            ))
             .into_response()
         }
         Err(error) => {
@@ -12066,6 +12066,93 @@ async fn skinlib_list(
     }
 }
 
+fn skinlib_list_paginator(
+    data: Vec<serde_json::Value>,
+    total: i64,
+    page: i64,
+    per_page: i64,
+    path: &str,
+    raw_query: Option<&str>,
+) -> serde_json::Value {
+    let last_page = total.saturating_add(per_page - 1) / per_page;
+    let last_page = last_page.max(1);
+    let page_url = |number: i64| skinlib_page_url(path, raw_query, number);
+    let previous = (page > 1).then(|| page_url(page - 1));
+    let next = (page < last_page).then(|| page_url(page + 1));
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let from = (!data.is_empty()).then_some(offset + 1);
+    let to = (!data.is_empty()).then_some(offset + data.len() as i64);
+
+    let page_numbers = if last_page <= 14 {
+        (1..=last_page).map(Some).collect::<Vec<_>>()
+    } else if page <= 7 {
+        (1..=7).map(Some).chain([None, Some(last_page)]).collect()
+    } else if page >= last_page.saturating_sub(6) {
+        [Some(1), None]
+            .into_iter()
+            .chain((last_page - 7..=last_page).map(Some))
+            .collect()
+    } else {
+        [Some(1), None]
+            .into_iter()
+            .chain((page.saturating_sub(3)..=page.saturating_add(3).min(last_page)).map(Some))
+            .chain([None, Some(last_page)])
+            .collect()
+    };
+    let mut links = vec![serde_json::json!({
+        "url": previous,
+        "label": "&laquo; Previous",
+        "active": false
+    })];
+    for number in page_numbers {
+        match number {
+            Some(number) => links.push(serde_json::json!({
+                "url": page_url(number),
+                "label": number.to_string(),
+                "active": number == page
+            })),
+            None => links.push(serde_json::json!({
+                "url": null,
+                "label": "...",
+                "active": false
+            })),
+        }
+    }
+    links.push(serde_json::json!({
+        "url": next,
+        "label": "Next &raquo;",
+        "active": false
+    }));
+
+    serde_json::json!({
+        "current_page": page,
+        "data": data,
+        "first_page_url": page_url(1),
+        "from": from,
+        "last_page": last_page,
+        "last_page_url": page_url(last_page),
+        "links": links,
+        "next_page_url": next,
+        "path": path,
+        "per_page": per_page,
+        "prev_page_url": previous,
+        "to": to,
+        "total": total
+    })
+}
+
+fn skinlib_page_url(path: &str, raw_query: Option<&str>, page: i64) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    if let Some(raw_query) = raw_query {
+        for (name, value) in form_urlencoded::parse(raw_query.as_bytes()) {
+            if name != "page" {
+                query.append_pair(&name, &value);
+            }
+        }
+    }
+    query.append_pair("page", &page.to_string());
+    format!("{path}?{}", query.finish())
+}
 fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_json::Value {
     serde_json::json!({
         "tid": item.tid,
@@ -15981,6 +16068,32 @@ mod tests {
         assert_eq!(super::legacy_image_dimension(Some("1025px"), 100), 100);
     }
     #[test]
+    fn skinlib_paginator_preserves_query_and_builds_page_window() {
+        let paginator = super::skinlib_list_paginator(
+            Vec::new(),
+            2_000,
+            50,
+            20,
+            "https://skin.example/skinlib/list",
+            Some("filter=skin&keyword=white+fox&page=50"),
+        );
+        assert_eq!(
+            paginator["first_page_url"],
+            "https://skin.example/skinlib/list?filter=skin&keyword=white+fox&page=1"
+        );
+        assert_eq!(paginator["last_page"], 100);
+        let links = paginator["links"].as_array().unwrap();
+        assert_eq!(links.len(), 13);
+        assert_eq!(links[0]["label"], "&laquo; Previous");
+        assert_eq!(links[2]["label"], "...");
+        assert_eq!(links[3]["label"], "47");
+        assert_eq!(links[6]["label"], "50");
+        assert_eq!(links[6]["active"], true);
+        assert_eq!(links[10]["label"], "...");
+        assert_eq!(links[11]["label"], "100");
+        assert_eq!(links[12]["label"], "Next &raquo;");
+    }
+    #[test]
     fn texture_width_option_preserves_php_boolean_and_numeric_comparisons() {
         let (default_limit, default_label) = super::legacy_texture_width_limit(None);
         assert_eq!(default_limit, 8192.0);
@@ -19730,6 +19843,21 @@ mod tests {
                 .any(|item| item["tid"] == 20 && item["nickname"] == "NewGuy")
         );
 
+        assert_eq!(skinlib_list["per_page"], 20);
+        assert_eq!(
+            skinlib_list["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/skinlib/list"),
+            true
+        );
+        assert!(
+            skinlib_list["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/skinlib/list?filter=skin&sort=time&page=1")
+        );
+        assert!(skinlib_list["links"].as_array().is_some());
         let invalid_uploader_list = session_request(
             &app,
             &registered_cookie,
