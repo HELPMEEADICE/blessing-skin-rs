@@ -519,16 +519,27 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
         )
             .into_response();
     };
-    let payload = match serde_json::from_slice::<Value>(&body) {
-        Ok(Value::Object(payload)) => payload,
-        _ => return invalid("Invalid settings payload."),
+    let legacy_form = is_urlencoded_form(headers);
+    let values = if legacy_form {
+        match legacy_form_values(section, &body) {
+            Some(values) => values,
+            None => return render_page(state, headers, section, false).await,
+        }
+    } else {
+        let payload = match serde_json::from_slice::<Value>(&body) {
+            Ok(Value::Object(payload)) => payload,
+            _ => return invalid("Invalid settings payload."),
+        };
+        payload
+            .get("values")
+            .and_then(Value::as_object)
+            .unwrap_or(&payload)
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     };
-    let values = payload
-        .get("values")
-        .and_then(Value::as_object)
-        .unwrap_or(&payload);
     let mut normalized = Vec::with_capacity(values.len());
-    for (key, value) in values {
+    for (key, value) in &values {
         let Some(definition) = definitions.iter().find(|definition| definition.key == key) else {
             return invalid(&format!("Unknown setting: {key}"));
         };
@@ -599,7 +610,138 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
                 .into_response();
         }
     }
-    Json(serde_json::json!({"code":0,"message":if http::request_locale(&state).starts_with("zh") {"设置已保存。"} else {"Settings saved."}})).into_response()
+    if legacy_form {
+        render_page(state, headers, section, false).await
+    } else {
+        Json(serde_json::json!({"code":0,"message":if http::request_locale(&state).starts_with("zh") {"设置已保存。"} else {"Settings saved."}})).into_response()
+    }
+}
+
+fn is_urlencoded_form(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
+fn legacy_form_values(section: &str, body: &[u8]) -> Option<HashMap<String, Value>> {
+    let form = form_urlencoded::parse(body)
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    let option = form.get("option")?;
+    let (fields, checkboxes): (&[&str], &[&str]) = match (section, option.as_str()) {
+        ("general", "general") => (
+            &[
+                "site_name",
+                "site_description",
+                "site_url",
+                "register_with_player_name",
+                "require_verification",
+                "regs_per_ip",
+                "max_upload_file_size",
+                "max_texture_width",
+                "player_name_rule",
+                "custom_player_name_regexp",
+                "player_name_length_min",
+                "player_name_length_max",
+                "auto_del_invalid_texture",
+                "allow_downloading_texture",
+                "status_code_for_private",
+                "texture_name_regexp",
+                "content_policy",
+            ],
+            &[
+                "register_with_player_name",
+                "require_verification",
+                "auto_del_invalid_texture",
+                "allow_downloading_texture",
+            ],
+        ),
+        ("general", "announ") => (&["announcement"], &[]),
+        ("general", "meta") => (&["meta_keywords", "meta_description", "meta_extras"], &[]),
+        ("general", "recaptcha") => (
+            &[
+                "recaptcha_sitekey",
+                "recaptcha_secretkey",
+                "recaptcha_invisible",
+            ],
+            &["recaptcha_invisible"],
+        ),
+        ("score", "rate") => (
+            &[
+                "score_per_storage",
+                "private_score_per_storage",
+                "score_per_closet_item",
+                "return_score",
+                "score_per_player",
+                "user_initial_score",
+            ],
+            &["return_score"],
+        ),
+        ("score", "report") => (
+            &["reporter_score_modification", "reporter_reward_score"],
+            &[],
+        ),
+        ("score", "sign") => (
+            &[
+                "sign_score_from",
+                "sign_score_to",
+                "sign_gap_time",
+                "sign_after_zero",
+            ],
+            &["sign_after_zero"],
+        ),
+        ("score", "sharing") => (
+            &[
+                "score_award_per_texture",
+                "take_back_scores_after_deletion",
+                "score_award_per_like",
+            ],
+            &["take_back_scores_after_deletion"],
+        ),
+        ("customize", "homepage") => (
+            &[
+                "home_pic_url",
+                "favicon_url",
+                "transparent_navbar",
+                "hide_intro",
+                "fixed_bg",
+                "copyright_prefer",
+                "copyright_text",
+            ],
+            &["transparent_navbar", "hide_intro", "fixed_bg"],
+        ),
+        ("customize", "customJsCss") => (&["custom_css", "custom_js"], &[]),
+        ("resource", "resources") => (
+            &[
+                "force_ssl",
+                "auto_detect_asset_url",
+                "cache_expire_time",
+                "cdn_address",
+            ],
+            &["force_ssl", "auto_detect_asset_url"],
+        ),
+        ("resource", "cache") => (
+            &["enable_avatar_cache", "enable_preview_cache"],
+            &["enable_avatar_cache", "enable_preview_cache"],
+        ),
+        _ => return None,
+    };
+
+    let mut values = HashMap::new();
+    for key in fields {
+        if let Some(value) = form.get(*key) {
+            values.insert((*key).to_owned(), Value::String(value.clone()));
+        } else if checkboxes.contains(key) {
+            values.insert((*key).to_owned(), Value::Bool(false));
+        }
+    }
+    (!values.is_empty()).then_some(values)
 }
 
 async fn admin_user(state: &AppState, headers: &HeaderMap) -> Result<UserProfile, Response> {
@@ -867,9 +1009,34 @@ fn chinese_choice(value: &str, fallback: &str) -> String {
 mod tests {
     use super::{
         CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION,
-        RESOURCE, SCORE, normalize_value,
+        RESOURCE, SCORE, legacy_form_values, normalize_value,
     };
     use serde_json::json;
+
+    #[test]
+    fn legacy_forms_only_update_the_selected_option_group() {
+        let values = legacy_form_values(
+            "general",
+            b"option=meta&meta_keywords=legacy+keywords&site_name=must+be+ignored",
+        )
+        .unwrap();
+
+        assert_eq!(values.get("meta_keywords"), Some(&json!("legacy keywords")));
+        assert!(!values.contains_key("site_name"));
+        assert_eq!(
+            legacy_form_values("score", b"option=meta&meta_keywords=ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_forms_default_unchecked_checkboxes_to_false() {
+        let values =
+            legacy_form_values("resource", b"option=cache&enable_avatar_cache=on").unwrap();
+
+        assert_eq!(values.get("enable_avatar_cache"), Some(&json!("on")));
+        assert_eq!(values.get("enable_preview_cache"), Some(&json!(false)));
+    }
 
     #[test]
     fn settings_are_allowlisted_and_legacy_urls_are_normalized() {

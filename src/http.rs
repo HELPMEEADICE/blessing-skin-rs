@@ -19872,6 +19872,71 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let original_meta_keywords: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'meta_keywords'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let original_site_name: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'site_name_en'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let legacy_settings_form = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/options")
+                    .header("cookie", &registered_cookie)
+                    .header(
+                        CONTENT_TYPE,
+                        "application/x-www-form-urlencoded; charset=UTF-8",
+                    )
+                    .body(Body::from(
+                        "option=meta&meta_keywords=legacy+form+keywords&site_name=must+be+ignored",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_settings_form.status(), StatusCode::OK);
+        let legacy_settings_html = String::from_utf8(
+            to_bytes(legacy_settings_form.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(legacy_settings_html.contains("data-section=\"general\""));
+        let saved_meta_keywords: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'meta_keywords'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let unchanged_site_name: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'site_name_en'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(saved_meta_keywords, "legacy form keywords");
+        assert_eq!(unchanged_site_name, original_site_name);
+        if let Some(original) = original_meta_keywords {
+            sqlx::query("UPDATE options SET option_value = ? WHERE option_name = 'meta_keywords'")
+                .bind(original)
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("DELETE FROM options WHERE option_name = 'meta_keywords'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let saved_settings = session_request(
             &app,
             &registered_cookie,
