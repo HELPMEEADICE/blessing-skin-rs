@@ -2698,18 +2698,14 @@ async fn handle_register(
 
     let client_ip = registration_client_ip(&headers);
     let max_registrations_per_ip = match database.option(prefix, "regs_per_ip").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(3),
+        Ok(value) => legacy_option_integer(value.as_deref(), 3),
         Err(error) => {
             tracing::error!(%error, "failed to read registration IP limit");
             return unavailable();
         }
     };
     let initial_score = match database.option(prefix, "user_initial_score").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(1000),
+        Ok(value) => legacy_option_integer(value.as_deref(), 1000),
         Err(error) => {
             tracing::error!(%error, "failed to read initial user score");
             return unavailable();
@@ -6182,11 +6178,8 @@ async fn user_score_info(State(state): State<AppState>, headers: HeaderMap) -> R
             return unavailable();
         }
     };
-    let option_number = |value: Option<String>, default: i64| {
-        value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(default)
-    };
+    let option_number =
+        |value: Option<String>, default: i64| legacy_option_integer(value.as_deref(), default);
     let storage_rate = match database.option(prefix, "score_per_storage").await {
         Ok(value) => option_number(value, 1),
         Err(error) => {
@@ -6242,10 +6235,7 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
         }
     };
     let sign_gap_time = match database.option(prefix, "sign_gap_time").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(24)
-            .max(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 24).max(0),
         Err(error) => {
             tracing::error!(%error, "failed to read sign gap option");
             return unavailable();
@@ -6317,9 +6307,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
         }
     };
     let score_per_player = match database.option(prefix, "score_per_player").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(100),
+        Ok(value) => legacy_option_integer(value.as_deref(), 100),
         Err(error) => {
             tracing::error!(%error, "failed to load player score cost");
             return unavailable();
@@ -6470,9 +6458,7 @@ async fn web_add_player(
         return validation_error("name", &request_locale(&state));
     }
     let score_cost = match database.option(prefix, "score_per_player").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 100),
         Err(error) => {
             tracing::error!(%error, "failed to load player score cost");
             return unavailable();
@@ -6709,9 +6695,7 @@ async fn web_delete_player(
     };
     let score_reward = if return_score {
         match database.option(prefix, "score_per_player").await {
-            Ok(value) => value
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default(),
+            Ok(value) => legacy_option_integer(value.as_deref(), 100),
             Err(error) => {
                 tracing::error!(%error, "failed to load player score reward");
                 return unavailable();
@@ -6894,18 +6878,14 @@ async fn web_add_closet_item(
     };
     let prefix = &state.config.database.table_prefix;
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
-        Ok(value) => value
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load closet score cost");
             return unavailable();
         }
     };
     let like_award = match database.option(prefix, "score_award_per_like").await {
-        Ok(value) => value
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load texture like award");
             return unavailable();
@@ -7073,9 +7053,7 @@ async fn web_remove_closet_item(
     };
     let score_refund = if refund {
         match database.option(prefix, "score_per_closet_item").await {
-            Ok(value) => value
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or_default(),
+            Ok(value) => legacy_option_integer(value.as_deref(), 0),
             Err(error) => {
                 tracing::error!(%error, "failed to load closet refund score");
                 return unavailable();
@@ -7085,9 +7063,7 @@ async fn web_remove_closet_item(
         0
     };
     let like_award = match database.option(prefix, "score_award_per_like").await {
-        Ok(value) => value
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load like award");
             return unavailable();
@@ -9479,9 +9455,7 @@ async fn api_add_player(
         return validation_error("name", &request_locale(&state));
     }
     let score_cost = match database.option(prefix, "score_per_player").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 100),
         Err(error) => {
             tracing::error!(%error, "failed to load player score cost");
             return unavailable();
@@ -9556,9 +9530,7 @@ async fn api_delete_player(
     };
     let score_reward = if return_score {
         match database.option(prefix, "score_per_player").await {
-            Ok(value) => value
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default(),
+            Ok(value) => legacy_option_integer(value.as_deref(), 100),
             Err(error) => {
                 tracing::error!(%error, "failed to load player score reward");
                 return unavailable();
@@ -9610,6 +9582,35 @@ async fn api_delete_player(
             unavailable()
         }
     }
+}
+
+fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
+    let Some(value) = value else {
+        return default;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "(true)" => return 1,
+        "false" | "(false)" | "null" | "(null)" => return 0,
+        _ => {}
+    }
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut end = usize::from(
+        bytes
+            .first()
+            .is_some_and(|byte| matches!(byte, b'+' | b'-')),
+    );
+    let negative = bytes.first() == Some(&b'-');
+    let first_digit = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == first_digit {
+        return 0;
+    }
+    value[..end]
+        .parse::<i64>()
+        .unwrap_or(if negative { i64::MIN } else { i64::MAX })
 }
 
 fn legacy_option_bool(value: Option<&str>) -> bool {
@@ -9689,18 +9690,14 @@ async fn api_add_closet_item(
         }
     };
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load closet score cost");
             return unavailable();
         }
     };
     let like_award = match database.option(prefix, "score_award_per_like").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load texture like award");
             return unavailable();
@@ -9878,9 +9875,7 @@ async fn api_remove_closet_item(
     };
     let score_refund = if return_score {
         match database.option(prefix, "score_per_closet_item").await {
-            Ok(value) => value
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default(),
+            Ok(value) => legacy_option_integer(value.as_deref(), 0),
             Err(error) => {
                 tracing::error!(%error, "failed to load closet score refund");
                 return unavailable();
@@ -9890,9 +9885,7 @@ async fn api_remove_closet_item(
         0
     };
     let like_award = match database.option(prefix, "score_award_per_like").await {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to load texture like award");
             return unavailable();
@@ -10111,9 +10104,7 @@ async fn skinlib_show_page(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_default(),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, tid, "failed to load texture report score option");
             return unavailable();
@@ -10182,9 +10173,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
     };
     let prefix = &state.config.database.table_prefix;
     let read_number = async |name: &str, default: i64| match database.option(prefix, name).await {
-        Ok(value) => Ok(value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(default)),
+        Ok(value) => Ok(legacy_option_integer(value.as_deref(), default)),
         Err(error) => Err(error),
     };
     let public_rate = match read_number("score_per_storage", 1).await {
@@ -10631,10 +10620,7 @@ async fn upload_texture(
         .option(&state.config.database.table_prefix, "max_upload_file_size")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(1024)
-            .max(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 1024).max(0),
         Err(error) => {
             tracing::error!(%error, "failed to read maximum texture upload size");
             return unavailable();
@@ -10685,9 +10671,7 @@ async fn upload_texture(
         .option(&state.config.database.table_prefix, "score_per_storage")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 1),
         Err(error) => {
             tracing::error!(%error, "failed to read public texture storage score");
             return unavailable();
@@ -10700,9 +10684,7 @@ async fn upload_texture(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(10),
+        Ok(value) => legacy_option_integer(value.as_deref(), 10),
         Err(error) => {
             tracing::error!(%error, "failed to read private texture storage score");
             return unavailable();
@@ -10712,9 +10694,7 @@ async fn upload_texture(
         .option(&state.config.database.table_prefix, "score_per_closet_item")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to read closet item score");
             return unavailable();
@@ -10727,9 +10707,7 @@ async fn upload_texture(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to read texture upload award");
             return unavailable();
@@ -10928,9 +10906,7 @@ async fn submit_skinlib_report(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to read report score option");
             return unavailable();
@@ -11138,9 +11114,7 @@ async fn delete_texture(
         .option(&state.config.database.table_prefix, "score_per_storage")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 1),
         Err(error) => {
             tracing::error!(%error, "failed to read public texture storage score");
             return unavailable();
@@ -11153,9 +11127,7 @@ async fn delete_texture(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(10),
+        Ok(value) => legacy_option_integer(value.as_deref(), 10),
         Err(error) => {
             tracing::error!(%error, "failed to read private texture storage score");
             return unavailable();
@@ -11168,9 +11140,7 @@ async fn delete_texture(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to read texture score award");
             return unavailable();
@@ -11197,9 +11167,7 @@ async fn delete_texture(
             .option(&state.config.database.table_prefix, "score_per_closet_item")
             .await
         {
-            Ok(value) => value
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(0),
+            Ok(value) => legacy_option_integer(value.as_deref(), 0),
             Err(error) => {
                 tracing::error!(%error, "failed to read closet item score");
                 return unavailable();
@@ -11293,9 +11261,7 @@ async fn toggle_texture_privacy(
         .option(&state.config.database.table_prefix, "score_per_storage")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 1),
         Err(error) => {
             tracing::error!(%error, "failed to read public texture storage score");
             return unavailable();
@@ -11308,9 +11274,7 @@ async fn toggle_texture_privacy(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(10),
+        Ok(value) => legacy_option_integer(value.as_deref(), 10),
         Err(error) => {
             tracing::error!(%error, "failed to read private texture storage score");
             return unavailable();
@@ -11323,9 +11287,7 @@ async fn toggle_texture_privacy(
         )
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
             tracing::error!(%error, "failed to read texture score award");
             return unavailable();
@@ -13621,7 +13583,7 @@ async fn delete_reported_texture(
             return unavailable();
         }
     };
-    let public_cost = match read_score_option(database, prefix, "score_per_storage", 0).await {
+    let public_cost = match read_score_option(database, prefix, "score_per_storage", 1).await {
         Ok(value) => value,
         Err(error) => {
             tracing::error!(%error, "failed to read public texture storage score");
@@ -15452,6 +15414,18 @@ mod tests {
             .unwrap();
         assert_eq!(unrelated.status(), StatusCode::OK);
         assert!(unrelated.headers().get("x-ratelimit-limit").is_none());
+    }
+
+    #[test]
+    fn legacy_integer_options_match_php_option_and_int_casts() {
+        assert_eq!(super::legacy_option_integer(None, 17), 17);
+        assert_eq!(super::legacy_option_integer(Some("true"), 17), 1);
+        assert_eq!(super::legacy_option_integer(Some("(TRUE)"), 17), 1);
+        assert_eq!(super::legacy_option_integer(Some("false"), 17), 0);
+        assert_eq!(super::legacy_option_integer(Some("(null)"), 17), 0);
+        assert_eq!(super::legacy_option_integer(Some("1.9"), 17), 1);
+        assert_eq!(super::legacy_option_integer(Some(" -12.5 items"), 17), -12);
+        assert_eq!(super::legacy_option_integer(Some("invalid"), 17), 0);
     }
 
     #[test]
@@ -19329,6 +19303,36 @@ mod tests {
         assert_eq!(score_info["rate"]["storage"], 2);
         assert_eq!(score_info["rate"]["players"], 100);
         assert_eq!(score_info["usage"]["players"], 1);
+        sqlx::query(
+            "UPDATE options SET option_value = 'false' WHERE option_name = 'score_per_storage'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let false_score_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user/score-info")
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let false_score_info: serde_json::Value = serde_json::from_slice(
+            &to_bytes(false_score_info.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(false_score_info["rate"]["storage"], 0);
+        sqlx::query(
+            "UPDATE options SET option_value = '2' WHERE option_name = 'score_per_storage'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(score_info["usage"]["storage"], 8);
         let sign = app
             .clone()
