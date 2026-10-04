@@ -307,8 +307,12 @@ pub async fn customize_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
     method: Method,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
+    if method == Method::POST && legacy_color_action(query.as_deref()) {
+        return save_legacy_color_page(&state, &headers, body).await;
+    }
     dispatch_page(&state, &headers, "customize", method, body, false).await
 }
 pub async fn resource_dispatch(
@@ -326,6 +330,43 @@ pub async fn resource_dispatch(
     dispatch_page(&state, &headers, "resource", method, body, clear_cache).await
 }
 
+fn legacy_color_action(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "action" && value == "color")
+    })
+}
+
+async fn save_legacy_color_page(state: &AppState, headers: &HeaderMap, body: Bytes) -> Response {
+    if let Err(response) = admin_user(state, headers).await {
+        return response;
+    }
+    let Some(database) = &state.database else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Database is not ready.").into_response();
+    };
+    let form = form_urlencoded::parse(&body)
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    for (field, key) in [("navbar", "navbar_color"), ("sidebar", "sidebar_color")] {
+        let Some(value) = form.get(field).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(definition) = CUSTOMIZE.iter().find(|definition| definition.key == key) else {
+            continue;
+        };
+        let Some(value) = normalize_value(definition, &Value::String(value.clone())) else {
+            return invalid("Invalid color value.");
+        };
+        if let Err(error) = database
+            .set_option(&state.config.database.table_prefix, key, &value)
+            .await
+        {
+            tracing::error!(%error, option = key, "failed to save legacy customize color");
+            return (StatusCode::SERVICE_UNAVAILABLE, "Could not save settings.").into_response();
+        }
+    }
+    render_page(state, headers, "customize", false).await
+}
 async fn dispatch_page(
     state: &AppState,
     headers: &HeaderMap,

@@ -19830,6 +19830,48 @@ mod tests {
             assert_eq!(globals["route"], format!("admin/{section}"));
             assert_eq!(globals["extra"]["settings"]["section"], section);
         }
+        let legacy_color_form = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/customize?action=color")
+                    .header("cookie", &registered_cookie)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "navbar=orange&sidebar=light-olive&submit_color=Submit",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_color_form.status(), StatusCode::OK);
+        let legacy_color_html = String::from_utf8(
+            to_bytes(legacy_color_form.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(legacy_color_html.contains("data-section=\"customize\""));
+        let saved_navbar_color: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'navbar_color'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let saved_sidebar_color: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'sidebar_color'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(saved_navbar_color, "orange");
+        assert_eq!(saved_sidebar_color, "light-olive");
+        sqlx::query("DELETE FROM options WHERE option_name IN ('navbar_color', 'sidebar_color')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let saved_settings = session_request(
             &app,
             &registered_cookie,
