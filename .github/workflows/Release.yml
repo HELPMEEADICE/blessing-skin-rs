@@ -26,6 +26,12 @@ jobs:
           yarn install --frozen-lockfile
       - name: Build React and Webpack assets
         run: yarn build
+      - name: Copy legacy site images into the frontend bundle
+        run: |
+          cp resources/assets/src/images/bg.webp public/app/bg.webp
+          cp resources/assets/src/images/favicon.ico public/app/favicon.ico
+          test -s public/app/bg.webp
+          test -s public/app/favicon.ico
       - name: Upload frontend assets
         uses: actions/upload-artifact@v4
         with:
