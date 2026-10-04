@@ -35,6 +35,32 @@ pub struct Finding {
     pub severity: &'static str,
     pub detail: String,
 }
+const PHP_SOURCE_INDICATORS: &[(&str, &str, &str)] = &[
+    ("php-database-access", "database", "db::"),
+    ("php-database-access", "database schema", "schema::"),
+    (
+        "php-database-access",
+        "database package",
+        "illuminate\\database",
+    ),
+    ("php-route-registration", "route registration", "route::"),
+    ("php-event-hooks", "event hook", "event::listen"),
+    ("php-event-hooks", "event hook", "hook::"),
+    ("php-filesystem-access", "filesystem", "storage::"),
+    ("php-filesystem-access", "filesystem", "file::"),
+    ("php-filesystem-access", "filesystem", "file_get_contents("),
+    ("php-filesystem-access", "filesystem", "file_put_contents("),
+    ("php-filesystem-access", "filesystem", "fopen("),
+    ("php-filesystem-access", "filesystem", "unlink("),
+    ("php-network-access", "network", "http::"),
+    ("php-network-access", "network", "curl_init("),
+    ("php-network-access", "network", "guzzlehttp\\"),
+    ("php-host-services", "host service", "auth::"),
+    ("php-host-services", "host service", "cache::"),
+    ("php-host-services", "host service", "app("),
+    ("php-host-services", "host service", "resolve("),
+    ("php-host-services", "host service", "view("),
+];
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut args = args.into_iter();
@@ -126,6 +152,7 @@ pub fn analyze(source: &Path) -> Result<PluginReport, Box<dyn Error>> {
     collect_files(&root, &root, &mut php_source_files, &mut php_template_files)?;
     php_source_files.sort();
     php_template_files.sort();
+    let php_source_findings = scan_php_capabilities(&root, &php_source_files)?;
 
     let composer_path = root.join("composer.json");
     let composer_dependencies = if composer_path.is_file() {
@@ -201,6 +228,7 @@ pub fn analyze(source: &Path) -> Result<PluginReport, Box<dyn Error>> {
             ),
         });
     }
+    findings.extend(php_source_findings);
     if findings.is_empty() {
         findings.push(Finding {
             code: "no-known-php-hooks",
@@ -254,6 +282,47 @@ fn collect_strings(value: &Value, path: &str, output: &mut Vec<String>) {
     }
 }
 
+fn contains_php_indicator(line: &str, indicator: &str) -> bool {
+    line.match_indices(indicator).any(|(index, _)| {
+        line[..index].chars().next_back().map_or(true, |previous| {
+            !previous.is_ascii_alphanumeric() && previous != '_'
+        })
+    })
+}
+fn scan_php_capabilities(
+    root: &Path,
+    source_files: &[String],
+) -> Result<Vec<Finding>, Box<dyn Error>> {
+    let mut findings = Vec::new();
+    for relative in source_files {
+        let bytes = fs::read(root.join(relative))?;
+        let source = String::from_utf8_lossy(&bytes);
+        for (line_index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with('#')
+            {
+                continue;
+            }
+            let normalized = line.to_ascii_lowercase();
+            for (code, category, indicator) in PHP_SOURCE_INDICATORS {
+                if contains_php_indicator(&normalized, indicator) {
+                    findings.push(Finding {
+                        code,
+                        severity: "review",
+                        detail: format!(
+                            "Possible {category} dependency via `{indicator}` at {relative}:{}; review its Rust/WASM replacement.",
+                            line_index + 1
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(findings)
+}
 fn collect_files(
     root: &Path,
     directory: &Path,
@@ -448,7 +517,11 @@ mod tests {
             r#"{"require":{"illuminate/support":"^10.0"},"require-dev":{"phpunit/phpunit":"^10.0"}}"#,
         )
         .unwrap();
-        fs::write(root.join("src/Provider.php"), "<?php // source").unwrap();
+        fs::write(
+            root.join("src/Provider.php"),
+            b"<?php\n// Legacy \xff marker Route::get('/comment', $handler);\nDB::table('users')->get();\nRoute::get('/admin', $handler);\nStorage::put('file', $bytes);\nHttp::get('https://example.test');",
+        )
+        .unwrap();
         fs::write(root.join("views/config.blade.php"), "<div />").unwrap();
 
         let report = analyze(&root).unwrap();
@@ -477,6 +550,25 @@ mod tests {
             vec!["src/Provider.php", "views/config.blade.php"]
         );
         assert_eq!(report.php_template_files, vec!["views/config.blade.php"]);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| { finding.detail.contains("src/Provider.php:2") })
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "php-database-access" && finding.detail.contains("src/Provider.php:3")
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "php-route-registration"
+                && finding.detail.contains("src/Provider.php:4")
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "php-filesystem-access" && finding.detail.contains("src/Provider.php:5")
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "php-network-access" && finding.detail.contains("src/Provider.php:6")
+        }));
         assert!(
             report
                 .findings
@@ -536,5 +628,13 @@ mod tests {
         assert!(write_scaffold(&output, &report, &json).is_err());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(output).unwrap();
+    }
+    #[test]
+    fn php_source_indicators_require_identifier_boundaries() {
+        assert!(!super::contains_php_indicator(
+            "Profile::current()",
+            "file::"
+        ));
+        assert!(super::contains_php_indicator("\\file::delete()", "file::"));
     }
 }
