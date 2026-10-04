@@ -5991,18 +5991,20 @@ fn admin_plugin_inventory(state: &AppState) -> Result<Vec<serde_json::Value>, st
         .collect())
 }
 
-fn admin_plugin_record(
-    state: &AppState,
-    name: String,
+fn admin_plugin_description(
+    loaded: bool,
+    load_failed: bool,
     enabled: bool,
     on_disk: bool,
-    has_readme: bool,
-    has_config: bool,
-) -> serde_json::Value {
-    let filename = format!("{name}.wasm");
-    let loaded = state.wasm_plugins.iter().any(|plugin| plugin == &filename);
-    let chinese = request_locale(&state).starts_with("zh");
-    let description = if loaded && !on_disk {
+    chinese: bool,
+) -> &'static str {
+    if load_failed {
+        if chinese {
+            "加载失败；请查看服务日志"
+        } else {
+            "Failed to load; check service logs"
+        }
+    } else if loaded && !on_disk {
         if chinese {
             "文件已移除；当前进程重启前仍会运行"
         } else {
@@ -6020,9 +6022,30 @@ fn admin_plugin_record(
         } else {
             "Enabled; will load on next startup"
         }
+    } else if chinese {
+        "已停用"
     } else {
-        if chinese { "已停用" } else { "Disabled" }
-    };
+        "Disabled"
+    }
+}
+
+fn admin_plugin_record(
+    state: &AppState,
+    name: String,
+    enabled: bool,
+    on_disk: bool,
+    has_readme: bool,
+    has_config: bool,
+) -> serde_json::Value {
+    let filename = format!("{name}.wasm");
+    let loaded = state.wasm_plugins.iter().any(|plugin| plugin == &filename);
+    let load_failed = !loaded
+        && state
+            .wasm_plugin_load_failures
+            .iter()
+            .any(|plugin| plugin == &filename);
+    let chinese = request_locale(&state).starts_with("zh");
+    let description = admin_plugin_description(loaded, load_failed, enabled, on_disk, chinese);
     serde_json::json!({
         "name": name,
         "title": name,
@@ -6030,6 +6053,7 @@ fn admin_plugin_record(
         "version": "WASM host API 1.7.0",
         "enabled": enabled,
         "loaded": loaded,
+        "load_failed": load_failed,
         "on_disk": on_disk,
         "readme": has_readme,
         "config": has_config,
@@ -15707,6 +15731,22 @@ mod tests {
         safe_remote_component_url, valid_texture_hash,
     };
 
+    #[test]
+    fn plugin_inventory_reports_startup_failures_in_both_locales() {
+        assert_eq!(
+            super::admin_plugin_description(false, true, true, true, false),
+            "Failed to load; check service logs"
+        );
+        assert_eq!(
+            super::admin_plugin_description(false, true, true, true, true),
+            "加载失败；请查看服务日志"
+        );
+        assert_eq!(
+            super::admin_plugin_description(false, false, true, true, false),
+            "Enabled; will load on next startup"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_protected_route_ids_reach_authentication_before_resource_lookup() {
         use axum::{
@@ -17277,6 +17317,7 @@ mod tests {
                 path
             },
             wasm_plugins: Vec::new(),
+            wasm_plugin_load_failures: Vec::new(),
             wasm_plugin_readmes: Vec::new(),
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
@@ -17624,6 +17665,7 @@ mod tests {
             env_file: finish_env.clone(),
             public_dir: finish_public.clone(),
             wasm_plugins: Vec::new(),
+            wasm_plugin_load_failures: Vec::new(),
             wasm_plugin_readmes: Vec::new(),
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
@@ -18030,6 +18072,7 @@ mod tests {
             env_file: std::path::PathBuf::from(".env"),
             public_dir: public_dir.clone(),
             wasm_plugins: Vec::new(),
+            wasm_plugin_load_failures: Vec::new(),
             wasm_plugin_readmes: Vec::new(),
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),

@@ -77,6 +77,7 @@ struct LoadedPlugin {
 
 pub struct PluginRuntime {
     plugins: Vec<LoadedPlugin>,
+    load_failures: Vec<String>,
     database: Option<DatabasePool>,
     table_prefix: String,
 }
@@ -85,6 +86,7 @@ impl PluginRuntime {
     pub fn shared_empty() -> std::sync::Arc<tokio::sync::Mutex<Self>> {
         std::sync::Arc::new(tokio::sync::Mutex::new(Self {
             plugins: Vec::new(),
+            load_failures: Vec::new(),
             database: None,
             table_prefix: String::new(),
         }))
@@ -107,6 +109,7 @@ impl PluginRuntime {
         paths.sort();
         let mut runtime = Self {
             plugins: Vec::new(),
+            load_failures: Vec::new(),
             database: database.clone(),
             table_prefix: table_prefix.to_owned(),
         };
@@ -114,15 +117,18 @@ impl PluginRuntime {
             return Ok(runtime);
         }
         let Some(database) = database else {
+            runtime.record_failed_paths(&paths);
             tracing::warn!(directory = %directory.display(), "WASM plugins were not loaded because the database is unavailable for persistent plugin state");
             return Ok(runtime);
         };
         if let Err(error) = database.ensure_wasm_plugin_state_schema(table_prefix).await {
+            runtime.record_failed_paths(&paths);
             tracing::warn!(%error, "WASM plugins were not loaded because their state table could not be prepared");
             return Ok(runtime);
         }
         for path in paths {
             if let Err(error) = runtime.load_component(&engine, &path, &database).await {
+                runtime.record_failed_path(&path);
                 tracing::warn!(%error, plugin = %path.display(), "WASM plugin failed to load; continuing without it");
             }
         }
@@ -134,6 +140,7 @@ impl PluginRuntime {
         let engine = plugin_engine()?;
         let mut runtime = Self {
             plugins: Vec::new(),
+            load_failures: Vec::new(),
             database: None,
             table_prefix: String::new(),
         };
@@ -143,6 +150,32 @@ impl PluginRuntime {
         }
         runtime.plugins.clear();
         Ok(())
+    }
+
+    pub fn failed_plugin_names(&self) -> Vec<String> {
+        self.load_failures.clone()
+    }
+
+    fn record_failed_paths(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            self.record_failed_path(path);
+        }
+    }
+
+    fn record_failed_path(&mut self, path: &Path) {
+        let Some(filename) = path.file_name().and_then(|filename| filename.to_str()) else {
+            return;
+        };
+        let Some(name) = filename.strip_suffix(".wasm") else {
+            return;
+        };
+        if !valid_plugin_name(name) {
+            return;
+        }
+        let filename = format!("{name}.wasm");
+        if !self.load_failures.contains(&filename) {
+            self.load_failures.push(filename);
+        }
     }
 
     pub fn loaded_plugin_names(&self) -> Vec<String> {
@@ -1077,6 +1110,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runtime.loaded_count(), 0);
+        let mut failed_plugins = runtime.failed_plugin_names();
+        failed_plugins.sort();
+        assert_eq!(
+            failed_plugins,
+            vec!["empty.wasm".to_owned(), "invalid.wasm".to_owned()]
+        );
         runtime.shutdown().await;
         fs::remove_dir_all(path).unwrap();
     }
