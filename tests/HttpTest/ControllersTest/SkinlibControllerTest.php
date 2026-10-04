@@ -692,9 +692,9 @@ class SkinlibControllerTest extends TestCase
 
         // without returning score
         option(['return_score' => false, 'private_score_per_storage' => 0]);
-        $uploader->score += 1000;
-        $uploader->save();
         $texture = Texture::factory()->private()->create(['uploader' => $uploader->uid]);
+        $uploader->score += $texture->size * (int) option('score_per_storage');
+        $uploader->save();
         $other = User::factory()->create();
         $other->closet()->attach($texture->tid, ['item_name' => 'a']);
         $this->putJson(route('texture.privacy', ['texture' => $texture]))
