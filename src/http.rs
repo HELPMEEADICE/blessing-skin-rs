@@ -3313,6 +3313,16 @@ struct HomePage {
     frontend_globals_b64: String,
 }
 
+fn legacy_site_description(value: Option<String>) -> String {
+    value.unwrap_or_else(|| crate::admin_settings::LEGACY_DEFAULT_SITE_DESCRIPTION.to_owned())
+}
+
+fn legacy_copyright_text(value: Option<String>, site_name: &str, site_url: &str) -> String {
+    value
+        .unwrap_or_else(|| crate::admin_settings::LEGACY_DEFAULT_COPYRIGHT_TEXT.to_owned())
+        .replace("{site_name}", site_name)
+        .replace("{site_url}", site_url)
+}
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let site_name = site_name(&state).await;
     let locale = &request_locale(&state);
@@ -3339,15 +3349,8 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
     .to_owned();
     let logout = if chinese { "登出" } else { "Log Out" }.to_owned();
-    let site_description = localized_site_option(&state, "site_description")
-        .await
-        .unwrap_or_else(|| {
-            if chinese {
-                "Minecraft 皮肤上传与托管服务".to_owned()
-            } else {
-                "Open-source Minecraft skin hosting service".to_owned()
-            }
-        });
+    let site_description =
+        legacy_site_description(localized_site_option(&state, "site_description").await);
     let home_pic_url = site_option(&state, "home_pic_url")
         .await
         .filter(|value| legacy_option_bool(Some(value)))
@@ -3451,11 +3454,11 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
         })
         .filter(|value| *value <= 6)
         .unwrap_or_default();
-    let copyright_text = localized_site_option(&state, "copyright_text")
-        .await
-        .unwrap_or_default()
-        .replace("{site_name}", &site_name)
-        .replace("{site_url}", &site_url);
+    let copyright_text = legacy_copyright_text(
+        localized_site_option(&state, "copyright_text").await,
+        &site_name,
+        &site_url,
+    );
 
     let mut authenticated_user = None;
     if let (Some(database), Some(uid)) =
@@ -22504,5 +22507,24 @@ mod tests {
         assert!(valid_player_name("é", "custom", "/^..$/", 1, 16));
         assert!(valid_player_name("é", "custom", "/^.$/u", 1, 16));
         assert!(valid_player_name("é", "custom", "/^\\w+$/u", 1, 16));
+    }
+    #[test]
+    fn missing_site_description_and_copyright_use_legacy_defaults() {
+        assert_eq!(
+            super::legacy_site_description(None),
+            "Open-source PHP Minecraft Skin Hosting Service"
+        );
+        assert_eq!(
+            super::legacy_copyright_text(None, "Blessing Skin", "https://skin.example"),
+            "<b>Copyright &copy; {year} <a href=\"https://skin.example\">Blessing Skin</a>.</b> All rights reserved."
+        );
+        assert_eq!(
+            super::legacy_copyright_text(
+                Some("For {site_name} at {site_url}".to_owned()),
+                "Blessing Skin",
+                "https://skin.example"
+            ),
+            "For Blessing Skin at https://skin.example"
+        );
     }
 }

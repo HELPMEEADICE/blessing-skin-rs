@@ -13,6 +13,10 @@ use serde_json::Value;
 use crate::{AppState, database::UserProfile, http};
 
 const NONE: &[(&str, &str)] = &[];
+pub(crate) const LEGACY_DEFAULT_SITE_DESCRIPTION: &str =
+    "Open-source PHP Minecraft Skin Hosting Service";
+pub(crate) const LEGACY_DEFAULT_COPYRIGHT_TEXT: &str =
+    "<b>Copyright &copy; {year} <a href=\"{site_url}\">{site_name}</a>.</b> All rights reserved.";
 const PLAYER_NAME_RULES: &[(&str, &str)] = &[
     ("official", "Official"),
     ("cjk", "CJK"),
@@ -82,7 +86,7 @@ struct Definition {
 }
 
 macro_rules! setting {
-    ($key:literal, $kind:literal, $default:literal) => {
+    ($key:literal, $kind:literal, $default:expr) => {
         Definition {
             key: $key,
             kind: $kind,
@@ -94,7 +98,7 @@ macro_rules! setting {
             choices: NONE,
         }
     };
-    ($key:literal, $kind:literal, $default:literal, localized) => {
+    ($key:literal, $kind:literal, $default:expr, localized) => {
         Definition {
             key: $key,
             kind: $kind,
@@ -106,7 +110,7 @@ macro_rules! setting {
             choices: NONE,
         }
     };
-    ($key:literal, $kind:literal, $default:literal, $min:expr, $max:expr) => {
+    ($key:literal, $kind:literal, $default:expr, $min:expr, $max:expr) => {
         Definition {
             key: $key,
             kind: $kind,
@@ -118,7 +122,7 @@ macro_rules! setting {
             choices: NONE,
         }
     };
-    ($key:literal, $kind:literal, $default:literal, $choices:expr) => {
+    ($key:literal, $kind:literal, $default:expr, $choices:expr) => {
         Definition {
             key: $key,
             kind: $kind,
@@ -137,7 +141,7 @@ const GENERAL: &[Definition] = &[
     setting!(
         "site_description",
         "text",
-        "Open-source Minecraft skin hosting service",
+        LEGACY_DEFAULT_SITE_DESCRIPTION,
         localized
     ),
     setting!("site_url", "url", ""),
@@ -216,7 +220,12 @@ const CUSTOMIZE: &[Definition] = &[
     setting!("hide_intro", "checkbox", "false"),
     setting!("fixed_bg", "checkbox", "false"),
     setting!("copyright_prefer", "select", "0", COPYRIGHT_STYLES),
-    setting!("copyright_text", "textarea", "", localized),
+    setting!(
+        "copyright_text",
+        "textarea",
+        LEGACY_DEFAULT_COPYRIGHT_TEXT,
+        localized
+    ),
     setting!("custom_css", "textarea", ""),
     setting!("custom_js", "textarea", ""),
     setting!("navbar_color", "select", "cyan", NAVBAR_COLORS),
@@ -800,7 +809,10 @@ fn chinese_choice(value: &str, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CUSTOMIZE, GENERAL, SCORE, normalize_value};
+    use super::{
+        CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION, SCORE,
+        normalize_value,
+    };
     use serde_json::json;
 
     #[test]
@@ -841,5 +853,19 @@ mod tests {
             .find(|setting| setting.key == "navbar_color")
             .unwrap();
         assert_eq!(normalize_value(color, &json!("rgb(1,2,3)")), None);
+    }
+    #[test]
+    fn site_setting_defaults_match_legacy_php_options() {
+        let site_description = GENERAL
+            .iter()
+            .find(|setting| setting.key == "site_description")
+            .unwrap();
+        assert_eq!(site_description.default, LEGACY_DEFAULT_SITE_DESCRIPTION);
+
+        let copyright_text = CUSTOMIZE
+            .iter()
+            .find(|setting| setting.key == "copyright_text")
+            .unwrap();
+        assert_eq!(copyright_text.default, LEGACY_DEFAULT_COPYRIGHT_TEXT);
     }
 }
