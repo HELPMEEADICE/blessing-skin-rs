@@ -1020,7 +1020,6 @@ struct EmailVerificationPage {
 #[derive(Deserialize, Default)]
 struct LoginPageQuery {
     redirect_to: Option<String>,
-    identification: Option<String>,
 }
 
 fn safe_local_redirect(target: Option<&str>) -> Option<String> {
@@ -1391,11 +1390,8 @@ async fn login_page(
     let stylesheet = stylesheet.unwrap_or_default();
     let frontend_script = frontend_script.unwrap_or_default();
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
-    let failures = query
-        .identification
-        .as_deref()
-        .map(|identification| login_failure_count(&state, identification) > 3)
-        .unwrap_or(false);
+    let client_ip = registration_client_ip(&headers);
+    let failures = login_failure_count(&state, &client_ip) > 3;
     let (recaptcha_sitekey, recaptcha_invisible) = match &state.database {
         Some(database) => {
             let prefix = &state.config.database.table_prefix;
@@ -3012,7 +3008,8 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(password) = request.password.filter(|value| !value.is_empty()) else {
         return validation_error("password", &locale);
     };
-    let failures = login_failure_count(&state, &identification);
+    let failure_key = registration_client_ip(&headers);
+    let failures = login_failure_count(&state, &failure_key);
     if failures > 3 {
         let captcha_valid = if let Some(captcha) = request.captcha.as_deref() {
             match verify_registration_captcha(&state, &headers, captcha).await {
@@ -3081,7 +3078,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
                     now.duration_since(*updated) < Duration::from_secs(3600)
                 });
             }
-            let entry = attempts.entry(identification.clone()).or_insert((0, now));
+            let entry = attempts.entry(failure_key.clone()).or_insert((0, now));
             if now.duration_since(entry.1) >= Duration::from_secs(3600) {
                 entry.0 = 0;
             }
@@ -3138,7 +3135,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         .login_failures
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&identification);
+        .remove(&failure_key);
 
     let message = if locale.starts_with("zh") {
         "登录成功，欢迎回来"
@@ -15448,6 +15445,42 @@ mod tests {
         assert_eq!(translations["auth"]["login"], "Sign in");
         assert!(translations.get("broken").is_none());
     }
+    async fn login_page_too_many_fails(app: &axum::Router, ip: &str) -> bool {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+        };
+        use base64::Engine as _;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login")
+                    .header("x-real-ip", ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        let encoded = html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let globals = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let globals: serde_json::Value = serde_json::from_slice(&globals).unwrap();
+        globals["extra"]["tooManyFails"].as_bool().unwrap()
+    }
+
     async fn submit_test_registration(
         app: &axum::Router,
         cookie: &str,
@@ -20041,6 +20074,7 @@ mod tests {
                 .contains("2 accounts")
         );
 
+        let login_ip = "198.51.100.41";
         for expected_failures in 1..=4 {
             let failed_login = app
                 .clone()
@@ -20048,6 +20082,7 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri("/auth/login")
+                        .header("x-real-ip", login_ip)
                         .header("content-type", "application/json")
                         .body(Body::from(
                             r#"{"identification":"alex@example.test","password":"incorrect horse"}"#,
@@ -20070,9 +20105,10 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/login")
+                    .header("x-real-ip", login_ip)
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"identification":"alex@example.test","password":"correct horse","keep":true}"#,
+                        r#"{"identification":"different-account@example.test","password":"correct horse","keep":true}"#,
                     ))
                     .unwrap(),
             )
@@ -20086,6 +20122,31 @@ mod tests {
         .unwrap();
         assert_eq!(captcha_required["code"], 1);
         assert_eq!(captcha_required["data"]["login_fails"], 4);
+        assert!(login_page_too_many_fails(&app, login_ip).await);
+        assert!(!login_page_too_many_fails(&app, "198.51.100.42").await);
+
+        let isolated_failure = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("x-real-ip", "198.51.100.42")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"identification":"alex@example.test","password":"incorrect horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let isolated_failure: serde_json::Value = serde_json::from_slice(
+            &to_bytes(isolated_failure.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(isolated_failure["data"]["login_fails"], 1);
 
         let (captcha_cookie, captcha_answer) = issue_test_captcha(&app, &captcha_challenges).await;
         let login = app
@@ -20094,6 +20155,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/login?lang=en")
+                    .header("x-real-ip", "198.51.100.41")
                     .header("cookie", captcha_cookie)
                     .header("content-type", "application/json")
                     .body(Body::from(
