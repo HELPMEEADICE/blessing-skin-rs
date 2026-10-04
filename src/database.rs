@@ -8537,7 +8537,7 @@ mod tests {
 
 #[cfg(test)]
 mod language_line_tests {
-    use super::DatabasePool;
+    use super::{DatabasePool, PlayerAddOutcome, TextureUploadOutcome};
     use sqlx::{
         mysql::{MySqlConnectOptions, MySqlPoolOptions},
         postgres::{PgConnectOptions, PgPoolOptions},
@@ -8748,23 +8748,37 @@ mod language_line_tests {
             rand::random::<u32>()
         );
         // Keep this fixture aligned with the final schema produced by the legacy PHP migrations.
-        let (integer_type, timestamp_type, long_text_type) = match &database {
-            DatabasePool::Sqlite(_) => ("INTEGER", "DATETIME", "TEXT"),
-            DatabasePool::MySql(_) => ("INT UNSIGNED", "DATETIME", "LONGTEXT"),
-            DatabasePool::Postgres(_) => ("INTEGER", "TIMESTAMP", "TEXT"),
-        };
+        let (integer_type, integer_primary_key_type, timestamp_type, long_text_type) =
+            match &database {
+                DatabasePool::Sqlite(_) => (
+                    "INTEGER",
+                    "INTEGER PRIMARY KEY AUTOINCREMENT",
+                    "DATETIME",
+                    "TEXT",
+                ),
+                DatabasePool::MySql(_) => (
+                    "INT",
+                    "INT UNSIGNED AUTO_INCREMENT PRIMARY KEY",
+                    "DATETIME",
+                    "LONGTEXT",
+                ),
+                DatabasePool::Postgres(_) => ("INTEGER", "SERIAL PRIMARY KEY", "TIMESTAMP", "TEXT"),
+            };
         let statements = [
             format!(
-                "CREATE TABLE {prefix}users (uid {integer_type} PRIMARY KEY, email VARCHAR(100) NOT NULL, nickname VARCHAR(50) NOT NULL DEFAULT '', locale VARCHAR(255) NULL, score INTEGER NOT NULL, avatar INTEGER NOT NULL DEFAULT 0, password VARCHAR(255) NOT NULL, ip VARCHAR(45) NOT NULL, is_dark_mode BOOLEAN NOT NULL DEFAULT FALSE, permission INTEGER NOT NULL DEFAULT 0, last_sign_at {timestamp_type} NOT NULL, register_at {timestamp_type} NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, verification_token VARCHAR(255) NOT NULL DEFAULT '', remember_token VARCHAR(100) NULL)"
+                "CREATE TABLE {prefix}users (uid {integer_primary_key_type}, email VARCHAR(100) NOT NULL, nickname VARCHAR(50) NOT NULL DEFAULT '', locale VARCHAR(255) NULL, score INTEGER NOT NULL, avatar INTEGER NOT NULL DEFAULT 0, password VARCHAR(255) NOT NULL, ip VARCHAR(45) NOT NULL, is_dark_mode BOOLEAN NOT NULL DEFAULT FALSE, permission INTEGER NOT NULL DEFAULT 0, last_sign_at {timestamp_type} NOT NULL, register_at {timestamp_type} NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, verification_token VARCHAR(255) NOT NULL DEFAULT '', remember_token VARCHAR(100) NULL)"
             ),
             format!(
-                "CREATE TABLE {prefix}players (pid {integer_type} PRIMARY KEY, uid {integer_type} NOT NULL, name VARCHAR(50) NOT NULL, tid_cape INTEGER NOT NULL DEFAULT 0, last_modified {timestamp_type} NOT NULL, tid_skin INTEGER NOT NULL DEFAULT -1)"
+                "CREATE TABLE {prefix}players (pid {integer_primary_key_type}, uid {integer_type} NOT NULL, name VARCHAR(50) NOT NULL, tid_cape INTEGER NOT NULL DEFAULT 0, last_modified {timestamp_type} NOT NULL, tid_skin INTEGER NOT NULL DEFAULT -1)"
             ),
             format!(
-                "CREATE TABLE {prefix}textures (tid {integer_type} PRIMARY KEY, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size INTEGER NOT NULL, uploader {integer_type} NOT NULL, public BOOLEAN NOT NULL, upload_at {timestamp_type} NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
+                "CREATE TABLE {prefix}textures (tid {integer_primary_key_type}, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size INTEGER NOT NULL, uploader {integer_type} NOT NULL, public BOOLEAN NOT NULL, upload_at {timestamp_type} NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
             ),
             format!(
-                "CREATE TABLE {prefix}options (id {integer_type} PRIMARY KEY, option_name VARCHAR(50) NOT NULL, option_value {long_text_type} NOT NULL)"
+                "CREATE TABLE {prefix}options (id {integer_primary_key_type}, option_name VARCHAR(50) NOT NULL, option_value {long_text_type} NOT NULL)"
+            ),
+            format!(
+                "CREATE TABLE {prefix}user_closet (user_uid {integer_type} NOT NULL, texture_tid {integer_type} NOT NULL, item_name TEXT NULL)"
             ),
             format!(
                 "CREATE TABLE {prefix}oauth_access_tokens (id VARCHAR(100) PRIMARY KEY, user_id BIGINT NULL, client_id BIGINT NOT NULL, name VARCHAR(100) NULL, scopes TEXT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at {timestamp_type} NULL, updated_at {timestamp_type} NULL, expires_at {timestamp_type} NULL)"
@@ -8876,6 +8890,55 @@ mod language_line_tests {
             Some("Rust-backed Legacy Skin")
         );
 
+        let added_player = match database.add_player(&prefix, 7, "Steve", 4).await.unwrap() {
+            PlayerAddOutcome::Added(player) => player,
+            outcome => panic!("expected a player to be added, got {outcome:?}"),
+        };
+        assert_eq!(added_player.name, "Steve");
+        assert_eq!(added_player.uid, 7);
+        assert_ne!(added_player.pid, 3);
+
+        let uploaded_texture_id = match database
+            .upload_texture(
+                &prefix,
+                "Rust upload",
+                "alex",
+                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                256,
+                7,
+                true,
+                5,
+            )
+            .await
+            .unwrap()
+        {
+            TextureUploadOutcome::Uploaded(tid) => tid,
+            outcome => panic!("expected the legacy texture upload to succeed, got {outcome:?}"),
+        };
+        let uploaded_texture = database
+            .texture_info(&prefix, uploaded_texture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploaded_texture.name, "Rust upload");
+        assert_eq!(
+            uploaded_texture.hash,
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        );
+        assert_eq!(
+            database.closet_item_ids(&prefix, 7).await.unwrap(),
+            vec![uploaded_texture_id]
+        );
+        assert_eq!(
+            database
+                .user_profile(&prefix, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .score,
+            33
+        );
+
         let legacy_token = database
             .access_token(&prefix, "legacy-token")
             .await
@@ -8970,6 +9033,7 @@ mod language_line_tests {
             "wasm_plugin_state",
             "oauth_access_tokens",
             "options",
+            "user_closet",
             "textures",
             "players",
             "users",
