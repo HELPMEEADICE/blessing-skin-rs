@@ -63,6 +63,11 @@ pub struct MailConfig {
     pub mailer: String,
     pub url: Option<String>,
     pub sendmail_path: String,
+    pub mailgun_domain: Option<String>,
+    pub mailgun_secret: Option<String>,
+    pub mailgun_endpoint: String,
+    pub postmark_token: Option<String>,
+    pub postmark_message_stream: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
@@ -174,6 +179,14 @@ impl MailConfig {
             url: value("MAIL_URL").filter(|value| !value.trim().is_empty()),
             sendmail_path: value("MAIL_SENDMAIL_PATH")
                 .unwrap_or_else(|| "/usr/sbin/sendmail -bs -i".to_owned()),
+            mailgun_domain: value("MAILGUN_DOMAIN").filter(|value| !value.trim().is_empty()),
+            mailgun_secret: value("MAILGUN_SECRET").filter(|value| !value.trim().is_empty()),
+            mailgun_endpoint: value("MAILGUN_ENDPOINT")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "api.mailgun.net".to_owned()),
+            postmark_token: value("POSTMARK_TOKEN").filter(|value| !value.trim().is_empty()),
+            postmark_message_stream: value("POSTMARK_MESSAGE_STREAM_ID")
+                .filter(|value| !value.trim().is_empty()),
             host: value("MAIL_HOST").unwrap_or_else(|| "smtp.mailgun.org".to_owned()),
             port: parse_port_value(value("MAIL_PORT"), 587),
             username: value("MAIL_USERNAME").filter(|value| !value.is_empty()),
@@ -587,6 +600,11 @@ mod tests {
         assert_eq!(mail.mailer, "smtp");
         assert!(mail.url.is_none());
         assert_eq!(mail.sendmail_path, "/usr/sbin/sendmail -bs -i");
+        assert!(mail.mailgun_domain.is_none());
+        assert!(mail.mailgun_secret.is_none());
+        assert_eq!(mail.mailgun_endpoint, "api.mailgun.net");
+        assert!(mail.postmark_token.is_none());
+        assert!(mail.postmark_message_stream.is_none());
         assert_eq!(mail.host, "smtp.mailgun.org");
         assert_eq!(mail.port, 587);
         assert_eq!(mail.encryption, "tls");
@@ -595,6 +613,26 @@ mod tests {
         assert_eq!(mail.from_name, "Example");
         assert!(mail.username.is_none());
         assert!(mail.password.is_none());
+    }
+
+    #[test]
+    fn mail_configuration_reads_legacy_provider_environment_values() {
+        let mail = MailConfig::from_values(|name| match name {
+            "MAILGUN_DOMAIN" => Some("mg.example.test".to_owned()),
+            "MAILGUN_SECRET" => Some("mailgun-secret".to_owned()),
+            "MAILGUN_ENDPOINT" => Some("api.eu.mailgun.net".to_owned()),
+            "POSTMARK_TOKEN" => Some("postmark-token".to_owned()),
+            "POSTMARK_MESSAGE_STREAM_ID" => Some("transactional".to_owned()),
+            _ => None,
+        });
+        assert_eq!(mail.mailgun_domain.as_deref(), Some("mg.example.test"));
+        assert_eq!(mail.mailgun_secret.as_deref(), Some("mailgun-secret"));
+        assert_eq!(mail.mailgun_endpoint, "api.eu.mailgun.net");
+        assert_eq!(mail.postmark_token.as_deref(), Some("postmark-token"));
+        assert_eq!(
+            mail.postmark_message_stream.as_deref(),
+            Some("transactional")
+        );
     }
 
     #[test]

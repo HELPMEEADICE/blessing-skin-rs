@@ -10,6 +10,7 @@ use lettre::{
     },
 };
 use percent_encoding::percent_decode_str;
+use reqwest::{Client, multipart::Form, redirect::Policy};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::Command,
@@ -178,6 +179,8 @@ pub async fn send_email(
         }
         "smtp" => send_smtp_email(config, recipient, subject, body).await,
         "sendmail" => send_sendmail_email(config, recipient, subject, body).await,
+        "mailgun" => send_mailgun_email(config, recipient, subject, body).await,
+        "postmark" => send_postmark_email(config, recipient, subject, body).await,
         "" => Err("Email delivery is not configured.".to_owned()),
         mailer => Err(format!("Unsupported mailer: {mailer}")),
     }
@@ -515,20 +518,174 @@ fn smtp_data(message: &[u8]) -> Vec<u8> {
     data
 }
 
+fn mailgun_url(domain: &str, endpoint: &str) -> Result<Url, String> {
+    let domain = domain.trim();
+    if domain.is_empty()
+        || !domain
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+    {
+        return Err("MAILGUN_DOMAIN must be a valid DNS name.".to_owned());
+    }
+
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err("MAILGUN_ENDPOINT is empty.".to_owned());
+    }
+    let raw_url = if endpoint.contains("://") {
+        endpoint.to_owned()
+    } else {
+        format!("https://{endpoint}")
+    };
+    let mut url =
+        Url::parse(&raw_url).map_err(|error| format!("Invalid MAILGUN_ENDPOINT: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "MAILGUN_ENDPOINT must include a host.".to_owned())?;
+    if url.scheme() != "https"
+        || (!host.eq_ignore_ascii_case("mailgun.net")
+            && !host.to_ascii_lowercase().ends_with(".mailgun.net"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("MAILGUN_ENDPOINT must be an HTTPS Mailgun API host.".to_owned());
+    }
+
+    url.set_path("");
+    url.path_segments_mut()
+        .map_err(|_| "MAILGUN_ENDPOINT cannot be used as a base URL.".to_owned())?
+        .extend(["v3", domain, "messages"]);
+    Ok(url)
+}
+
+fn mailgun_fields(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let from = from_mailbox(config)?.to_string();
+    Ok(vec![
+        ("from".to_owned(), from),
+        ("to".to_owned(), recipient.to_owned()),
+        ("subject".to_owned(), subject.to_owned()),
+        ("text".to_owned(), body.to_owned()),
+    ])
+}
+
+fn postmark_payload(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    let mut payload = serde_json::json!({
+        "From": from_mailbox(config)?.to_string(),
+        "To": recipient,
+        "Subject": subject,
+        "TextBody": body,
+    });
+    if let Some(message_stream) = &config.postmark_message_stream {
+        payload["MessageStream"] = serde_json::Value::String(message_stream.clone());
+    }
+    Ok(payload)
+}
+
+fn mail_api_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(Policy::none())
+        .build()
+        .map_err(|error| format!("Could not configure mail API client: {error}"))
+}
+
+async fn check_mail_api_response(
+    provider: &str,
+    response: reqwest::Response,
+) -> Result<(), String> {
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("{provider} mail API returned HTTP {status}"))
+    }
+}
+
+async fn send_mailgun_email(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    let domain = config
+        .mailgun_domain
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "MAILGUN_DOMAIN is not configured.".to_owned())?;
+    let secret = config
+        .mailgun_secret
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "MAILGUN_SECRET is not configured.".to_owned())?;
+    let url = mailgun_url(domain, &config.mailgun_endpoint)?;
+    let fields = mailgun_fields(config, recipient, subject, body)?;
+    let form = fields
+        .into_iter()
+        .fold(Form::new(), |form, (name, value)| form.text(name, value));
+    let response = mail_api_client()?
+        .post(url)
+        .basic_auth("api", Some(secret))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| format!("Mailgun delivery failed: {error}"))?;
+    check_mail_api_response("Mailgun", response).await
+}
+
+async fn send_postmark_email(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    let token = config
+        .postmark_token
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "POSTMARK_TOKEN is not configured.".to_owned())?;
+    let payload = postmark_payload(config, recipient, subject, body)?;
+    let response = mail_api_client()?
+        .post("https://api.postmarkapp.com/email")
+        .header("Accept", "application/json")
+        .header("X-Postmark-Server-Token", token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Postmark delivery failed: {error}"))?;
+    check_mail_api_response("Postmark", response).await
+}
+
+fn from_mailbox(config: &MailConfig) -> Result<Mailbox, String> {
+    let address = config
+        .from_address
+        .parse()
+        .map_err(|error| format!("Invalid MAIL_FROM_ADDRESS: {error}"))?;
+    Ok(Mailbox::new(Some(config.from_name.clone()), address))
+}
+
 fn build_message(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<Message, String> {
-    let from_address = config
-        .from_address
-        .parse()
-        .map_err(|error| format!("Invalid MAIL_FROM_ADDRESS: {error}"))?;
+    let from = from_mailbox(config)?;
     let to_address = recipient
         .parse()
         .map_err(|error| format!("Invalid recipient address: {error}"))?;
-    let from = Mailbox::new(Some(config.from_name.clone()), from_address);
     let to = Mailbox::new(None, to_address);
     Message::builder()
         .from(from)
@@ -602,8 +759,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SendmailMode, SmtpMode, build_message, sendmail_mode, smtp_data, smtp_mode,
-        smtp_sendmail_session, smtp_settings, split_sendmail_command,
+        SendmailMode, SmtpMode, build_message, mailgun_fields, mailgun_url, postmark_payload,
+        sendmail_mode, smtp_data, smtp_mode, smtp_sendmail_session, smtp_settings,
+        split_sendmail_command,
     };
     use crate::config::MailConfig;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -763,6 +921,79 @@ mod tests {
 
         let data = server_task.await.unwrap();
         assert!(data.contains("..dot\r\n"));
+    }
+
+    #[test]
+    fn builds_mailgun_requests_for_the_configured_region() {
+        let config = MailConfig {
+            from_address: "noreply@example.test".to_owned(),
+            from_name: "Blessing Skin".to_owned(),
+            ..MailConfig::default()
+        };
+        assert_eq!(
+            mailgun_url("mg.example.test", "api.eu.mailgun.net")
+                .unwrap()
+                .as_str(),
+            "https://api.eu.mailgun.net/v3/mg.example.test/messages"
+        );
+        let fields = mailgun_fields(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            "Use this code: 123",
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                (
+                    "from".to_owned(),
+                    "Blessing Skin <noreply@example.test>".to_owned()
+                ),
+                ("to".to_owned(), "skin-user@example.test".to_owned()),
+                ("subject".to_owned(), "Verify account".to_owned()),
+                ("text".to_owned(), "Use this code: 123".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_insecure_or_non_mailgun_api_endpoints() {
+        for endpoint in [
+            "http://api.mailgun.net",
+            "https://attacker.example.test",
+            "https://api.mailgun.net/other-path",
+            "https://user:secret@api.mailgun.net",
+        ] {
+            assert!(mailgun_url("mg.example.test", endpoint).is_err());
+        }
+        assert!(mailgun_url("mg.example.test/path", "api.mailgun.net").is_err());
+    }
+
+    #[test]
+    fn builds_postmark_plain_text_payload_and_optional_stream() {
+        let config = MailConfig {
+            from_address: "noreply@example.test".to_owned(),
+            from_name: "Blessing Skin".to_owned(),
+            postmark_message_stream: Some("transactional".to_owned()),
+            ..MailConfig::default()
+        };
+        assert_eq!(
+            postmark_payload(
+                &config,
+                "skin-user@example.test",
+                "Verify account",
+                "Use this code: 123",
+            )
+            .unwrap(),
+            serde_json::json!({
+                "From": "Blessing Skin <noreply@example.test>",
+                "To": "skin-user@example.test",
+                "Subject": "Verify account",
+                "TextBody": "Use this code: 123",
+                "MessageStream": "transactional",
+            })
+        );
     }
 
     #[test]
