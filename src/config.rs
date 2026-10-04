@@ -4,6 +4,8 @@ use sqlx::{mysql::MySqlConnectOptions, postgres::PgConnectOptions, sqlite::Sqlit
 use thiserror::Error;
 
 const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
+const DEFAULT_RUST_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/HELPMEEADICE/blessing-skin-rs/releases/latest";
 
 /// Read an environment value using Laravel's reserved `.env` value semantics.
 /// Laravel's `Env::get` converts `null` and `(null)` to `None`, and `empty` and
@@ -48,6 +50,7 @@ pub struct Config {
     pub textures_dir: PathBuf,
     pub plugins_dir: PathBuf,
     pub wasm_plugin_registry_url: Option<String>,
+    pub rust_releases_api_url: Option<String>,
     pub app_url: String,
     pub passport_public_key: Option<Vec<u8>>,
     pub passport_private_key: Option<Vec<u8>>,
@@ -152,6 +155,11 @@ impl Config {
             plugins_dir,
             wasm_plugin_registry_url: legacy_env("WASM_PLUGIN_REGISTRY_URL")
                 .filter(|value| !value.trim().is_empty()),
+            rust_releases_api_url: match legacy_env("RUST_RELEASES_API_URL") {
+                Some(value) if value.is_empty() => None,
+                Some(value) => Some(value),
+                None => Some(DEFAULT_RUST_RELEASES_API_URL.to_owned()),
+            },
             app_url: legacy_env("APP_URL").unwrap_or_else(|| "http://localhost".to_owned()),
             passport_public_key,
             passport_private_key: load_passport_key(

@@ -3558,6 +3558,12 @@ struct AdminUpdatePage {
     site_name: String,
     locale: String,
     version: String,
+    latest_version: String,
+    has_release_info: bool,
+    update_available: bool,
+    update_check_failed: bool,
+    update_check_disabled: bool,
+    update_check_no_release: bool,
     releases_url: String,
 }
 
@@ -4666,10 +4672,40 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let (
+        latest_version,
+        has_release_info,
+        update_available,
+        update_check_failed,
+        update_check_no_release,
+    ) = if let Some(api_url) = &state.config.rust_releases_api_url {
+        match crate::update::check_latest_release(api_url, state.config.version).await {
+            Ok(Some(release)) => (
+                release.version,
+                true,
+                release.update_available,
+                false,
+                false,
+            ),
+            Ok(None) => (String::new(), false, false, false, true),
+            Err(error) => {
+                tracing::warn!(%error, "failed to check for a newer Rust release");
+                (String::new(), false, false, true, false)
+            }
+        }
+    } else {
+        (String::new(), false, false, false, false)
+    };
     let page = AdminUpdatePage {
         site_name: site_name(&state).await,
         locale: request_locale(&state),
         version: state.config.version.to_owned(),
+        latest_version,
+        has_release_info,
+        update_available,
+        update_check_failed,
+        update_check_disabled: state.config.rust_releases_api_url.is_none(),
+        update_check_no_release,
         releases_url: "https://github.com/HELPMEEADICE/blessing-skin-rs/releases".to_owned(),
     };
     match page.render() {
@@ -16892,6 +16928,7 @@ mod tests {
             textures_dir: PathBuf::new(),
             plugins_dir: PathBuf::new(),
             wasm_plugin_registry_url: None,
+            rust_releases_api_url: None,
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
             passport_private_key: None,
@@ -17591,6 +17628,7 @@ mod tests {
             textures_dir: texture_test_dir.clone(),
             plugins_dir: PathBuf::new(),
             wasm_plugin_registry_url: None,
+            rust_releases_api_url: None,
             app_url: "http://localhost".to_owned(),
             passport_public_key: None,
             passport_private_key: None,
@@ -18626,6 +18664,7 @@ mod tests {
         .unwrap();
         assert!(update_html.contains("Rust service releases"));
         assert!(update_html.contains("Current version"));
+        assert!(update_html.contains("Release checks are disabled."));
         assert!(update_html.contains("https://github.com/HELPMEEADICE/blessing-skin-rs/releases"));
         assert!(update_html.contains("storage"));
         let update_download =

@@ -80,6 +80,35 @@
           endif %}
         </h2>
         <p class="version">{{ version }}</p>
+        {% if update_check_failed %}
+        <p role="status">
+          {% if locale.starts_with("zh")
+          %}暂时无法检查最新版本；仍可打开发行页手动查看。{% else %}Could not
+          check for a newer release. You can still view releases manually.{%
+          endif %}
+        </p>
+        {% else if update_check_disabled %}
+        <p role="status">
+          {% if locale.starts_with("zh") %}版本检查已禁用。{% else %}Release
+          checks are disabled.{% endif %}
+        </p>
+        {% else if update_check_no_release %}
+        <p role="status">
+          {% if locale.starts_with("zh") %}该仓库尚未发布正式发行版。{% else
+          %}This repository has not published a release yet.{% endif %}
+        </p>
+        {% else if has_release_info %}
+        <p role="status">
+          {% if update_available %} {% if locale.starts_with("zh")
+          %}发现新版本：<strong>{{ latest_version }}</strong>。{% else %}New
+          version available: <strong>{{ latest_version }}</strong>.{% endif %}
+          {% else %} {% if locale.starts_with("zh") %}最新版本：<strong
+            >{{ latest_version }}</strong
+          >；当前已是最新版本。{% else %}Latest version:
+          <strong>{{ latest_version }}</strong>; this service is up to date.{%
+          endif %} {% endif %}
+        </p>
+        {% endif %}
         <p>
           {% if locale.starts_with("zh") %}发行包提供 Linux
           x86_64/ARM64、Windows x86_64 和 macOS x86_64/ARM64 版本。{% else

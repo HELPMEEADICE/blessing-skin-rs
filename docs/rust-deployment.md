@@ -41,6 +41,7 @@ cargo build --locked --release
 | `PUBLIC_PATH`                                                                           | 默认 `public`；提供 `app/` 前端 bundle 和其余公开静态文件；隐藏文件、`storage/` 路径和 PHP 源文件不会通过 Rust 服务                                                                                                                                   |
 | `TEXTURES_DIR`                                                                          | 默认 `$STORAGE_PATH/textures`；请指向旧站实际纹理目录                                                                                                                                                                                                 |
 | `PLUGINS_DIR`                                                                           | 默认 `$STORAGE_PATH/plugins`；只扫描 `.wasm` 组件，不运行 PHP 插件                                                                                                                                                                                    |
+| `RUST_RELEASES_API_URL`                                                                 | 默认查询本项目 GitHub latest release；设为空字符串可关闭管理后台版本检查。检查失败不影响服务，升级仍由管理员下载匹配平台发行包并手动替换程序和前端资源                                                                                                |
 | `WASM_PLUGIN_REGISTRY_URL`                                                              | 可选；管理员插件市场使用的可信版本 1 JSON 清单 URL，必须为公网 HTTPS；未设置时市场安装功能关闭                                                                                                                                                        |
 | `APP_URL`                                                                               | 对外站点 URL，默认 `http://localhost`                                                                                                                                                                                                                 |
 | `APP_LOCALE`                                                                            | 默认 `zh_CN`                                                                                                                                                                                                                                          |
@@ -66,7 +67,7 @@ Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-in
 
 从 [GitHub Releases](https://github.com/HELPMEEADICE/blessing-skin-rs/releases) 下载与你的系统和架构匹配的软件包。发行包包含独立 Rust 程序、前端资源和部署文档。升级前备份数据库与纹理目录；停止当前服务后替换程序和 `public/app`，保留 `.env`、`storage`、Passport 密钥和纹理文件，再启动服务并检查 `/health/ready`。已有 PHP 站点不需要重新运行安装器。
 
-管理后台的“版本更新”页面提供当前程序版本和发行页入口。Rust 服务不在运行中覆盖自身文件，`POST /admin/update/download` 会返回人工升级提示。
+管理后台的“版本更新”页面查询配置的 latest release API，并显示最新版本和更新状态；尚无正式发行版时会明确提示，网络失败只显示提示，不影响服务。Rust 服务不在运行中覆盖自身文件，`POST /admin/update/download` 会返回人工升级步骤，需由管理员下载匹配平台发行包并停止服务后替换程序和前端资源。
 
 ## 本地启动
 

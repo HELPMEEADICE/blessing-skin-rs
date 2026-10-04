@@ -2032,6 +2032,7 @@ mod integration_tests {
             textures_dir: PathBuf::new(),
             plugins_dir: PathBuf::new(),
             wasm_plugin_registry_url: None,
+            rust_releases_api_url: None,
             app_url: "https://skin.example.test".to_owned(),
             passport_public_key: Some(public_key.to_vec()),
             passport_private_key: Some(private_key.to_vec()),
