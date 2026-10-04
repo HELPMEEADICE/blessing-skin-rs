@@ -14248,9 +14248,6 @@ async fn avatar_by_player(
             return unavailable();
         }
     };
-    if profile.permission == -1 {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let source = profile
         .skin_hash
         .zip(profile.skin_type)
@@ -16828,6 +16825,25 @@ mod tests {
         let decoded_avatar = image::load_from_memory(&avatar_webp).unwrap();
         assert_eq!((decoded_avatar.width(), decoded_avatar.height()), (24, 24));
 
+        sqlx::query("UPDATE users SET permission = -1 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let banned_player_avatar = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/avatar/player/Alex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(banned_player_avatar.status(), StatusCode::OK);
+        sqlx::query("UPDATE users SET permission = 1 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
         let login_page = app
             .clone()
             .oneshot(
