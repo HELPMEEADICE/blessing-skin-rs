@@ -225,10 +225,18 @@ fn normalize_locale(locale: &str) -> Option<&'static str> {
         .to_ascii_lowercase()
         .as_str()
     {
-        "zh_cn" | "zh_hans_cn" => Some("zh_CN"),
-        "zh_tw" => Some("zh_TW"),
-        "en" | "en_us" => Some("en"),
-        "es_es" => Some("es_ES"),
+        "zh" | "zh_cn" | "zh_hans" | "zh_hans_cn" => Some("zh_CN"),
+        "zh_tw" | "zh_hant" | "zh_hant_tw" => Some("zh_TW"),
+        "en" | "en_us" | "en_gb" => Some("en"),
+        "de" | "de_de" => Some("de_DE"),
+        "el" | "el_gr" => Some("el_GR"),
+        "es" | "es_es" => Some("es_ES"),
+        "fr" | "fr_fr" => Some("fr_FR"),
+        "it" | "it_it" => Some("it_IT"),
+        "ja" | "ja_jp" => Some("ja_JP"),
+        "ko" | "ko_kr" => Some("ko_KR"),
+        "nl" | "nl_nl" => Some("nl_NL"),
+        "pt" | "pt_pt" => Some("pt_PT"),
         "ru" | "ru_ru" => Some("ru_RU"),
         _ => None,
     }
@@ -14874,7 +14882,15 @@ mod tests {
         assert_eq!(super::normalize_locale("zh-HANS-CN"), Some("zh_CN"));
         assert_eq!(super::normalize_locale("en_US"), Some("en"));
         assert_eq!(super::normalize_locale("ru"), Some("ru_RU"));
-        assert_eq!(super::normalize_locale("fr"), None);
+        for locale in [
+            "de_DE", "el_GR", "en", "es_ES", "fr_FR", "it_IT", "ja_JP", "ko_KR", "nl_NL", "pt_PT",
+            "ru_RU", "zh_CN", "zh_TW",
+        ] {
+            assert_eq!(super::normalize_locale(locale), Some(locale), "{locale}");
+        }
+        assert_eq!(super::normalize_locale("fr"), Some("fr_FR"));
+        assert_eq!(super::normalize_locale("zh-Hant"), Some("zh_TW"));
+        assert_eq!(super::normalize_locale("fr-CA"), None);
 
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -16872,7 +16888,7 @@ mod tests {
         let invalid_locale_page = app
             .clone()
             .oneshot(
-                Request::get("/auth/login?lang=fr")
+                Request::get("/auth/login?lang=fr-CA")
                     .header("accept-language", "ru")
                     .body(Body::empty())
                     .unwrap(),
