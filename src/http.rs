@@ -8638,7 +8638,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 struct ApiRoot {
     blessing_skin: &'static str,
     spec: u8,
-    copyright: &'static str,
+    copyright: Option<&'static str>,
     site_name: String,
 }
 
@@ -14047,6 +14047,14 @@ async fn api_root(State(state): State<AppState>) -> Response {
     }
 }
 
+fn copyright_for_preference(preference: Option<&str>) -> Option<&'static str> {
+    let key = preference.unwrap_or("0");
+    COPYRIGHTS
+        .iter()
+        .enumerate()
+        .find_map(|(index, copyright)| (key == index.to_string()).then_some(*copyright))
+}
+
 async fn build_api_root(database: &DatabasePool, state: &AppState) -> Result<ApiRoot, sqlx::Error> {
     let locale_key = format!("copyright_prefer_{}", request_locale(&state));
     let preference = database
@@ -14055,14 +14063,7 @@ async fn build_api_root(database: &DatabasePool, state: &AppState) -> Result<Api
         .or(database
             .option(&state.config.database.table_prefix, "copyright_prefer")
             .await?);
-    let copyright_index = preference
-        .as_deref()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_default();
-    let copyright = COPYRIGHTS
-        .get(copyright_index)
-        .copied()
-        .unwrap_or(COPYRIGHTS[0]);
+    let copyright = copyright_for_preference(preference.as_deref());
     let site_name = database
         .option(&state.config.database.table_prefix, "site_name")
         .await?
@@ -15146,6 +15147,29 @@ mod tests {
         assert!(public_download_ip("1.1.1.1".parse().unwrap()));
         assert!(public_download_ip("2606:4700:4700::1111".parse().unwrap()));
     }
+    #[test]
+    fn api_root_copyright_matches_php_array_key_lookup() {
+        assert_eq!(
+            super::copyright_for_preference(None),
+            Some(super::COPYRIGHTS[0])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("0")),
+            Some(super::COPYRIGHTS[0])
+        );
+        assert_eq!(
+            super::copyright_for_preference(Some("6")),
+            Some(super::COPYRIGHTS[6])
+        );
+        for invalid in ["7", "01", "-1", "1.0", "invalid", ""] {
+            assert_eq!(
+                super::copyright_for_preference(Some(invalid)),
+                None,
+                "{invalid}"
+            );
+        }
+    }
+
     #[test]
     fn plugin_configuration_page_preserves_app_subpaths_and_escapes_values() {
         let page = PluginConfigurationPage {
