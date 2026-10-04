@@ -12005,14 +12005,26 @@ async fn skinlib_list(
         .keyword
         .as_deref()
         .filter(|value| !value.is_empty() && *value != "0");
-    let uploader = query
+    let uploader_filter = query
         .uploader
         .as_deref()
-        .filter(|value| !value.is_empty() && *value != "0")
-        .and_then(|value| value.parse::<i64>().ok());
+        .filter(|value| !value.is_empty() && *value != "0");
+    let uploader = uploader_filter.and_then(|value| value.parse::<i64>().ok());
     let sort = query.sort.as_deref().unwrap_or("time");
     let page = query.page.unwrap_or(1).max(1);
     let per_page = 20_i64;
+    if uploader_filter.is_some() && uploader.is_none() {
+        return Json(serde_json::json!({
+            "current_page": page,
+            "data": [],
+            "last_page": 1,
+            "per_page": per_page,
+            "from": null,
+            "to": null,
+            "total": 0
+        }))
+        .into_response();
+    }
     match database
         .skinlib_items(
             &state.config.database.table_prefix,
@@ -19718,6 +19730,23 @@ mod tests {
                 .any(|item| item["tid"] == 20 && item["nickname"] == "NewGuy")
         );
 
+        let invalid_uploader_list = session_request(
+            &app,
+            &registered_cookie,
+            "GET",
+            "/skinlib/list?uploader=not-a-number",
+            None,
+        )
+        .await;
+        assert_eq!(invalid_uploader_list.status(), StatusCode::OK);
+        let invalid_uploader_list: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_uploader_list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(invalid_uploader_list["data"], serde_json::json!([]));
+        assert_eq!(invalid_uploader_list["total"], 0);
         let skinlib_show =
             session_request(&app, &registered_cookie, "GET", "/skinlib/show/20", None).await;
         assert_eq!(skinlib_show.status(), StatusCode::OK);
