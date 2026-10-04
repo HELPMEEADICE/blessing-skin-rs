@@ -14025,19 +14025,23 @@ async fn raw_texture(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let allowed = database
+    let allowed = match database
         .option(
             &state.config.database.table_prefix,
             "allow_downloading_texture",
         )
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "true".to_owned());
-    if matches!(
-        allowed.to_ascii_lowercase().as_str(),
-        "false" | "0" | "off" | "no"
-    ) {
+    {
+        Ok(value) => value
+            .as_deref()
+            .map(|value| legacy_option_bool(Some(value)))
+            .unwrap_or(true),
+        Err(error) => {
+            tracing::error!(%error, "failed to read direct texture download option");
+            return unavailable();
+        }
+    };
+    if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -19984,6 +19988,51 @@ mod tests {
         sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (900001,'Preview skin','alex',?,4096,7,1,'2026-10-02 12:00:00',0),(900002,'Preview cape','cape',?,4096,7,1,'2026-10-02 12:00:00',0)")
             .bind(&preview_skin_hash)
             .bind(&preview_cape_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let raw_default = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/900001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_default.status(), StatusCode::OK);
+        sqlx::query("INSERT INTO options (option_name, option_value) VALUES ('allow_downloading_texture', 'no')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let raw_legacy_truthy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/900001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_legacy_truthy.status(), StatusCode::OK);
+        sqlx::query("UPDATE options SET option_value = '(false)' WHERE option_name = 'allow_downloading_texture'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let raw_legacy_false = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/900001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_legacy_false.status(), StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE options SET option_value = 'true' WHERE option_name = 'allow_downloading_texture'")
             .execute(&pool)
             .await
             .unwrap();
