@@ -3334,12 +3334,9 @@ async fn localized_site_option(state: &AppState, key: &str) -> Option<String> {
 }
 
 async fn option_is_enabled(state: &AppState, key: &str) -> bool {
-    site_option(state, key).await.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    site_option(state, key)
+        .await
+        .is_some_and(|value| legacy_option_bool(Some(&value)))
 }
 
 fn strip_configured_html_tags(value: &str) -> String {
@@ -14880,12 +14877,7 @@ async fn image_response_cache_ttl(state: &AppState, option_name: &str) -> Durati
             .await
             .ok()
             .flatten()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes" | "(true)"
-                )
-            })
+            .is_some_and(|value| legacy_option_bool(Some(&value)))
     } else {
         false
     };
@@ -15666,7 +15658,10 @@ mod tests {
         assert!(super::legacy_option_bool(Some("true")));
         assert!(super::legacy_option_bool(Some("(true)")));
         assert!(!super::legacy_option_bool(Some("false")));
+        assert!(!super::legacy_option_bool(Some("(false)")));
         assert!(!super::legacy_option_bool(Some("0")));
+        assert!(!super::legacy_option_bool(Some("")));
+        assert!(super::legacy_option_bool(Some("no")));
         assert!(!super::legacy_option_bool(None));
     }
     #[test]
@@ -18740,7 +18735,7 @@ mod tests {
         .unwrap();
         assert!(localized_home.contains("Settings Integration"));
 
-        sqlx::query(r#"INSERT OR REPLACE INTO options (option_name,option_value) VALUES ('site_description_en','Legacy site description'), ('home_pic_url','/uploads/home.webp'), ('fixed_bg','true'), ('hide_intro','true'), ('transparent_navbar','true'), ('navbar_color','purple'), ('favicon_url','/favicon.png'), ('meta_keywords','minecraft,skins'), ('meta_description','Legacy SEO summary'), ('meta_extras','<meta name="author" content="legacy"><script>alert(1)</script>'), ('custom_css','body { color: red; }'), ('custom_js','window.homeCustom = true;'), ('copyright_prefer_en','2'), ('copyright_text_en','For {site_name} at {site_url}')"#)
+        sqlx::query(r#"INSERT OR REPLACE INTO options (option_name,option_value) VALUES ('site_description_en','Legacy site description'), ('home_pic_url','/uploads/home.webp'), ('fixed_bg','(true)'), ('hide_intro','(false)'), ('transparent_navbar','(true)'), ('navbar_color','purple'), ('favicon_url','/favicon.png'), ('meta_keywords','minecraft,skins'), ('meta_description','Legacy SEO summary'), ('meta_extras','<meta name="author" content="legacy"><script>alert(1)</script>'), ('custom_css','body { color: red; }'), ('custom_js','window.homeCustom = true;'), ('copyright_prefer_en','2'), ('copyright_text_en','For {site_name} at {site_url}')"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -18774,7 +18769,7 @@ mod tests {
         assert_eq!(home_globals["route"], "home");
         assert_eq!(home_globals["site_name"], "Settings Integration");
         assert_eq!(home_globals["extra"]["home"]["fixed_bg"], true);
-        assert_eq!(home_globals["extra"]["home"]["hide_intro"], true);
+        assert_eq!(home_globals["extra"]["home"]["hide_intro"], false);
         assert_eq!(home_globals["extra"]["home"]["navbar_color"], "purple");
         assert_eq!(
             home_globals["extra"]["home"]["description"],
