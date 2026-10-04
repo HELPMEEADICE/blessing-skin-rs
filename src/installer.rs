@@ -383,7 +383,7 @@ async fn seed_options(
         ("site_name", site_name.to_owned()),
         (
             "site_description",
-            "Open-source Minecraft Skin Hosting Service".to_owned(),
+            "Open-source PHP Minecraft Skin Hosting Service".to_owned(),
         ),
         ("register_with_player_name", "true".to_owned()),
         ("require_verification", "false".to_owned()),
@@ -670,6 +670,15 @@ mod tests {
             .await
             .unwrap(),
             "https://skin.example"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT option_value FROM bs_options WHERE option_name = 'site_description'"
+            )
+            .fetch_one(sqlite)
+            .await
+            .unwrap(),
+            "Open-source PHP Minecraft Skin Hosting Service"
         );
         assert!(table_exists(&pool, "bs_oauth_auth_codes").await.unwrap());
         assert!(table_exists(&pool, "bs_notifications").await.unwrap());
