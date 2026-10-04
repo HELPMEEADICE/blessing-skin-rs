@@ -46,6 +46,12 @@ SAFE_PATH_PATTERNS = tuple(
         r"/textures/[A-Za-z0-9_-]{1,128}",
         r"/csl/textures/[A-Za-z0-9_-]{1,128}",
         r"/raw/[1-9][0-9]*",
+        r"/avatar/player/[A-Za-z0-9_]{1,16}",
+        r"/avatar/user/(?:0|[1-9][0-9]*)",
+        r"/avatar/hash/[A-Fa-f0-9]{64}",
+        r"/avatar/(?:0|[1-9][0-9]*)",
+        r"/preview/(?:0|[1-9][0-9]*)",
+        r"/preview/hash/[A-Fa-f0-9]{64}",
         r"/[^/]+\.json",
         r"/csl/[^/]+\.json",
     )
@@ -78,6 +84,16 @@ def is_safe_path(value: str) -> bool:
     return any(pattern.fullmatch(path) for pattern in SAFE_PATH_PATTERNS)
 
 
+def is_safe_fixture_path(value: str) -> bool:
+    """Validate a path template with representative safe values for placeholders."""
+    if not ENV_TOKEN.search(value):
+        return is_safe_path(value)
+    return any(
+        is_safe_path(ENV_TOKEN.sub(replacement, value))
+        for replacement in ("1", "ExamplePlayer", "a" * 64)
+    )
+
+
 def validate_fixture(document: Any) -> list[dict[str, Any]]:
     if not isinstance(document, dict) or type(document.get("format_version")) is not int or document["format_version"] != 1:
         raise ValueError("fixture format_version must be 1")
@@ -99,7 +115,7 @@ def validate_fixture(document: Any) -> list[dict[str, Any]]:
             or name in names
         ):
             raise ValueError(f"{where}.name must be a unique printable non-empty string")
-        if not isinstance(path, str) or not is_safe_path(ENV_TOKEN.sub("1", path)):
+        if not isinstance(path, str) or not is_safe_fixture_path(path):
             raise ValueError(f"{where}.path is not on the read-only GET allowlist")
         names.add(name)
         headers = item.get("headers", {})

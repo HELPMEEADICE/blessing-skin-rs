@@ -22,6 +22,12 @@ class CompatCompareTests(unittest.TestCase):
             "/api/players?page=1",
             "/api/admin/closet/42",
             "/raw/42",
+            "/avatar/player/Notch",
+            "/avatar/user/42",
+            "/avatar/hash/" + "a" * 64,
+            "/avatar/0?png",
+            "/preview/42?height=128",
+            "/preview/hash/" + "b" * 64 + "?png",
             "/Alex.json",
             "/csl/Alex.json",
             "/textures/0123456789abcdef0123456789abcdef",
@@ -37,8 +43,10 @@ class CompatCompareTests(unittest.TestCase):
             "/user/profile",
             "/admin/options",
             "/api/players/3",
-            "/avatar/user/3",
-            "/preview/3",
+            "/avatar/user/-1",
+            "/avatar/hash/not-a-hash",
+            "/preview/3/extra",
+            "/preview/hash/../api/user",
             "/api/user/notifications/3",
             "/skinlib/show/3",
             "/texture",
@@ -56,6 +64,7 @@ class CompatCompareTests(unittest.TestCase):
             {
                 "BS_SHADOW_OAUTH_TOKEN": "read-only-test-token",
                 "BS_SHADOW_PLAYER": "ExamplePlayer",
+                "BS_SHADOW_USER_ID": "7",
                 "BS_SHADOW_TEXTURE_HASH": "a" * 64,
                 "BS_SHADOW_TEXTURE_ID": "42",
             },
@@ -64,7 +73,7 @@ class CompatCompareTests(unittest.TestCase):
             probes = compat.validate_fixture(fixture)
             for probe in probes:
                 probe["path"] = compat.resolve_probe_path(probe["path"])
-        self.assertEqual(len(probes), 5)
+        self.assertEqual(len(probes), 11)
         self.assertTrue(all(compat.is_safe_path(probe["path"]) for probe in probes))
 
     def test_path_variables_expand_only_to_allowlisted_read_routes(self):

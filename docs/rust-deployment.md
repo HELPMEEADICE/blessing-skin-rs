@@ -161,7 +161,7 @@ python3 tools/compat_compare.py \
 
 可在本机复制并修改 [示例探针](compat-shadow.example.json)，令牌应从环境变量传入，不要写入 fixture。动态 JSON 字段可用 `ignore_json_pointers` 标注；响应体中的其他字段、状态码和缓存相关头仍会比较。工具只打印差异类别、JSON 字段路径或非 JSON 响应的 SHA-256，不打印响应内容。
 
-示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理及旧 `/raw/{tid}` 下载响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
+示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_USER_ID`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理、不同来源的头像，以及按 ID/哈希生成的皮肤预览响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
 
 ### 单业务域灰度（每个域至少 24 小时）
 
