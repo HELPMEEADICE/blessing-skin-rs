@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, ffi::OsString, net::SocketAddr, path::PathBuf};
 
 use sqlx::{mysql::MySqlConnectOptions, postgres::PgConnectOptions, sqlite::SqliteConnectOptions};
 use thiserror::Error;
@@ -10,6 +10,17 @@ const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
 /// `(empty)` to an empty string. Rust's dotenv loader leaves these as strings.
 pub(crate) fn legacy_env(name: &str) -> Option<String> {
     env::var(name).ok().and_then(parse_legacy_env_value)
+}
+
+fn legacy_env_os(name: &str) -> Option<OsString> {
+    env::var_os(name).and_then(parse_legacy_env_os)
+}
+
+fn parse_legacy_env_os(value: OsString) -> Option<OsString> {
+    match value.into_string() {
+        Ok(value) => parse_legacy_env_value(value).map(OsString::from),
+        Err(value) => Some(value),
+    }
 }
 
 fn parse_legacy_env_value(value: String) -> Option<String> {
@@ -117,12 +128,12 @@ impl Config {
 
         let storage =
             PathBuf::from(legacy_env("STORAGE_PATH").unwrap_or_else(|| "storage".to_owned()));
-        let textures_dir = legacy_env("TEXTURES_DIR")
+        let textures_dir = legacy_env_os("TEXTURES_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| storage.join("textures"));
         let passport_public_key = load_passport_public_key(&storage);
 
-        let plugins_dir = legacy_env("PLUGINS_DIR")
+        let plugins_dir = legacy_env_os("PLUGINS_DIR")
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| storage.join("plugins"));
@@ -468,9 +479,9 @@ fn valid_table_prefix(prefix: &str) -> bool {
 mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, is_legacy_false, mysql_connect_options,
-        parse_legacy_env_value, valid_table_prefix,
+        parse_legacy_env_os, parse_legacy_env_value, valid_table_prefix,
     };
-    use std::path::Path;
+    use std::{ffi::OsString, path::Path};
 
     #[test]
     fn parses_laravel_reserved_environment_values() {
@@ -491,6 +502,28 @@ mod tests {
             parse_legacy_env_value(" null ".to_owned()),
             Some(" null ".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_reserved_values_for_path_environment_variables() {
+        assert_eq!(parse_legacy_env_os(OsString::from("null")), None);
+        assert_eq!(
+            parse_legacy_env_os(OsString::from("empty")),
+            Some(OsString::new())
+        );
+        assert_eq!(
+            parse_legacy_env_os(OsString::from("/srv/blessing/textures")),
+            Some(OsString::from("/srv/blessing/textures"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_path_environment_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = OsString::from_vec(vec![0xff, b'/', b't']);
+        assert_eq!(parse_legacy_env_os(path.clone()), Some(path));
     }
 
     #[test]
