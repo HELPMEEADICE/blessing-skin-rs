@@ -30,7 +30,7 @@ cargo build --locked --release
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BS_LISTEN`                                        | 监听地址，默认 `127.0.0.1:3000`；建议仅绑定回环地址并由反向代理访问                                                                            |
 | `DB_CONNECTION`                                    | `sqlite`、`mysql`、`mariadb`、`pgsql`、`postgres` 或 `postgresql`，默认 `mysql`                                                                |
-| `DB_DATABASE`                                      | SQLite 文件路径；MySQL/PostgreSQL 数据库名                                                                                                     |
+| `DB_DATABASE`                                      | SQLite 文件路径（未设置时默认 database/database.sqlite）；MySQL/PostgreSQL 数据库名（默认 forge）                                              |
 | `DATABASE_URL`                                     | 可选的旧 Laravel 数据库 URL；设置后按 `DB_CONNECTION` 解析，并优先于独立的 `DB_HOST`、`DB_PORT`、`DB_DATABASE`、`DB_USERNAME` 和 `DB_PASSWORD` |
 | `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD` | 未设置 DATABASE_URL 时使用的 MySQL/PostgreSQL 连接参数                                                                                         |
 | `DB_SOCKET`                                        | 可选的 MySQL/MariaDB Unix socket 路径；设定后通过该 socket 连接                                                                                |

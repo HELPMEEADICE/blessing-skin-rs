@@ -3,6 +3,8 @@ use std::{env, net::SocketAddr, path::PathBuf};
 use sqlx::{mysql::MySqlConnectOptions, postgres::PgConnectOptions, sqlite::SqliteConnectOptions};
 use thiserror::Error;
 
+const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -329,8 +331,7 @@ impl DatabaseConfig {
             .as_str()
         {
             "sqlite" => {
-                let database = env::var("DB_DATABASE")
-                    .unwrap_or_else(|_| "storage/database.sqlite".to_owned());
+                let database = sqlite_database_path(env::var("DB_DATABASE").ok());
                 let mut options = SqliteConnectOptions::new()
                     .filename(&database)
                     .create_if_missing(false);
@@ -436,6 +437,10 @@ fn parse_setup_port(value: &str, default: u16) -> Result<u16, ConfigError> {
     Ok(port)
 }
 
+fn sqlite_database_path(database: Option<String>) -> String {
+    database.unwrap_or_else(|| LEGACY_SQLITE_DATABASE_PATH.to_owned())
+}
+
 fn parse_port(name: &str, default: u16) -> u16 {
     env::var(name)
         .ok()
@@ -455,6 +460,18 @@ mod tests {
         ConfigError, DatabaseConfig, DatabaseConnection, mysql_connect_options, valid_table_prefix,
     };
     use std::path::Path;
+
+    #[test]
+    fn defaults_sqlite_path_to_the_legacy_laravel_database_location() {
+        assert_eq!(
+            super::sqlite_database_path(None),
+            "database/database.sqlite"
+        );
+        assert_eq!(
+            super::sqlite_database_path(Some("storage/custom.sqlite".to_owned())),
+            "storage/custom.sqlite"
+        );
+    }
 
     #[test]
     fn accepts_empty_and_simple_prefixes() {
