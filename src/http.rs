@@ -5959,7 +5959,7 @@ fn admin_plugin_record(
         "name": name,
         "title": name,
         "description": description,
-        "version": "WASM host API 1.6.0",
+        "version": "WASM host API 1.7.0",
         "enabled": enabled,
         "loaded": loaded,
         "on_disk": on_disk,
@@ -7759,8 +7759,25 @@ fn expire_web_session(state: &AppState, mut response: Response) -> Response {
     response
 }
 
-async fn logout(State(state): State<AppState>) -> Response {
-    let mut response = login_result(
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user_id) = session_user_id(&state, &headers) else {
+        return (StatusCode::FOUND, [(LOCATION, "/auth/login")]).into_response();
+    };
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    match database
+        .user_profile(&state.config.database.table_prefix, user_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::FOUND, [(LOCATION, "/auth/login")]).into_response(),
+        Err(error) => {
+            tracing::error!(%error, user_id, "failed to load account for logout");
+            return unavailable();
+        }
+    }
+    let response = login_result(
         0,
         if request_locale(&state).starts_with("zh") {
             "已退出登录"
@@ -7769,16 +7786,13 @@ async fn logout(State(state): State<AppState>) -> Response {
         },
         None,
     );
-    let secure = if request_app_url(&state).starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie =
-        format!("blessing_skin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}");
-    if let Ok(value) = HeaderValue::from_str(&cookie) {
-        response.headers_mut().insert(SET_COOKIE, value);
-    }
+    let response = expire_web_session(&state, response);
+    emit_plugin_event(
+        &state,
+        "user.logged-out",
+        serde_json::json!({"user_id": user_id}),
+    )
+    .await;
     response
 }
 
@@ -21922,7 +21936,8 @@ mod tests {
             proxied_https_page.contains("https://skins.auto.example.test/app/style.012abcd.css")
         );
 
-        let logout = app
+        let anonymous_logout = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -21932,6 +21947,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(anonymous_logout.status(), StatusCode::FOUND);
+        assert_eq!(anonymous_logout.headers()[LOCATION], "/auth/login");
+
+        let logout = session_request(&app, &registered_cookie, "POST", "/auth/logout", None).await;
         assert_eq!(logout.status(), StatusCode::OK);
         assert!(
             logout

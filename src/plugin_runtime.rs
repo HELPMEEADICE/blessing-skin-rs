@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.6.0";
+const HOST_API_VERSION: &str = "1.7.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -31,6 +31,7 @@ const PLUGIN_CONFIGURATION_LIMIT: usize = 64 * 1024;
 const PLUGIN_README_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.logged-in",
+    "user.logged-out",
     "user.registered",
     "user.profile.updated",
     "user.avatar.updated",
@@ -877,6 +878,7 @@ mod tests {
     #[test]
     fn plugin_events_are_allowlisted_bounded_json_objects() {
         assert!(validate_plugin_event("user.logged-in", br#"{"user_id":7}"#).is_ok());
+        assert!(validate_plugin_event("user.logged-out", br#"{"user_id":7}"#).is_ok());
         assert!(
             validate_plugin_event(
                 "user.verification.updated",
