@@ -14727,9 +14727,12 @@ async fn texture(
 
 async fn raw_texture(
     State(state): State<AppState>,
-    RoutePath(tid): RoutePath<i64>,
+    RoutePath(raw_tid): RoutePath<String>,
     request_headers: HeaderMap,
 ) -> Response {
+    let Some(tid) = raw_tid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -21422,6 +21425,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let raw_invalid_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/not-a-number")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_invalid_id.status(), StatusCode::NOT_FOUND);
         let raw_default = app
             .clone()
             .oneshot(
