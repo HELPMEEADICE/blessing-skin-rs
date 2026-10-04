@@ -9595,6 +9595,7 @@ fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
         "false" | "(false)" | "null" | "(null)" => return 0,
         _ => {}
     }
+
     let value = value.trim_start();
     let bytes = value.as_bytes();
     let mut end = usize::from(
@@ -9603,12 +9604,54 @@ fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
             .is_some_and(|byte| matches!(byte, b'+' | b'-')),
     );
     let negative = bytes.first() == Some(&b'-');
-    let first_digit = end;
+    let integer_start = end;
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         end += 1;
     }
-    if end == first_digit {
+    let integer_digits = end - integer_start;
+    let mut has_fraction = false;
+    let mut fraction_digits = 0;
+    if bytes.get(end) == Some(&b'.') {
+        has_fraction = true;
+        end += 1;
+        let fraction_start = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        fraction_digits = end - fraction_start;
+    }
+    if integer_digits + fraction_digits == 0 {
         return 0;
+    }
+
+    let mut has_exponent = false;
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let exponent_start = end;
+        end += 1;
+        if bytes
+            .get(end)
+            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+        {
+            end += 1;
+        }
+        let exponent_digits_start = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == exponent_digits_start {
+            end = exponent_start;
+        } else {
+            has_exponent = true;
+        }
+    }
+
+    if has_fraction || has_exponent {
+        return value[..end]
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(|number| number.trunc() as i64)
+            .unwrap_or(0);
     }
     value[..end]
         .parse::<i64>()
@@ -15466,6 +15509,10 @@ mod tests {
         assert_eq!(super::legacy_option_integer(Some("false"), 17), 0);
         assert_eq!(super::legacy_option_integer(Some("(null)"), 17), 0);
         assert_eq!(super::legacy_option_integer(Some("1.9"), 17), 1);
+        assert_eq!(super::legacy_option_integer(Some("1e2"), 17), 100);
+        assert_eq!(super::legacy_option_integer(Some("1.2e2"), 17), 120);
+        assert_eq!(super::legacy_option_integer(Some("1e2 items"), 17), 100);
+        assert_eq!(super::legacy_option_integer(Some("1e+"), 17), 1);
         assert_eq!(super::legacy_option_integer(Some(" -12.5 items"), 17), -12);
         assert_eq!(super::legacy_option_integer(Some("invalid"), 17), 0);
     }
