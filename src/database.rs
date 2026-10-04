@@ -8751,7 +8751,7 @@ mod tests {
 
 #[cfg(test)]
 mod language_line_tests {
-    use super::{DatabasePool, PlayerAddOutcome, TextureUploadOutcome};
+    use super::{DatabasePool, PlayerAddOutcome, TextureUploadOutcome, UserRegistrationOutcome};
     use sqlx::{
         mysql::{MySqlConnectOptions, MySqlPoolOptions},
         postgres::{PgConnectOptions, PgPoolOptions},
@@ -9111,6 +9111,45 @@ mod language_line_tests {
         assert_eq!(added_player.name, "Steve");
         assert_eq!(added_player.uid, 7);
         assert_ne!(added_player.pid, 3);
+
+        let registration_now = "2026-10-05 12:30:00";
+        let registration_last_sign_at = "2026-10-04 12:30:00";
+        let (registered_uid, registered_player) = match database
+            .register_user(
+                &prefix,
+                "rust-registration@example.test",
+                "Rust registration",
+                21,
+                "legacy-compatible-password-hash",
+                "203.0.113.45",
+                registration_now,
+                registration_last_sign_at,
+                2,
+                Some("RustRegister"),
+            )
+            .await
+            .unwrap()
+        {
+            UserRegistrationOutcome::Registered {
+                uid,
+                player: Some(player),
+            } => (uid, player),
+            outcome => panic!("expected registration with an initial player, got {outcome:?}"),
+        };
+        assert_eq!(registered_player.uid, registered_uid);
+        assert_eq!(registered_player.name, "RustRegister");
+        assert_eq!(registered_player.tid_skin, 0);
+        assert_eq!(registered_player.tid_cape, 0);
+        assert_eq!(registered_player.last_modified, registration_now);
+        assert_ne!(registered_player.pid, 0);
+        assert_ne!(registered_player.pid, added_player.pid);
+        assert_eq!(
+            database
+                .players_for_user(&prefix, registered_uid)
+                .await
+                .unwrap(),
+            vec![registered_player]
+        );
 
         let uploaded_texture_id = match database
             .upload_texture(
