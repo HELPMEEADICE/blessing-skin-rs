@@ -427,10 +427,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/plugins/manage",
             get(web_admin_plugins_page).post(web_admin_plugins_manage),
         )
-        .route(
-            "/admin/plugins/config/{name}",
-            get(web_admin_plugin_config).post(web_admin_plugin_config),
-        )
+        .route("/admin/plugins/config/{name}", any(web_admin_plugin_config))
         .route("/admin/plugins/readme/{name}", get(web_admin_plugin_readme))
         .route(
             "/admin/plugins/upload",
@@ -4613,8 +4610,6 @@ async fn web_admin_plugin_config(
                 };
             }
         }
-    } else if method != Method::GET {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
 
     let configuration = match state
@@ -17288,6 +17283,24 @@ mod tests {
             serde_json::from_slice(&to_bytes(plugin_data.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert!(plugin_data.is_array());
+        let denied_plugin_config = session_request(
+            &app,
+            &registered_cookie,
+            "PATCH",
+            "/admin/plugins/config/unavailable-plugin",
+            None,
+        )
+        .await;
+        assert_eq!(denied_plugin_config.status(), StatusCode::FORBIDDEN);
+        let unavailable_plugin_config = session_request(
+            &app,
+            &admin_cookie,
+            "PATCH",
+            "/admin/plugins/config/unavailable-plugin",
+            None,
+        )
+        .await;
+        assert_eq!(unavailable_plugin_config.status(), StatusCode::NOT_FOUND);
         let boundary = "blessing-wasm-upload-test";
         let upload_body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"broken.wasm\"\r\nContent-Type: application/wasm\r\n\r\nnot wasm\r\n--{boundary}--\r\n"
