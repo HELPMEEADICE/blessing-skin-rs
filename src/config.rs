@@ -77,6 +77,8 @@ pub enum ConfigError {
     InvalidTablePrefix,
     #[error("invalid database setup value")]
     InvalidSetupValue,
+    #[error("invalid DATABASE_URL for the selected DB_CONNECTION")]
+    InvalidDatabaseUrl,
 }
 
 impl Config {
@@ -243,8 +245,85 @@ impl DatabaseConfig {
         }
     }
 
+    fn from_url(
+        driver: &str,
+        table_prefix: String,
+        url: &str,
+        sqlite_foreign_keys: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        if !valid_table_prefix(&table_prefix) {
+            return Err(ConfigError::InvalidTablePrefix);
+        }
+
+        match driver.to_ascii_lowercase().as_str() {
+            "sqlite" => {
+                let mut options = url
+                    .parse::<SqliteConnectOptions>()
+                    .map_err(|_| ConfigError::InvalidDatabaseUrl)?
+                    .create_if_missing(false);
+                if sqlite_foreign_keys.is_some_and(|value| value == "false" || value == "0") {
+                    options = options.foreign_keys(false);
+                }
+                let database = options.get_filename().to_string_lossy().into_owned();
+                Ok(Self {
+                    connection: DatabaseConnection::Sqlite(options),
+                    table_prefix,
+                    driver: "SQLite".to_owned(),
+                    host: None,
+                    port: None,
+                    username: None,
+                    database,
+                })
+            }
+            "mysql" | "mariadb" => {
+                let options = url
+                    .parse::<MySqlConnectOptions>()
+                    .map_err(|_| ConfigError::InvalidDatabaseUrl)?;
+                let host = options.get_host().to_owned();
+                let port = options.get_port();
+                let username = options.get_username().to_owned();
+                let database = options.get_database().unwrap_or_default().to_owned();
+                Ok(Self {
+                    connection: DatabaseConnection::MySql(options),
+                    table_prefix,
+                    driver: "MySQL/MariaDB".to_owned(),
+                    host: Some(host),
+                    port: Some(port),
+                    username: Some(username),
+                    database,
+                })
+            }
+            "pgsql" | "postgres" | "postgresql" => {
+                let options = url
+                    .parse::<PgConnectOptions>()
+                    .map_err(|_| ConfigError::InvalidDatabaseUrl)?;
+                let host = options.get_host().to_owned();
+                let port = options.get_port();
+                let username = options.get_username().to_owned();
+                let database = options.get_database().unwrap_or_default().to_owned();
+                Ok(Self {
+                    connection: DatabaseConnection::Postgres(options),
+                    table_prefix,
+                    driver: "PostgreSQL".to_owned(),
+                    host: Some(host),
+                    port: Some(port),
+                    username: Some(username),
+                    database,
+                })
+            }
+            _ => Err(ConfigError::UnsupportedDatabase(driver.to_owned())),
+        }
+    }
+
     fn from_env(table_prefix: String) -> Result<Self, ConfigError> {
         let driver = env::var("DB_CONNECTION").unwrap_or_else(|_| "mysql".to_owned());
+        if let Some(url) = env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let foreign_keys = env::var("DB_FOREIGN_KEYS").ok();
+            return Self::from_url(&driver, table_prefix, &url, foreign_keys.as_deref());
+        }
         let (connection, display_driver, host, port, username, database) = match driver
             .to_ascii_lowercase()
             .as_str()
@@ -372,7 +451,9 @@ fn valid_table_prefix(prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatabaseConfig, DatabaseConnection, mysql_connect_options, valid_table_prefix};
+    use super::{
+        ConfigError, DatabaseConfig, DatabaseConnection, mysql_connect_options, valid_table_prefix,
+    };
     use std::path::Path;
 
     #[test]
@@ -414,6 +495,56 @@ mod tests {
                 .is_err()
         );
         assert!(DatabaseConfig::from_setup("sqlite", "", "", "", "", ":memory:", "").is_err());
+    }
+
+    #[test]
+    fn parses_legacy_database_urls_for_all_supported_drivers() {
+        let mysql = DatabaseConfig::from_url(
+            "mysql",
+            "bs_".to_owned(),
+            "mysql://blessing:p%40ss@db.example.test:3307/skin",
+            None,
+        )
+        .unwrap();
+        assert_eq!(mysql.driver, "MySQL/MariaDB");
+        assert_eq!(mysql.host.as_deref(), Some("db.example.test"));
+        assert_eq!(mysql.port, Some(3307));
+        assert_eq!(mysql.username.as_deref(), Some("blessing"));
+        assert_eq!(mysql.database, "skin");
+        assert_eq!(mysql.table_prefix, "bs_");
+        assert!(matches!(mysql.connection, DatabaseConnection::MySql(_)));
+
+        let postgres = DatabaseConfig::from_url(
+            "pgsql",
+            String::new(),
+            "postgres://blessing:secret@db.example.test:5433/skin?sslmode=require",
+            None,
+        )
+        .unwrap();
+        assert_eq!(postgres.driver, "PostgreSQL");
+        assert_eq!(postgres.host.as_deref(), Some("db.example.test"));
+        assert_eq!(postgres.port, Some(5433));
+        assert_eq!(postgres.username.as_deref(), Some("blessing"));
+        assert_eq!(postgres.database, "skin");
+        assert!(matches!(
+            postgres.connection,
+            DatabaseConnection::Postgres(_)
+        ));
+
+        let sqlite = DatabaseConfig::from_url(
+            "sqlite",
+            String::new(),
+            "sqlite:///var/lib/blessing-skin/database.sqlite?mode=rw",
+            Some("false"),
+        )
+        .unwrap();
+        assert_eq!(sqlite.database, "/var/lib/blessing-skin/database.sqlite");
+        assert!(matches!(sqlite.connection, DatabaseConnection::Sqlite(_)));
+
+        assert!(matches!(
+            DatabaseConfig::from_url("mysql", String::new(), "not-a-url", None),
+            Err(ConfigError::InvalidDatabaseUrl)
+        ));
     }
 
     #[test]
