@@ -51,7 +51,10 @@ impl ImageCache {
     }
 
     pub fn get(&self, key: &ImageCacheKey) -> Option<CachedImage> {
-        let now = Instant::now();
+        self.get_at(key, Instant::now())
+    }
+
+    fn get_at(&self, key: &ImageCacheKey, now: Instant) -> Option<CachedImage> {
         let mut entries = self
             .entries
             .lock()
@@ -69,12 +72,15 @@ impl ImageCache {
     }
 
     pub fn insert(&self, key: ImageCacheKey, image: CachedImage, ttl: Duration) {
+        self.insert_at(key, image, ttl, Instant::now());
+    }
+
+    fn insert_at(&self, key: ImageCacheKey, image: CachedImage, ttl: Duration, now: Instant) {
         let size = image.body.len();
         if size > MAX_ENTRY_BYTES || size > MAX_BYTES {
             return;
         }
 
-        let now = Instant::now();
         let mut entries = self
             .entries
             .lock()
@@ -153,10 +159,18 @@ mod tests {
     #[test]
     fn caches_expires_and_clears_images() {
         let cache = ImageCache::default();
-        cache.insert(key(1), image(b"png"), Duration::from_millis(1));
-        assert!(cache.get(&key(1)).is_some());
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(cache.get(&key(1)).is_none());
+        let inserted_at = Instant::now();
+        cache.insert_at(key(1), image(b"png"), Duration::from_millis(1), inserted_at);
+        assert!(
+            cache
+                .get_at(&key(1), inserted_at + Duration::from_micros(500))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_at(&key(1), inserted_at + Duration::from_millis(2))
+                .is_none()
+        );
 
         cache.insert(key(2), image(b"webp"), Duration::from_secs(60));
         cache.clear();
