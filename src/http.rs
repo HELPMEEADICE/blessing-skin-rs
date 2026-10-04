@@ -207,6 +207,7 @@ async fn legacy_api_throttle(
 tokio::task_local! {
     static REQUEST_LOCALE: String;
     static REQUEST_INPUT_LOCALE: Option<String>;
+    static REQUEST_APP_URL: String;
 }
 
 fn explicit_request_locale() -> Option<String> {
@@ -386,6 +387,99 @@ fn select_request_locale(
         .to_owned()
 }
 
+pub(crate) fn request_app_url(state: &AppState) -> String {
+    REQUEST_APP_URL
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| state.config.app_url.clone())
+}
+
+fn request_is_secure(request: &axum::extract::Request) -> bool {
+    request.uri().scheme_str() == Some("https")
+        || request
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "https")
+        || request
+            .headers()
+            .get("x-forwarded-ssl")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "on")
+}
+
+fn force_https_url(app_url: &str) -> String {
+    if app_url.starts_with("https://") {
+        app_url.to_owned()
+    } else if let Some(rest) = app_url.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        app_url.to_owned()
+    }
+}
+
+fn detected_request_root(request: &axum::extract::Request, request_secure: bool) -> Option<String> {
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })?;
+    let authority = host.parse::<axum::http::uri::Authority>().ok()?;
+    let scheme = if request_secure { "https" } else { "http" };
+    Some(format!("{scheme}://{authority}"))
+}
+
+fn is_valid_site_url(value: &str) -> bool {
+    value.parse::<axum::http::Uri>().ok().is_some_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+    })
+}
+
+async fn select_request_app_url(
+    state: &AppState,
+    detected_root: Option<String>,
+    request_secure: bool,
+) -> String {
+    let mut app_url = detected_root.unwrap_or_else(|| state.config.app_url.clone());
+    let force_ssl = if let Some(database) = &state.database {
+        let auto_detect = database
+            .option(&state.config.database.table_prefix, "auto_detect_asset_url")
+            .await
+            .ok()
+            .flatten()
+            .map(|value| legacy_option_bool(Some(&value)))
+            .unwrap_or(true);
+        if !auto_detect {
+            if let Some(site_url) = database
+                .option(&state.config.database.table_prefix, "site_url")
+                .await
+                .ok()
+                .flatten()
+                .filter(|value| is_valid_site_url(value))
+            {
+                app_url = site_url;
+            }
+        }
+        database
+            .option(&state.config.database.table_prefix, "force_ssl")
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|value| legacy_option_bool(Some(&value)))
+    } else {
+        false
+    };
+    if force_ssl || request_secure {
+        force_https_url(&app_url)
+    } else {
+        app_url
+    }
+}
+
 async fn detect_locale_preference(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -433,7 +527,13 @@ async fn detect_locale_preference(
         }
     }
     let should_set_cookie = !is_api;
-    let response = REQUEST_LOCALE.scope(locale.clone(), next.run(request));
+    let request_secure = request_is_secure(&request);
+    let detected_root = detected_request_root(&request, request_secure);
+    let app_url = select_request_app_url(&state, detected_root, request_secure).await;
+    let response = REQUEST_LOCALE.scope(
+        locale.clone(),
+        REQUEST_APP_URL.scope(app_url, next.run(request)),
+    );
     let mut response = REQUEST_INPUT_LOCALE.scope(input_locale, response).await;
     if should_set_cookie {
         if let Ok(cookie) = HeaderValue::from_str(&format!(
@@ -970,8 +1070,9 @@ async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> R
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 =
         encode_frontend_globals(&state, &site_name, "auth/bind", serde_json::json!({}), i18n);
@@ -1225,7 +1326,7 @@ pub(crate) fn encode_frontend_globals(
     let globals = serde_json::json!({
         "version": state.config.version,
         "locale": request_locale(&state),
-        "base_url": state.config.app_url.trim_end_matches('/'),
+        "base_url": request_app_url(&state).trim_end_matches('/'),
         "site_name": site_name,
         "route": route,
         "debug": cfg!(debug_assertions),
@@ -1273,8 +1374,9 @@ async fn login_page(
     let chinese = request_locale(&state).starts_with("zh");
     let redirect_to = safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default();
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let frontend_script_available = frontend_script.is_some();
     let stylesheet = stylesheet.unwrap_or_default();
     let frontend_script = frontend_script.unwrap_or_default();
@@ -1445,8 +1547,9 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -1532,8 +1635,9 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -1673,7 +1777,7 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
         release_mail_limit(&state, &key);
         return unavailable();
     };
-    let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
+    let url = format!("{}{}", request_app_url(&state).trim_end_matches('/'), path);
     let site_name = site_name(&state).await;
     let body = if request_locale(&state).starts_with("zh") {
         format!(
@@ -1753,8 +1857,9 @@ async fn reset_page(
     let chinese = request_locale(&state).starts_with("zh");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -1937,8 +2042,9 @@ async fn verify_email_page(
     let chinese = request_locale(&state).starts_with("zh");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -2161,7 +2267,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         release_mail_limit(&state, &key);
         return unavailable();
     };
-    let url = format!("{}{}", state.config.app_url.trim_end_matches('/'), path);
+    let url = format!("{}{}", request_app_url(&state).trim_end_matches('/'), path);
     let site_name = site_name(&state).await;
     let body = if request_locale(&state).starts_with("zh") {
         format!(
@@ -2336,7 +2442,7 @@ fn unix_timestamp() -> u64 {
 fn signed_action_url(state: &AppState, uri: &axum::http::Uri) -> String {
     format!(
         "{}{}",
-        state.config.app_url.trim_end_matches('/'),
+        request_app_url(&state).trim_end_matches('/'),
         uri.path_and_query()
             .map(|value| value.as_str())
             .unwrap_or(uri.path())
@@ -2364,7 +2470,7 @@ async fn captcha_image(State(state): State<AppState>) -> Response {
             return unavailable();
         }
     };
-    let secure = if state.config.app_url.starts_with("https://") {
+    let secure = if request_app_url(&state).starts_with("https://") {
         "; Secure"
     } else {
         ""
@@ -2799,7 +2905,7 @@ async fn handle_register(
                 "Your account was registered. Redirecting..."
             };
             let mut response = login_result(0, message, None);
-            let secure = if state.config.app_url.starts_with("https://") {
+            let secure = if request_app_url(&state).starts_with("https://") {
                 "; Secure"
             } else {
                 ""
@@ -3036,7 +3142,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
             serde_json::json!({ "redirectTo": safe_local_redirect(request.redirect_to.as_deref()).unwrap_or_else(|| "/user".to_owned()) }),
         ),
     );
-    let secure = if state.config.app_url.starts_with("https://") {
+    let secure = if request_app_url(&state).starts_with("https://") {
         "; Secure"
     } else {
         ""
@@ -3199,7 +3305,8 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .collect(),
     );
     let meta_extras = meta_sanitizer.clean(&meta_extras_raw).to_string();
-    let base_url = state.config.app_url.trim_end_matches('/');
+    let app_url = request_app_url(&state);
+    let base_url = app_url.trim_end_matches('/');
     let favicon_option = site_option(&state, "favicon_url")
         .await
         .unwrap_or_else(|| "app/favicon.ico".to_owned());
@@ -3268,11 +3375,12 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "copyright_text": &copyright_text,
     });
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
     let home_stylesheet =
-        frontend_entrypoint(&app_dir, "home-css", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
-    let home_script = frontend_entrypoint(&app_dir, "home", "js", &state.config.app_url).await;
+        frontend_entrypoint(&app_dir, "home-css", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
+    let home_script = frontend_entrypoint(&app_dir, "home", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -3979,8 +4087,9 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -4025,8 +4134,9 @@ async fn web_admin_translations(
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -4333,8 +4443,9 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -4487,8 +4598,9 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     let site_name = site_name(&state).await;
     let wasm_plugins = state.wasm_plugins.clone();
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -4573,8 +4685,9 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let can_upload = user.permission >= 2;
     let frontend_globals_b64 = encode_frontend_globals(
@@ -4590,7 +4703,7 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     let page = AdminPluginsPage {
         site_name,
         locale: request_locale(&state),
-        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
+        base_url: request_app_url(&state).trim_end_matches('/').to_owned(),
         can_upload,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -4620,8 +4733,9 @@ async fn web_admin_plugins_market_page(
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let locale = request_locale(&state);
     let i18n = load_frontend_translations(&state, &app_dir, &locale).await;
     let frontend_globals_b64 = encode_frontend_globals(
@@ -4634,7 +4748,7 @@ async fn web_admin_plugins_market_page(
     let page = AdminPluginMarketPage {
         site_name,
         locale,
-        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
+        base_url: request_app_url(&state).trim_end_matches('/').to_owned(),
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -4799,7 +4913,7 @@ async fn web_admin_plugin_config(
     let chinese = request_locale(&state).starts_with("zh");
     let page = PluginConfigurationPage {
         locale: request_locale(&state),
-        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
+        base_url: request_app_url(&state).trim_end_matches('/').to_owned(),
         plugin_name: name,
         heading: if chinese {
             "插件设置"
@@ -5926,8 +6040,9 @@ async fn oauth_manage_page(State(state): State<AppState>, headers: HeaderMap) ->
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -5961,8 +6076,9 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let allow_delete = user.permission < 1;
     let extra = serde_json::json!({
@@ -6026,8 +6142,9 @@ async fn web_user_reports(
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -6352,8 +6469,9 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -6765,8 +6883,9 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -7554,7 +7673,7 @@ fn illegal_parameters_message(locale: &str) -> &'static str {
 }
 
 fn expire_web_session(state: &AppState, mut response: Response) -> Response {
-    let secure = if state.config.app_url.starts_with("https://") {
+    let secure = if request_app_url(&state).starts_with("https://") {
         "; Secure"
     } else {
         ""
@@ -7577,7 +7696,7 @@ async fn logout(State(state): State<AppState>) -> Response {
         },
         None,
     );
-    let secure = if state.config.app_url.starts_with("https://") {
+    let secure = if request_app_url(&state).starts_with("https://") {
         "; Secure"
     } else {
         ""
@@ -8461,7 +8580,8 @@ async fn setup_page_assets(
     extra: serde_json::Value,
 ) -> SetupPageAssets {
     let app_dir = state.public_dir.join("app");
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(state, "Blessing Skin", route, extra, i18n);
     SetupPageAssets {
@@ -10133,8 +10253,9 @@ async fn skinlib_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let logged_in = current_uid > 0;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -10290,8 +10411,9 @@ async fn skinlib_show_page(
     };
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -10428,8 +10550,9 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
     let rendered_content_policy = render_notification_markdown(&content_policy);
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -12274,8 +12397,9 @@ async fn web_admin_players_page(State(state): State<AppState>, headers: HeaderMa
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -12850,8 +12974,9 @@ async fn web_admin_users_page(State(state): State<AppState>, headers: HeaderMap)
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -13363,8 +13488,9 @@ async fn web_admin_reports_page(State(state): State<AppState>, headers: HeaderMa
     }
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
+    let frontend_script =
+        frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let frontend_globals_b64 = encode_frontend_globals(
         &state,
@@ -20867,6 +20993,125 @@ mod tests {
         )
         .await;
         assert_eq!(denied_notice.status(), StatusCode::FORBIDDEN);
+        sqlx::query("INSERT OR REPLACE INTO options (option_name,option_value) VALUES ('auto_detect_asset_url','false'), ('site_url','http://legacy.example.test'), ('force_ssl','true')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let forced_url_page = app
+            .clone()
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(forced_url_page.status(), StatusCode::OK);
+        let forced_url_page = String::from_utf8(
+            to_bytes(forced_url_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(forced_url_page.contains("https://legacy.example.test/app/style.012abcd.css"));
+        let encoded_forced_url_globals = forced_url_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let forced_url_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_forced_url_globals)
+            .unwrap();
+        let forced_url_globals: serde_json::Value =
+            serde_json::from_slice(&forced_url_globals_bytes).unwrap();
+        assert_eq!(
+            forced_url_globals["base_url"],
+            "https://legacy.example.test"
+        );
+
+        let secure_captcha = app
+            .clone()
+            .oneshot(Request::get("/auth/captcha").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(secure_captcha.status(), StatusCode::OK);
+        assert!(
+            secure_captcha
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .any(
+                    |cookie| cookie.to_str().unwrap().contains("blessing_skin_captcha=")
+                        && cookie.to_str().unwrap().contains("; Secure")
+                )
+        );
+
+        sqlx::query(
+            "UPDATE options SET option_value = 'true' WHERE option_name = 'auto_detect_asset_url'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE options SET option_value = 'false' WHERE option_name = 'force_ssl'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let detected_url_page = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login")
+                    .header("host", "skins.auto.example.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detected_url_page.status(), StatusCode::OK);
+        let detected_url_page = String::from_utf8(
+            to_bytes(detected_url_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let encoded_detected_url_globals = detected_url_page
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let detected_url_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_detected_url_globals)
+            .unwrap();
+        let detected_url_globals: serde_json::Value =
+            serde_json::from_slice(&detected_url_globals_bytes).unwrap();
+        assert_eq!(
+            detected_url_globals["base_url"],
+            "http://skins.auto.example.test"
+        );
+
+        let proxied_https_page = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login")
+                    .header("host", "skins.auto.example.test")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let proxied_https_page = String::from_utf8(
+            to_bytes(proxied_https_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            proxied_https_page.contains("https://skins.auto.example.test/app/style.012abcd.css")
+        );
+
         let logout = app
             .oneshot(
                 Request::builder()

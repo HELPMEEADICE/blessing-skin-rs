@@ -351,10 +351,20 @@ pub async fn authorize(
     };
     let site_name = crate::http::site_name(&state).await;
     let app_dir = state.public_dir.join("app");
-    let stylesheet =
-        crate::http::frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
-    let frontend_script =
-        crate::http::frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let stylesheet = crate::http::frontend_entrypoint(
+        &app_dir,
+        "style",
+        "css",
+        &crate::http::request_app_url(&state),
+    )
+    .await;
+    let frontend_script = crate::http::frontend_entrypoint(
+        &app_dir,
+        "app",
+        "js",
+        &crate::http::request_app_url(&state),
+    )
+    .await;
     let i18n = crate::http::load_frontend_translations(
         &state,
         &app_dir,

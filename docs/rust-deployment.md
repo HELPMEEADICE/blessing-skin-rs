@@ -131,6 +131,8 @@ server {
 
 将 `APP_URL` 设为 `https://skin.example.com`，并在反向代理处配置证书和 HTTP 到 HTTPS 跳转。
 
+Rust 会继续读取旧站的 `auto_detect_asset_url`、`site_url` 和 `force_ssl` 选项：自动检测开启时使用请求的 `Host`，关闭时使用有效的 `site_url`；`force_ssl` 或安全的反向代理头会强制生成 HTTPS URL。反向代理应保留并校验 `Host`，并按示例传递 `X-Forwarded-Proto`。缺少有效请求 Host 时回退到 `APP_URL`。
+
 ## 迁移切换
 
 切换按“只读影子比对 → 单业务域灰度 → 全站 Rust”推进。每个阶段至少观察 24 小时；任一阶段不满足退出条件时，不进入下一阶段。
