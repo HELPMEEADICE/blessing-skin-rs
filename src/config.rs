@@ -235,6 +235,8 @@ impl DatabaseConfig {
                     .username(username)
                     .password(password)
                     .database(database);
+                let options =
+                    with_mysql_ssl_ca(options, legacy_env("MYSQL_ATTR_SSL_CA").as_deref());
                 Ok(Self {
                     connection: DatabaseConnection::MySql(options),
                     table_prefix,
@@ -278,6 +280,7 @@ impl DatabaseConfig {
         table_prefix: String,
         url: &str,
         sqlite_foreign_keys: Option<&str>,
+        mysql_ssl_ca: Option<&str>,
     ) -> Result<Self, ConfigError> {
         if !valid_table_prefix(&table_prefix) {
             return Err(ConfigError::InvalidTablePrefix);
@@ -307,6 +310,7 @@ impl DatabaseConfig {
                 let options = url
                     .parse::<MySqlConnectOptions>()
                     .map_err(|_| ConfigError::InvalidDatabaseUrl)?;
+                let options = with_mysql_ssl_ca(options, mysql_ssl_ca);
                 let host = options.get_host().to_owned();
                 let port = options.get_port();
                 let username = options.get_username().to_owned();
@@ -347,7 +351,14 @@ impl DatabaseConfig {
         let driver = legacy_env("DB_CONNECTION").unwrap_or_else(|| "mysql".to_owned());
         if let Some(url) = legacy_env("DATABASE_URL").filter(|value| !value.trim().is_empty()) {
             let foreign_keys = legacy_env("DB_FOREIGN_KEYS");
-            return Self::from_url(&driver, table_prefix, &url, foreign_keys.as_deref());
+            let mysql_ssl_ca = legacy_env("MYSQL_ATTR_SSL_CA");
+            return Self::from_url(
+                &driver,
+                table_prefix,
+                &url,
+                foreign_keys.as_deref(),
+                mysql_ssl_ca.as_deref(),
+            );
         }
         let (connection, display_driver, host, port, username, database) =
             match driver.to_ascii_lowercase().as_str() {
@@ -381,6 +392,8 @@ impl DatabaseConfig {
                         &database,
                         legacy_env("DB_SOCKET").as_deref(),
                     );
+                    let options =
+                        with_mysql_ssl_ca(options, legacy_env("MYSQL_ATTR_SSL_CA").as_deref());
                     (
                         DatabaseConnection::MySql(options),
                         "MySQL/MariaDB",
@@ -445,6 +458,16 @@ fn mysql_connect_options(
     }
 }
 
+fn with_mysql_ssl_ca(
+    options: MySqlConnectOptions,
+    certificate_authority: Option<&str>,
+) -> MySqlConnectOptions {
+    match certificate_authority.filter(|path| !path.trim().is_empty()) {
+        Some(path) => options.ssl_ca(path),
+        None => options,
+    }
+}
+
 fn parse_setup_port(value: &str, default: u16) -> Result<u16, ConfigError> {
     if value.trim().is_empty() {
         return Ok(default);
@@ -483,8 +506,18 @@ mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
         mysql_connect_options, parse_legacy_env_os, parse_legacy_env_value, valid_table_prefix,
+        with_mysql_ssl_ca,
     };
+    use sqlx::{ConnectOptions, mysql::MySqlConnectOptions};
     use std::{ffi::OsString, path::Path};
+
+    fn mysql_ssl_ca_path(options: &MySqlConnectOptions) -> Option<String> {
+        options
+            .to_url_lossy()
+            .query_pairs()
+            .find(|(name, _)| name == "ssl-ca")
+            .map(|(_, value)| value.strip_prefix("file: ").unwrap_or(&value).to_owned())
+    }
 
     #[test]
     fn parses_laravel_reserved_environment_values() {
@@ -636,8 +669,9 @@ mod tests {
         let mysql = DatabaseConfig::from_url(
             "mysql",
             "bs_".to_owned(),
-            "mysql://blessing:p%40ss@db.example.test:3307/skin",
+            "mysql://blessing:p%40ss@db.example.test:3307/skin?ssl-ca=url-ca.pem",
             None,
+            Some("legacy-ca.pem"),
         )
         .unwrap();
         assert_eq!(mysql.driver, "MySQL/MariaDB");
@@ -646,12 +680,19 @@ mod tests {
         assert_eq!(mysql.username.as_deref(), Some("blessing"));
         assert_eq!(mysql.database, "skin");
         assert_eq!(mysql.table_prefix, "bs_");
-        assert!(matches!(mysql.connection, DatabaseConnection::MySql(_)));
+        let DatabaseConnection::MySql(mysql_options) = mysql.connection else {
+            panic!("expected MySQL connection options");
+        };
+        assert_eq!(
+            mysql_ssl_ca_path(&mysql_options).as_deref(),
+            Some("legacy-ca.pem")
+        );
 
         let postgres = DatabaseConfig::from_url(
             "pgsql",
             String::new(),
             "postgres://blessing:secret@db.example.test:5433/skin?sslmode=require",
+            None,
             None,
         )
         .unwrap();
@@ -670,13 +711,14 @@ mod tests {
             String::new(),
             "sqlite:///var/lib/blessing-skin/database.sqlite?mode=rw",
             Some("false"),
+            None,
         )
         .unwrap();
         assert_eq!(sqlite.database, "/var/lib/blessing-skin/database.sqlite");
         assert!(matches!(sqlite.connection, DatabaseConnection::Sqlite(_)));
 
         assert!(matches!(
-            DatabaseConfig::from_url("mysql", String::new(), "not-a-url", None),
+            DatabaseConfig::from_url("mysql", String::new(), "not-a-url", None, None),
             Err(ConfigError::InvalidDatabaseUrl)
         ));
     }
@@ -704,6 +746,17 @@ mod tests {
 
         let options = mysql_connect_options("localhost", 3306, "user", "", "skin", Some(" "));
         assert!(options.get_socket().is_none());
+
+        let options = with_mysql_ssl_ca(options, Some("/etc/mysql/ca.pem"));
+        assert_eq!(
+            mysql_ssl_ca_path(&options).as_deref(),
+            Some("/etc/mysql/ca.pem")
+        );
+        let options = with_mysql_ssl_ca(options, Some("  "));
+        assert_eq!(
+            mysql_ssl_ca_path(&options).as_deref(),
+            Some("/etc/mysql/ca.pem")
+        );
     }
 }
 fn load_passport_public_key(storage: &std::path::Path) -> Option<Vec<u8>> {
