@@ -509,7 +509,7 @@ pub struct UserProfile {
     pub verified: bool,
     pub is_dark_mode: bool,
 }
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, PartialEq, Eq)]
 pub struct PlayerRecord {
     pub pid: i64,
     pub uid: i64,
@@ -520,7 +520,10 @@ pub struct PlayerRecord {
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum UserRegistrationOutcome {
-    Registered(i64),
+    Registered {
+        uid: i64,
+        player: Option<PlayerRecord>,
+    },
     EmailExists,
     PlayerNameExists,
     IpLimit,
@@ -4797,11 +4800,22 @@ impl DatabasePool {
                 last_sign_at,
             )
             .await?;
-        if let Some(player_name) = player_name {
-            self.insert_registered_player(prefix, uid, player_name, now)
+        let player = if let Some(player_name) = player_name {
+            let pid = self
+                .insert_registered_player(prefix, uid, player_name, now)
                 .await?;
-        }
-        Ok(UserRegistrationOutcome::Registered(uid))
+            Some(PlayerRecord {
+                pid,
+                uid,
+                name: player_name.to_owned(),
+                tid_skin: 0,
+                tid_cape: 0,
+                last_modified: now.to_owned(),
+            })
+        } else {
+            None
+        };
+        Ok(UserRegistrationOutcome::Registered { uid, player })
     }
 
     async fn insert_registered_user(
@@ -4871,42 +4885,37 @@ impl DatabasePool {
         uid: i64,
         player_name: &str,
         now: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<i64, sqlx::Error> {
         let sql = match self {
             Self::Postgres(_) => format!(
-                "INSERT INTO {prefix}players (uid,name,tid_skin,tid_cape,last_modified) VALUES ($1,$2,0,0,CAST($3 AS TIMESTAMP))"
+                "INSERT INTO {prefix}players (uid,name,tid_skin,tid_cape,last_modified) VALUES ($1,$2,0,0,CAST($3 AS TIMESTAMP)) RETURNING CAST(pid AS BIGINT)"
             ),
             _ => format!(
                 "INSERT INTO {prefix}players (uid,name,tid_skin,tid_cape,last_modified) VALUES (?,?,0,0,?)"
             ),
         };
         match self {
-            Self::Sqlite(pool) => {
-                sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(uid)
-                    .bind(player_name)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            Self::MySql(pool) => {
-                sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(uid)
-                    .bind(player_name)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            Self::Postgres(pool) => {
-                sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(uid)
-                    .bind(player_name)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
+            Self::Sqlite(pool) => Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(player_name)
+                .bind(now)
+                .execute(pool)
+                .await?
+                .last_insert_rowid()),
+            Self::MySql(pool) => Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(player_name)
+                .bind(now)
+                .execute(pool)
+                .await?
+                .last_insert_id() as i64),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(player_name)
+                .bind(now)
+                .fetch_one(pool)
+                .await?),
         }
-        Ok(())
     }
 
     pub async fn user_email_exists(

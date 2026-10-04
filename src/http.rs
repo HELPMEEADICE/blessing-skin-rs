@@ -2739,6 +2739,21 @@ async fn infer_peer_client_ip(
     next.run(request).await
 }
 
+fn registration_plugin_events(
+    uid: i64,
+    initial_player: Option<&crate::database::PlayerRecord>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut events = vec![("user.registered", serde_json::json!({"user_id": uid}))];
+    if let Some(player) = initial_player {
+        events.push((
+            "player.added",
+            serde_json::json!({"user_id": uid, "player_id": player.pid, "name": player.name}),
+        ));
+    }
+    events.push(("user.logged-in", serde_json::json!({"user_id": uid})));
+    events
+}
+
 async fn handle_register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2930,7 +2945,7 @@ async fn handle_register(
             },
             None,
         ),
-        Ok(crate::database::UserRegistrationOutcome::Registered(uid)) => {
+        Ok(crate::database::UserRegistrationOutcome::Registered { uid, player }) => {
             let requested_locale = body_locale
                 .or_else(|| explicit_request_locale().and_then(|locale| normalize_locale(&locale)));
             if let Some(locale) = requested_locale {
@@ -2969,15 +2984,18 @@ async fn handle_register(
             let cookie = format!(
                 "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200{secure}"
             );
-            if let Ok(value) = HeaderValue::from_str(&cookie) {
-                response.headers_mut().insert(SET_COOKIE, value);
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    response.headers_mut().insert(SET_COOKIE, value);
+                }
+                Err(error) => {
+                    tracing::error!(%error, user_id = uid, "failed to create post-registration session cookie");
+                    return unavailable();
+                }
             }
-            emit_plugin_event(
-                &state,
-                "user.registered",
-                serde_json::json!({"user_id": uid}),
-            )
-            .await;
+            for (event, payload) in registration_plugin_events(uid, player.as_ref()) {
+                emit_plugin_event(&state, event, payload).await;
+            }
             response
         }
         Err(error) => {
@@ -16836,6 +16854,36 @@ mod tests {
         assert!(html.contains(r#"id="forgot-form""#));
         assert!(html.contains("/auth/captcha"));
         assert!(!html.contains("window.blessing = JSON.parse"));
+    }
+
+    #[test]
+    fn registration_plugin_events_match_legacy_success_order_and_payloads() {
+        let player = crate::database::PlayerRecord {
+            pid: 11,
+            uid: 7,
+            name: "Alex".to_owned(),
+            tid_skin: 0,
+            tid_cape: 0,
+            last_modified: "2026-10-05 12:00:00".to_owned(),
+        };
+        assert_eq!(
+            super::registration_plugin_events(7, Some(&player)),
+            vec![
+                ("user.registered", serde_json::json!({"user_id": 7})),
+                (
+                    "player.added",
+                    serde_json::json!({"user_id": 7, "player_id": 11, "name": "Alex"}),
+                ),
+                ("user.logged-in", serde_json::json!({"user_id": 7})),
+            ]
+        );
+        assert_eq!(
+            super::registration_plugin_events(7, None),
+            vec![
+                ("user.registered", serde_json::json!({"user_id": 7})),
+                ("user.logged-in", serde_json::json!({"user_id": 7})),
+            ]
+        );
     }
 
     #[test]
