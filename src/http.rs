@@ -9615,6 +9615,20 @@ fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
         .unwrap_or(if negative { i64::MIN } else { i64::MAX })
 }
 
+fn legacy_texture_width_limit(value: Option<&str>) -> (f64, String) {
+    let Some(value) = value else {
+        return (8192.0, "8192".to_owned());
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "(true)" => (f64::INFINITY, "1".to_owned()),
+        "false" | "(false)" | "null" | "(null)" => (0.0, String::new()),
+        _ => match value.trim().parse::<f64>() {
+            Ok(limit) if limit.is_finite() => (limit, value.to_owned()),
+            _ => (8192.0, "8192".to_owned()),
+        },
+    }
+}
+
 fn private_texture_status_code(value: Option<&str>) -> StatusCode {
     if legacy_option_integer(value, 403) == 404 {
         StatusCode::NOT_FOUND
@@ -10636,23 +10650,23 @@ async fn upload_texture(
     let Some((width, height)) = png_dimensions(&file_bytes) else {
         return upload_validation_error("file", &request_locale(&state));
     };
-    let max_width = match database
+    let (max_width, max_width_label) = match database
         .option(&state.config.database.table_prefix, "max_texture_width")
         .await
     {
-        Ok(value) => value
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(8192),
+        Ok(value) => legacy_texture_width_limit(value.as_deref()),
         Err(error) => {
             tracing::error!(%error, "failed to read maximum texture width");
             return unavailable();
         }
     };
-    if width > max_width {
+    if f64::from(width) > max_width {
         let message = if request_locale(&state).starts_with("zh") {
-            format!("材质过宽（{width}px），本站允许的最大宽度为 {max_width}px")
+            format!("材质过宽（{width}px），本站允许的最大宽度为 {max_width_label}px")
         } else {
-            format!("The texture is too wide ({width}px). Maximum width allowed is {max_width}px")
+            format!(
+                "The texture is too wide ({width}px). Maximum width allowed is {max_width_label}px"
+            )
         };
         return login_result(1, &message, None);
     }
@@ -15454,6 +15468,34 @@ mod tests {
         assert_eq!(super::legacy_option_integer(Some("1.9"), 17), 1);
         assert_eq!(super::legacy_option_integer(Some(" -12.5 items"), 17), -12);
         assert_eq!(super::legacy_option_integer(Some("invalid"), 17), 0);
+    }
+
+    #[test]
+    fn texture_width_option_preserves_php_boolean_and_numeric_comparisons() {
+        let (default_limit, default_label) = super::legacy_texture_width_limit(None);
+        assert_eq!(default_limit, 8192.0);
+        assert_eq!(default_label, "8192");
+
+        let (true_limit, true_label) = super::legacy_texture_width_limit(Some("(TRUE)"));
+        assert!(!(64.0 > true_limit));
+        assert_eq!(true_label, "1");
+
+        let (false_limit, false_label) = super::legacy_texture_width_limit(Some("false"));
+        assert!(64.0 > false_limit);
+        assert!(false_label.is_empty());
+
+        let (null_limit, null_label) = super::legacy_texture_width_limit(Some("(null)"));
+        assert!(64.0 > null_limit);
+        assert!(null_label.is_empty());
+
+        let (numeric_limit, numeric_label) = super::legacy_texture_width_limit(Some("64.5"));
+        assert!(!(64.0 > numeric_limit));
+        assert!(65.0 > numeric_limit);
+        assert_eq!(numeric_label, "64.5");
+
+        let (invalid_limit, invalid_label) = super::legacy_texture_width_limit(Some("invalid"));
+        assert_eq!(invalid_limit, 8192.0);
+        assert_eq!(invalid_label, "8192");
     }
 
     #[test]
