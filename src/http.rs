@@ -3126,6 +3126,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
         });
     let home_pic_url = site_option(&state, "home_pic_url")
         .await
+        .filter(|value| legacy_option_bool(Some(value)))
         .unwrap_or_else(|| "./app/bg.webp".to_owned());
     let fixed_bg = option_is_enabled(&state, "fixed_bg").await;
     let hide_intro = option_is_enabled(&state, "hide_intro").await;
@@ -18778,6 +18779,36 @@ mod tests {
         assert_eq!(
             home_globals["extra"]["home"]["background"],
             "/uploads/home.webp"
+        );
+        sqlx::query("UPDATE options SET option_value = '0' WHERE option_name = 'home_pic_url'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let falsey_background_home =
+            session_request(&app, &registered_cookie, "GET", "/", None).await;
+        assert_eq!(falsey_background_home.status(), StatusCode::OK);
+        let falsey_background_home = String::from_utf8(
+            to_bytes(falsey_background_home.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let encoded_falsey_background_globals = falsey_background_home
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let falsey_background_globals = base64::engine::general_purpose::STANDARD
+            .decode(encoded_falsey_background_globals)
+            .unwrap();
+        let falsey_background_globals: serde_json::Value =
+            serde_json::from_slice(&falsey_background_globals).unwrap();
+        assert_eq!(
+            falsey_background_globals["extra"]["home"]["background"],
+            "./app/bg.webp"
         );
         assert_eq!(home_globals["extra"]["home"]["user_label"], "NewGuy");
         assert_eq!(home_globals["extra"]["transparent_navbar"], true);
