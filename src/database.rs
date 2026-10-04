@@ -3920,6 +3920,58 @@ impl DatabasePool {
         }
     }
 
+    pub async fn issue_oauth_client_credentials_token(
+        &self,
+        prefix: &str,
+        access_token_id: &str,
+        client_id: i64,
+        scopes: &str,
+        expires_at: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES ($1,NULL,$2,$3,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$4::TIMESTAMP)"
+            ),
+            _ => format!(
+                "INSERT INTO {prefix}oauth_access_tokens \
+                 (id,user_id,client_id,scopes,revoked,created_at,updated_at,expires_at) \
+                 VALUES (?,NULL,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?)"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(access_token_id)
+                    .bind(client_id)
+                    .bind(scopes)
+                    .bind(expires_at)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn issue_oauth_personal_access_token(
         &self,
         prefix: &str,
@@ -8708,6 +8760,9 @@ mod language_line_tests {
             format!(
                 "CREATE TABLE {prefix}options (id BIGINT PRIMARY KEY, option_name VARCHAR(50) NOT NULL, option_value TEXT NOT NULL)"
             ),
+            format!(
+                "CREATE TABLE {prefix}oauth_access_tokens (id VARCHAR(100) PRIMARY KEY, user_id BIGINT NULL, client_id BIGINT NOT NULL, name VARCHAR(100) NULL, scopes TEXT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP NULL, updated_at TIMESTAMP NULL, expires_at TIMESTAMP NULL)"
+            ),
         ];
         for statement in &statements {
             execute_legacy_fixture_sql(&database, statement)
@@ -8805,6 +8860,25 @@ mod language_line_tests {
         );
 
         database
+            .issue_oauth_client_credentials_token(
+                &prefix,
+                "machine-token",
+                19,
+                r#"["Plugin.Custom"]"#,
+                "2099-01-01 00:00:00",
+            )
+            .await
+            .unwrap();
+        let machine_token = database
+            .access_token(&prefix, "machine-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(machine_token.user_id, None);
+        assert_eq!(machine_token.client_id, 19);
+        assert!(!machine_token.revoked);
+
+        database
             .ensure_wasm_plugin_state_schema(&prefix)
             .await
             .unwrap();
@@ -8868,6 +8942,7 @@ mod language_line_tests {
 
         for suffix in [
             "wasm_plugin_state",
+            "oauth_access_tokens",
             "options",
             "textures",
             "players",

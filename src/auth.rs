@@ -58,7 +58,10 @@ pub fn decode_web_session(token: &str, secret: &str) -> Option<i64> {
 }
 
 pub fn has_scope(claims: &PassportClaims, required: &str) -> bool {
-    claims.scopes.iter().any(|scope| scope == required)
+    claims
+        .scopes
+        .iter()
+        .any(|scope| scope == "*" || scope == required)
 }
 
 pub fn audience_matches(audience: Option<&Value>, client_id: i64) -> bool {
@@ -222,6 +225,11 @@ mod tests {
         };
         assert!(has_scope(&claims, "User.Read"));
         assert!(!has_scope(&claims, "Player.Read"));
+        let wildcard = PassportClaims {
+            scopes: vec!["*".to_owned()],
+            ..claims
+        };
+        assert!(has_scope(&wildcard, "Player.Read"));
     }
 
     #[test]

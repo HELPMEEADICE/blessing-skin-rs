@@ -14524,7 +14524,9 @@ struct AuthenticatedToken {
 
 impl AuthenticatedToken {
     fn has_scope(&self, required: &str) -> bool {
-        self.scopes.iter().any(|scope| scope == required)
+        self.scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == required)
     }
 
     fn has_any_scope(&self, required: &[&str]) -> bool {

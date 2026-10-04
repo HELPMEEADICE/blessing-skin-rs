@@ -259,12 +259,13 @@ pub async fn authorize(
         }
     };
     let known_scopes = load_known_scopes(database, prefix).await;
-    let scopes = match parse_scopes(
+    let scopes: Vec<String> = match parse_scopes(
         request.fields.get("scope").map(String::as_str),
         None,
         &known_scopes,
+        true,
     ) {
-        Ok(scopes) => scopes,
+        Ok(scopes) => scopes.into_iter().filter(|scope| scope != "*").collect(),
         Err(()) => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -903,7 +904,7 @@ pub async fn create_personal_access_token(
     let known_scopes = load_known_scopes(database, prefix).await;
     let mut scopes = Vec::with_capacity(request.scopes.len());
     for scope in request.scopes {
-        if !known_scopes.iter().any(|known| known == &scope) {
+        if scope != "*" && !known_scopes.iter().any(|known| known == &scope) {
             return oauth_validation_error(
                 "The given data was invalid.",
                 serde_json::json!({ "scopes": [format!("The selected scope {scope} is invalid.")] }),
@@ -1078,7 +1079,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
         .unwrap_or("");
     if !matches!(
         grant_type,
-        "password" | "refresh_token" | "authorization_code"
+        "password" | "refresh_token" | "authorization_code" | "client_credentials"
     ) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -1117,7 +1118,9 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
             );
         }
     };
-    if !verify_client_secret(&client, client_secret.as_deref()) {
+    if (grant_type == "client_credentials" && client.secret.is_none())
+        || !verify_client_secret(&client, client_secret.as_deref())
+    {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
@@ -1207,6 +1210,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                 request.fields.get("scope").map(String::as_str),
                 None,
                 &known_scopes,
+                true,
             ) {
                 Ok(scopes) => scopes,
                 Err(()) => {
@@ -1217,7 +1221,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                     );
                 }
             };
-            (credential.uid, scopes, None, None)
+            (Some(credential.uid), scopes, None, None)
         }
         "authorization_code" => {
             let Some(code) = request.fields.get("code").filter(|value| !value.is_empty()) else {
@@ -1381,7 +1385,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                 );
             }
             (
-                user_id,
+                Some(user_id),
                 scopes,
                 None,
                 Some((payload.auth_code_id, user_id, client.id)),
@@ -1430,6 +1434,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                 request.fields.get("scope").map(String::as_str),
                 Some(&old_scopes),
                 &known_scopes,
+                true,
             ) {
                 Ok(scopes) => scopes,
                 Err(()) => {
@@ -1450,12 +1455,32 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
                     "A refresh token cannot grant additional scopes.",
                 );
             }
+            let scopes = scopes.into_iter().filter(|scope| scope != "*").collect();
             (
-                previous.user_id.unwrap(),
+                Some(previous.user_id.unwrap()),
                 scopes,
                 Some(refresh_id.clone()),
                 None,
             )
+        }
+        "client_credentials" => {
+            let known_scopes = load_known_scopes(database, prefix).await;
+            let scopes = match parse_scopes(
+                request.fields.get("scope").map(String::as_str),
+                None,
+                &known_scopes,
+                true,
+            ) {
+                Ok(scopes) => scopes,
+                Err(()) => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_scope",
+                        "The requested scope is invalid.",
+                    );
+                }
+            };
+            (None, scopes, None, None)
         }
         _ => unreachable!(),
     };
@@ -1472,7 +1497,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
         jti: access_id.clone(),
         nbf: now,
         scopes: scopes.clone(),
-        sub: user_id.to_string(),
+        sub: user_id.map_or_else(String::new, |user_id| user_id.to_string()),
     };
     let access_token = match encode(&Header::new(Algorithm::RS256), &claims, signing_key) {
         Ok(token) => token,
@@ -1496,23 +1521,35 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
             );
         }
     };
-    let stored = match database
-        .issue_oauth_token_pair(
-            prefix,
-            &access_id,
-            user_id,
-            client.id,
-            &scopes_json,
-            &database_datetime(access_expires),
-            &refresh_id,
-            &database_datetime(refresh_expires),
-            rotate_refresh.as_deref(),
-            consume_auth_code
-                .as_ref()
-                .map(|(id, user_id, client_id)| (id.as_str(), *user_id, *client_id)),
-        )
-        .await
-    {
+    let stored = match if let Some(user_id) = user_id {
+        database
+            .issue_oauth_token_pair(
+                prefix,
+                &access_id,
+                user_id,
+                client.id,
+                &scopes_json,
+                &database_datetime(access_expires),
+                &refresh_id,
+                &database_datetime(refresh_expires),
+                rotate_refresh.as_deref(),
+                consume_auth_code
+                    .as_ref()
+                    .map(|(id, user_id, client_id)| (id.as_str(), *user_id, *client_id)),
+            )
+            .await
+    } else {
+        database
+            .issue_oauth_client_credentials_token(
+                prefix,
+                &access_id,
+                client.id,
+                &scopes_json,
+                &database_datetime(access_expires),
+            )
+            .await
+            .map(|()| true)
+    } {
         Ok(stored) => stored,
         Err(error) => {
             tracing::error!(%error, "failed to persist Passport access and refresh tokens");
@@ -1531,14 +1568,23 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
         );
     }
 
-    let mut response = Json(serde_json::json!({
-        "token_type": "Bearer",
-        "expires_in": ACCESS_TOKEN_TTL,
-        "access_token": access_token,
-        "refresh_token": refresh_id,
-        "scope": scopes.join(" "),
-    }))
-    .into_response();
+    let response_body = if grant_type == "client_credentials" {
+        serde_json::json!({
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "access_token": access_token,
+            "scope": scopes.join(" "),
+        })
+    } else {
+        serde_json::json!({
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "access_token": access_token,
+            "refresh_token": refresh_id,
+            "scope": scopes.join(" "),
+        })
+    };
+    let mut response = Json(response_body).into_response();
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1658,6 +1704,7 @@ fn parse_scopes(
     requested: Option<&str>,
     defaults: Option<&[String]>,
     known_scopes: &[String],
+    allow_wildcard: bool,
 ) -> Result<Vec<String>, ()> {
     let scopes: Vec<String> = match requested.filter(|value| !value.trim().is_empty()) {
         Some(value) => value.split_ascii_whitespace().map(str::to_owned).collect(),
@@ -1665,10 +1712,13 @@ fn parse_scopes(
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| vec!["User.Read".to_owned()]),
     };
-    if scopes
-        .iter()
-        .any(|scope| !known_scopes.iter().any(|known| known == scope))
-    {
+    if scopes.iter().any(|scope| {
+        if scope == "*" {
+            !allow_wildcard
+        } else {
+            !known_scopes.iter().any(|known| known == scope)
+        }
+    }) {
         return Err(());
     }
     let mut unique = Vec::with_capacity(scopes.len());
@@ -1780,21 +1830,33 @@ mod tests {
     #[test]
     fn applies_default_and_requested_scope_rules() {
         assert_eq!(
-            parse_scopes(None, None, &known_scopes()).unwrap(),
+            parse_scopes(None, None, &known_scopes(), false).unwrap(),
             vec!["User.Read"]
         );
         assert_eq!(
             parse_scopes(
                 Some("Player.Read User.Read Player.Read"),
                 None,
-                &known_scopes()
+                &known_scopes(),
+                false
             )
             .unwrap(),
             vec!["Player.Read", "User.Read"]
         );
-        assert!(parse_scopes(Some("Unknown.Read"), None, &known_scopes()).is_err());
+        assert!(parse_scopes(Some("Unknown.Read"), None, &known_scopes(), false).is_err());
+        assert!(parse_scopes(Some("*"), None, &known_scopes(), false).is_err());
         assert_eq!(
-            parse_scopes(None, Some(&["Player.Read".to_owned()]), &known_scopes()).unwrap(),
+            parse_scopes(Some("*"), None, &known_scopes(), true).unwrap(),
+            vec!["*"]
+        );
+        assert_eq!(
+            parse_scopes(
+                None,
+                Some(&["Player.Read".to_owned()]),
+                &known_scopes(),
+                false
+            )
+            .unwrap(),
             vec!["Player.Read"]
         );
     }
@@ -1927,6 +1989,8 @@ mod integration_tests {
         .await
         .unwrap();
         sqlx::query("INSERT INTO oauth_clients (id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (2,'Game client','client-secret',NULL,'http://localhost',FALSE,TRUE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO oauth_clients (id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (5,'Public client',NULL,NULL,'https://public.test/callback',FALSE,FALSE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO oauth_clients (id,user_id,name,secret,provider,redirect,personal_access_client,password_client,revoked,created_at,updated_at) VALUES (3,7,'Third-party app','never-return-this-secret',NULL,'https://example.test/callback',FALSE,FALSE,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
             .execute(&pool).await.unwrap();
@@ -2084,6 +2148,70 @@ mod integration_tests {
             1
         );
 
+        let wildcard_body = form(&[
+            ("grant_type", "password"),
+            ("client_id", "2"),
+            ("client_secret", "client-secret"),
+            ("username", "alex@example.test"),
+            ("password", "correct horse"),
+            ("scope", "*"),
+        ]);
+        let wildcard_response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(wildcard_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wildcard_response.status(), StatusCode::OK);
+        let wildcard_tokens: Value = response_json(wildcard_response).await;
+        let wildcard_access = wildcard_tokens["access_token"].as_str().unwrap();
+        let wildcard_refresh = wildcard_tokens["refresh_token"].as_str().unwrap();
+        let wildcard_claims = crate::auth::decode_access_token(
+            wildcard_access,
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wildcard_claims.scopes, vec!["*"]);
+        let wildcard_user = app
+            .clone()
+            .oneshot(
+                Request::get("/api/user")
+                    .header("authorization", format!("Bearer {wildcard_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wildcard_user.status(), StatusCode::OK);
+        let wildcard_refresh_body = form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "2"),
+            ("client_secret", "client-secret"),
+            ("refresh_token", wildcard_refresh),
+        ]);
+        let wildcard_refreshed = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(wildcard_refresh_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wildcard_refreshed.status(), StatusCode::OK);
+        let wildcard_refreshed: Value = response_json(wildcard_refreshed).await;
+        let wildcard_refreshed_claims = crate::auth::decode_access_token(
+            wildcard_refreshed["access_token"].as_str().unwrap(),
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert!(wildcard_refreshed_claims.scopes.is_empty());
+
         let auth_code_id = "php-issued-code";
         let code_verifier = "A".repeat(43);
         let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
@@ -2200,7 +2328,7 @@ mod integration_tests {
         let browser_verifier = "C".repeat(43);
         let browser_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(browser_verifier.as_bytes()));
         let authorize_path = format!(
-            "/oauth/authorize?response_type=code&client_id=3&scope=User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id=3&scope=*+User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256"
         );
         let guest_authorize = app
             .clone()
@@ -2238,7 +2366,7 @@ mod integration_tests {
                     .body(Body::from(serde_json::json!({
                         "identification": "alex@example.test",
                         "password": "correct horse",
-                        "redirect_to": format!("/oauth/authorize?response_type=code&client_id=3&scope=User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256")
+                        "redirect_to": format!("/oauth/authorize?response_type=code&client_id=3&scope=*+User.Read+Plugin.Custom&state=browser-state&code_challenge={browser_challenge}&code_challenge_method=S256")
                     }).to_string()))
                     .unwrap(),
             )
@@ -2385,6 +2513,94 @@ mod integration_tests {
             redirect_parameter(deny_location, "state").as_deref(),
             Some("deny-state")
         );
+        let client_credentials_body = form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", "3"),
+            ("client_secret", "never-return-this-secret"),
+            ("scope", "*"),
+        ]);
+        let client_credentials_response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(client_credentials_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client_credentials_response.status(), StatusCode::OK);
+        assert_eq!(
+            client_credentials_response
+                .headers()
+                .get("cache-control")
+                .unwrap(),
+            "no-store"
+        );
+        let client_credentials_tokens: Value = response_json(client_credentials_response).await;
+        assert!(client_credentials_tokens.get("refresh_token").is_none());
+        assert_eq!(client_credentials_tokens["scope"], "*");
+        let client_credentials_access = client_credentials_tokens["access_token"].as_str().unwrap();
+        let client_credentials_claims = crate::auth::decode_access_token(
+            client_credentials_access,
+            &DecodingKey::from_rsa_pem(public_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(client_credentials_claims.sub, "");
+        assert_eq!(client_credentials_claims.aud.unwrap(), "3");
+        assert_eq!(client_credentials_claims.scopes, vec!["*"]);
+        let client_credentials_record = sqlx::query_as::<_, (Option<i64>, i64, bool)>(
+            "SELECT user_id, client_id, revoked FROM oauth_access_tokens WHERE id = ?",
+        )
+        .bind(&client_credentials_claims.jti)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(client_credentials_record, (None, 3, false));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM oauth_refresh_tokens WHERE access_token_id = ?"
+            )
+            .bind(&client_credentials_claims.jti)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let client_credentials_user = app
+            .clone()
+            .oneshot(
+                Request::get("/api/user")
+                    .header(
+                        "authorization",
+                        format!("Bearer {client_credentials_access}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client_credentials_user.status(), StatusCode::UNAUTHORIZED);
+
+        let public_client_body = form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", "5"),
+            ("scope", "User.Read"),
+        ]);
+        let public_client_response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(public_client_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_client_response.status(), StatusCode::UNAUTHORIZED);
+        let public_client_error: Value = response_json(public_client_response).await;
+        assert_eq!(public_client_error["error"], "invalid_client");
+
         let refresh_body = form(&[
             ("grant_type", "refresh_token"),
             ("client_id", "2"),
@@ -2470,7 +2686,7 @@ mod integration_tests {
                 Request::post("/oauth/personal-access-tokens")
                     .header("cookie", session_cookie(7, session_secret))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"CLI token","scopes":["User.Read"]}"#))
+                    .body(Body::from(r#"{"name":"CLI token","scopes":["*"]}"#))
                     .unwrap(),
             )
             .await
@@ -2485,6 +2701,7 @@ mod integration_tests {
         )
         .unwrap();
         assert_eq!(personal_created["token"]["id"], personal_claims.jti);
+        assert_eq!(personal_claims.scopes, vec!["*"]);
         let personal_use = app
             .clone()
             .oneshot(
