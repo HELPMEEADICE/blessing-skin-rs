@@ -56,21 +56,36 @@ const NAVBAR_COLORS: &[(&str, &str)] = &[
     ("orange", "Orange"),
 ];
 const SIDEBAR_COLORS: &[(&str, &str)] = &[
-    ("primary", "Primary"),
-    ("warning", "Warning"),
-    ("info", "Info"),
-    ("danger", "Danger"),
-    ("success", "Success"),
-    ("indigo", "Indigo"),
-    ("navy", "Navy"),
-    ("purple", "Purple"),
-    ("fuchsia", "Fuchsia"),
-    ("pink", "Pink"),
-    ("maroon", "Maroon"),
-    ("orange", "Orange"),
-    ("lime", "Lime"),
-    ("teal", "Teal"),
-    ("olive", "Olive"),
+    ("dark-primary", "Dark primary"),
+    ("dark-warning", "Dark warning"),
+    ("dark-info", "Dark info"),
+    ("dark-danger", "Dark danger"),
+    ("dark-success", "Dark success"),
+    ("dark-indigo", "Dark indigo"),
+    ("dark-navy", "Dark navy"),
+    ("dark-purple", "Dark purple"),
+    ("dark-fuchsia", "Dark fuchsia"),
+    ("dark-pink", "Dark pink"),
+    ("dark-maroon", "Dark maroon"),
+    ("dark-orange", "Dark orange"),
+    ("dark-lime", "Dark lime"),
+    ("dark-teal", "Dark teal"),
+    ("dark-olive", "Dark olive"),
+    ("light-primary", "Light primary"),
+    ("light-warning", "Light warning"),
+    ("light-info", "Light info"),
+    ("light-danger", "Light danger"),
+    ("light-success", "Light success"),
+    ("light-indigo", "Light indigo"),
+    ("light-navy", "Light navy"),
+    ("light-purple", "Light purple"),
+    ("light-fuchsia", "Light fuchsia"),
+    ("light-pink", "Light pink"),
+    ("light-maroon", "Light maroon"),
+    ("light-orange", "Light orange"),
+    ("light-lime", "Light lime"),
+    ("light-teal", "Light teal"),
+    ("light-olive", "Light olive"),
 ];
 
 #[derive(Clone, Copy)]
@@ -867,5 +882,29 @@ mod tests {
             .find(|setting| setting.key == "copyright_text")
             .unwrap();
         assert_eq!(copyright_text.default, LEGACY_DEFAULT_COPYRIGHT_TEXT);
+    }
+    #[test]
+    fn sidebar_color_values_match_legacy_dark_and_light_palette() {
+        let sidebar = CUSTOMIZE
+            .iter()
+            .find(|setting| setting.key == "sidebar_color")
+            .unwrap();
+        assert!(
+            sidebar
+                .choices
+                .iter()
+                .any(|(value, _)| *value == "dark-maroon")
+        );
+        assert!(
+            sidebar
+                .choices
+                .iter()
+                .any(|(value, _)| *value == "light-olive")
+        );
+        assert_eq!(sidebar.default, "dark-maroon");
+        assert_eq!(
+            normalize_value(sidebar, &json!("dark-maroon")),
+            Some("dark-maroon".to_owned())
+        );
     }
 }
