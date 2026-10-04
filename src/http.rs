@@ -10527,7 +10527,7 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
         }
     };
     let texture_name_regexp = match database.option(prefix, "texture_name_regexp").await {
-        Ok(value) => value.filter(|value| !value.is_empty()),
+        Ok(value) => value.filter(|value| legacy_option_bool(Some(value))),
         Err(error) => {
             tracing::error!(%error, "failed to read texture name rule");
             return unavailable();
@@ -10905,7 +10905,7 @@ async fn upload_texture(
             return unavailable();
         }
     };
-    if !name_rule.is_empty() {
+    if legacy_option_bool(Some(&name_rule)) {
         if RegexBuilder::new(&name_rule).build().is_err() {
             tracing::error!("invalid legacy texture name validation regex");
             return unavailable();
@@ -11290,7 +11290,7 @@ fn valid_texture_name(name: &str, rule: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    rule.is_empty()
+    !legacy_option_bool(Some(rule))
         || RegexBuilder::new(rule)
             .build()
             .is_ok_and(|regex| regex.is_match(name))
@@ -11330,7 +11330,7 @@ async fn rename_texture(
             return unavailable();
         }
     };
-    if !name_rule.is_empty() {
+    if legacy_option_bool(Some(&name_rule)) {
         if RegexBuilder::new(&name_rule).build().is_err() {
             tracing::error!("invalid legacy texture name validation regex");
             return unavailable();
@@ -15835,6 +15835,9 @@ mod tests {
     #[test]
     fn validates_legacy_texture_name_rules() {
         assert!(super::valid_texture_name("skin_01", ""));
+        assert!(super::valid_texture_name("Skin 01", "0"));
+        assert!(super::valid_texture_name("Skin 01", "false"));
+        assert!(super::valid_texture_name("Skin 01", "(false)"));
         assert!(!super::valid_texture_name("", ""));
         assert!(super::valid_texture_name("skin_01", "^[a-z0-9_]+$"));
         assert!(!super::valid_texture_name("Skin 01", "^[a-z0-9_]+$"));
