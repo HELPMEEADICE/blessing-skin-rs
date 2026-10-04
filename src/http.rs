@@ -14266,36 +14266,38 @@ async fn avatar_by_user(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let Some(uid) = uid.parse::<i64>().ok() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let user = match database
-        .user_profile(&state.config.database.table_prefix, uid)
-        .await
-    {
-        Ok(user) => user,
-        Err(error) => {
-            tracing::error!(%error, uid, "failed to load user avatar");
-            return unavailable();
-        }
-    };
-    let texture_id = user.map(|user| user.avatar).filter(|tid| *tid > 0);
-    let source = match texture_id {
-        Some(tid) => match database
-            .texture_info(&state.config.database.table_prefix, tid)
-            .await
-        {
-            Ok(Some(texture)) => Some(AvatarSource {
-                hash: texture.hash,
-                texture_type: texture.texture_type,
-            }),
-            Ok(None) => None,
-            Err(error) => {
-                tracing::error!(%error, tid, "failed to load user avatar texture");
-                return unavailable();
+    let source = match uid.parse::<i64>() {
+        Ok(uid) => {
+            let user = match database
+                .user_profile(&state.config.database.table_prefix, uid)
+                .await
+            {
+                Ok(user) => user,
+                Err(error) => {
+                    tracing::error!(%error, uid, "failed to load user avatar");
+                    return unavailable();
+                }
+            };
+            let texture_id = user.map(|user| user.avatar).filter(|tid| *tid > 0);
+            match texture_id {
+                Some(tid) => match database
+                    .texture_info(&state.config.database.table_prefix, tid)
+                    .await
+                {
+                    Ok(Some(texture)) => Some(AvatarSource {
+                        hash: texture.hash,
+                        texture_type: texture.texture_type,
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::error!(%error, tid, "failed to load user avatar texture");
+                        return unavailable();
+                    }
+                },
+                None => None,
             }
-        },
-        None => None,
+        }
+        Err(_) => None,
     };
     render_avatar_response(&state, source, &query, &request_headers, true).await
 }
@@ -14349,22 +14351,23 @@ async fn avatar_by_texture(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let Some(tid) = tid.parse::<i64>().ok() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let source = match database
-        .texture_info(&state.config.database.table_prefix, tid)
-        .await
-    {
-        Ok(Some(texture)) => Some(AvatarSource {
-            hash: texture.hash,
-            texture_type: texture.texture_type,
-        }),
-        Ok(None) => None,
-        Err(error) => {
-            tracing::error!(%error, tid, "failed to load avatar texture");
-            return unavailable();
+    let source = if let Ok(tid) = tid.parse::<i64>() {
+        match database
+            .texture_info(&state.config.database.table_prefix, tid)
+            .await
+        {
+            Ok(Some(texture)) => Some(AvatarSource {
+                hash: texture.hash,
+                texture_type: texture.texture_type,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::error!(%error, tid, "failed to load avatar texture");
+                return unavailable();
+            }
         }
+    } else {
+        None
     };
     render_avatar_response(&state, source, &query, &request_headers, true).await
 }
@@ -20165,6 +20168,24 @@ mod tests {
                 .get(axum::http::header::LAST_MODIFIED)
                 .is_some()
         );
+        for uri in [
+            "/avatar/not-an-id?png&size=32",
+            "/avatar/user/not-an-id?png&size=32",
+        ] {
+            let invalid_avatar_id = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(invalid_avatar_id.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                invalid_avatar_id
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "image/png"
+            );
+        }
         std::fs::remove_dir_all(&texture_test_dir).unwrap();
 
         let admin_notice = session_request(
