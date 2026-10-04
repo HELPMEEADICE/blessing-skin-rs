@@ -69,10 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Arc::new(Config::from_env()?);
-    let storage_dir =
-        PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "storage".to_owned()));
-    let public_dir =
-        PathBuf::from(std::env::var("PUBLIC_PATH").unwrap_or_else(|_| "public".to_owned()));
+    let storage_dir = PathBuf::from(
+        crate::config::legacy_env("STORAGE_PATH").unwrap_or_else(|| "storage".to_owned()),
+    );
+    let public_dir = PathBuf::from(
+        crate::config::legacy_env("PUBLIC_PATH").unwrap_or_else(|| "public".to_owned()),
+    );
     if std::env::args().nth(1).as_deref() == Some("install") {
         installer::run(&config).await?;
         return Ok(());

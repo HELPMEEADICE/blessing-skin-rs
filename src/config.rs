@@ -5,6 +5,28 @@ use thiserror::Error;
 
 const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
 
+/// Read an environment value using Laravel's reserved `.env` value semantics.
+/// Laravel's `Env::get` converts `null` and `(null)` to `None`, and `empty` and
+/// `(empty)` to an empty string. Rust's dotenv loader leaves these as strings.
+pub(crate) fn legacy_env(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(parse_legacy_env_value)
+}
+
+fn parse_legacy_env_value(value: String) -> Option<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "null" | "(null)" => None,
+        "empty" | "(empty)" => Some(String::new()),
+        _ => Some(value),
+    }
+}
+
+fn is_legacy_false(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "false" | "(false)" | "0"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -85,22 +107,22 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let bind = env::var("BS_LISTEN")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+        let bind = legacy_env("BS_LISTEN")
+            .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse()?;
-        let table_prefix = env::var("DB_PREFIX").unwrap_or_default();
+        let table_prefix = legacy_env("DB_PREFIX").unwrap_or_default();
         if !valid_table_prefix(&table_prefix) {
             return Err(ConfigError::InvalidTablePrefix);
         }
 
         let storage =
-            PathBuf::from(env::var("STORAGE_PATH").unwrap_or_else(|_| "storage".to_owned()));
-        let textures_dir = env::var_os("TEXTURES_DIR")
+            PathBuf::from(legacy_env("STORAGE_PATH").unwrap_or_else(|| "storage".to_owned()));
+        let textures_dir = legacy_env("TEXTURES_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| storage.join("textures"));
         let passport_public_key = load_passport_public_key(&storage);
 
-        let plugins_dir = env::var_os("PLUGINS_DIR")
+        let plugins_dir = legacy_env("PLUGINS_DIR")
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| storage.join("plugins"));
@@ -108,25 +130,23 @@ impl Config {
         Ok(Self {
             bind,
             version: env!("CARGO_PKG_VERSION"),
-            locale: env::var("APP_LOCALE").unwrap_or_else(|_| "zh_CN".to_owned()),
-            fallback_locale: env::var("APP_FALLBACK_LOCALE").unwrap_or_else(|_| "en".to_owned()),
+            locale: legacy_env("APP_LOCALE").unwrap_or_else(|| "zh_CN".to_owned()),
+            fallback_locale: legacy_env("APP_FALLBACK_LOCALE").unwrap_or_else(|| "en".to_owned()),
             database: DatabaseConfig::from_env(table_prefix)?,
             textures_dir,
             plugins_dir,
-            wasm_plugin_registry_url: env::var("WASM_PLUGIN_REGISTRY_URL")
-                .ok()
+            wasm_plugin_registry_url: legacy_env("WASM_PLUGIN_REGISTRY_URL")
                 .filter(|value| !value.trim().is_empty()),
-            app_url: env::var("APP_URL").unwrap_or_else(|_| "http://localhost".to_owned()),
+            app_url: legacy_env("APP_URL").unwrap_or_else(|| "http://localhost".to_owned()),
             passport_public_key,
             passport_private_key: load_passport_key(
                 &storage,
                 "PASSPORT_PRIVATE_KEY",
                 "oauth-private.key",
             ),
-            password_method: env::var("PWD_METHOD").unwrap_or_else(|_| "BCRYPT".to_owned()),
-            password_salt: env::var("SALT").unwrap_or_default(),
-            app_key: env::var("APP_KEY")
-                .ok()
+            password_method: legacy_env("PWD_METHOD").unwrap_or_else(|| "BCRYPT".to_owned()),
+            password_salt: legacy_env("SALT").unwrap_or_default(),
+            app_key: legacy_env("APP_KEY")
                 .filter(|value| !value.is_empty())
                 .or_else(|| std::fs::read_to_string(storage.join("app.key")).ok())
                 .map(|value| value.trim().to_owned())
@@ -139,19 +159,15 @@ impl Config {
 impl MailConfig {
     fn from_env() -> Self {
         Self {
-            mailer: env::var("MAIL_MAILER").unwrap_or_else(|_| "smtp".to_owned()),
-            host: env::var("MAIL_HOST").unwrap_or_default(),
+            mailer: legacy_env("MAIL_MAILER").unwrap_or_else(|| "smtp".to_owned()),
+            host: legacy_env("MAIL_HOST").unwrap_or_default(),
             port: parse_port("MAIL_PORT", 465),
-            username: env::var("MAIL_USERNAME")
-                .ok()
-                .filter(|value| !value.is_empty()),
-            password: env::var("MAIL_PASSWORD")
-                .ok()
-                .filter(|value| !value.is_empty()),
-            encryption: env::var("MAIL_ENCRYPTION").unwrap_or_default(),
-            from_address: env::var("MAIL_FROM_ADDRESS")
-                .unwrap_or_else(|_| "hello@example.com".to_owned()),
-            from_name: env::var("MAIL_FROM_NAME").unwrap_or_else(|_| "Blessing Skin".to_owned()),
+            username: legacy_env("MAIL_USERNAME").filter(|value| !value.is_empty()),
+            password: legacy_env("MAIL_PASSWORD").filter(|value| !value.is_empty()),
+            encryption: legacy_env("MAIL_ENCRYPTION").unwrap_or_default(),
+            from_address: legacy_env("MAIL_FROM_ADDRESS")
+                .unwrap_or_else(|| "hello@example.com".to_owned()),
+            from_name: legacy_env("MAIL_FROM_NAME").unwrap_or_else(|| "Blessing Skin".to_owned()),
         }
     }
 }
@@ -263,7 +279,7 @@ impl DatabaseConfig {
                     .parse::<SqliteConnectOptions>()
                     .map_err(|_| ConfigError::InvalidDatabaseUrl)?
                     .create_if_missing(false);
-                if sqlite_foreign_keys.is_some_and(|value| value == "false" || value == "0") {
+                if sqlite_foreign_keys.is_some_and(is_legacy_false) {
                     options = options.foreign_keys(false);
                 }
                 let database = options.get_filename().to_string_lossy().into_owned();
@@ -318,79 +334,74 @@ impl DatabaseConfig {
     }
 
     fn from_env(table_prefix: String) -> Result<Self, ConfigError> {
-        let driver = env::var("DB_CONNECTION").unwrap_or_else(|_| "mysql".to_owned());
-        if let Some(url) = env::var("DATABASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let foreign_keys = env::var("DB_FOREIGN_KEYS").ok();
+        let driver = legacy_env("DB_CONNECTION").unwrap_or_else(|| "mysql".to_owned());
+        if let Some(url) = legacy_env("DATABASE_URL").filter(|value| !value.trim().is_empty()) {
+            let foreign_keys = legacy_env("DB_FOREIGN_KEYS");
             return Self::from_url(&driver, table_prefix, &url, foreign_keys.as_deref());
         }
-        let (connection, display_driver, host, port, username, database) = match driver
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "sqlite" => {
-                let database = sqlite_database_path(env::var("DB_DATABASE").ok());
-                let mut options = SqliteConnectOptions::new()
-                    .filename(&database)
-                    .create_if_missing(false);
-                if env::var("DB_FOREIGN_KEYS").is_ok_and(|value| value == "false" || value == "0") {
-                    options = options.foreign_keys(false);
+        let (connection, display_driver, host, port, username, database) =
+            match driver.to_ascii_lowercase().as_str() {
+                "sqlite" => {
+                    let database = sqlite_database_path(legacy_env("DB_DATABASE"));
+                    let mut options = SqliteConnectOptions::new()
+                        .filename(&database)
+                        .create_if_missing(false);
+                    if legacy_env("DB_FOREIGN_KEYS").is_some_and(|value| is_legacy_false(&value)) {
+                        options = options.foreign_keys(false);
+                    }
+                    (
+                        DatabaseConnection::Sqlite(options),
+                        "SQLite",
+                        None,
+                        None,
+                        None,
+                        database,
+                    )
                 }
-                (
-                    DatabaseConnection::Sqlite(options),
-                    "SQLite",
-                    None,
-                    None,
-                    None,
-                    database,
-                )
-            }
-            "mysql" | "mariadb" => {
-                let host = env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-                let port = parse_port("DB_PORT", 3306);
-                let username = env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned());
-                let database = env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned());
-                let options = mysql_connect_options(
-                    &host,
-                    port,
-                    &username,
-                    &env::var("DB_PASSWORD").unwrap_or_default(),
-                    &database,
-                    env::var("DB_SOCKET").ok().as_deref(),
-                );
-                (
-                    DatabaseConnection::MySql(options),
-                    "MySQL/MariaDB",
-                    Some(host),
-                    Some(port),
-                    Some(username),
-                    database,
-                )
-            }
-            "pgsql" | "postgres" | "postgresql" => {
-                let host = env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-                let port = parse_port("DB_PORT", 5432);
-                let username = env::var("DB_USERNAME").unwrap_or_else(|_| "forge".to_owned());
-                let database = env::var("DB_DATABASE").unwrap_or_else(|_| "forge".to_owned());
-                let options = PgConnectOptions::new()
-                    .host(&host)
-                    .port(port)
-                    .username(&username)
-                    .password(&env::var("DB_PASSWORD").unwrap_or_default())
-                    .database(&database);
-                (
-                    DatabaseConnection::Postgres(options),
-                    "PostgreSQL",
-                    Some(host),
-                    Some(port),
-                    Some(username),
-                    database,
-                )
-            }
-            _ => return Err(ConfigError::UnsupportedDatabase(driver)),
-        };
+                "mysql" | "mariadb" => {
+                    let host = legacy_env("DB_HOST").unwrap_or_else(|| "127.0.0.1".to_owned());
+                    let port = parse_port("DB_PORT", 3306);
+                    let username = legacy_env("DB_USERNAME").unwrap_or_else(|| "forge".to_owned());
+                    let database = legacy_env("DB_DATABASE").unwrap_or_else(|| "forge".to_owned());
+                    let options = mysql_connect_options(
+                        &host,
+                        port,
+                        &username,
+                        &legacy_env("DB_PASSWORD").unwrap_or_default(),
+                        &database,
+                        legacy_env("DB_SOCKET").as_deref(),
+                    );
+                    (
+                        DatabaseConnection::MySql(options),
+                        "MySQL/MariaDB",
+                        Some(host),
+                        Some(port),
+                        Some(username),
+                        database,
+                    )
+                }
+                "pgsql" | "postgres" | "postgresql" => {
+                    let host = legacy_env("DB_HOST").unwrap_or_else(|| "127.0.0.1".to_owned());
+                    let port = parse_port("DB_PORT", 5432);
+                    let username = legacy_env("DB_USERNAME").unwrap_or_else(|| "forge".to_owned());
+                    let database = legacy_env("DB_DATABASE").unwrap_or_else(|| "forge".to_owned());
+                    let options = PgConnectOptions::new()
+                        .host(&host)
+                        .port(port)
+                        .username(&username)
+                        .password(&legacy_env("DB_PASSWORD").unwrap_or_default())
+                        .database(&database);
+                    (
+                        DatabaseConnection::Postgres(options),
+                        "PostgreSQL",
+                        Some(host),
+                        Some(port),
+                        Some(username),
+                        database,
+                    )
+                }
+                _ => return Err(ConfigError::UnsupportedDatabase(driver)),
+            };
 
         Ok(Self {
             connection,
@@ -442,8 +453,7 @@ fn sqlite_database_path(database: Option<String>) -> String {
 }
 
 fn parse_port(name: &str, default: u16) -> u16 {
-    env::var(name)
-        .ok()
+    legacy_env(name)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
@@ -457,9 +467,41 @@ fn valid_table_prefix(prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, DatabaseConfig, DatabaseConnection, mysql_connect_options, valid_table_prefix,
+        ConfigError, DatabaseConfig, DatabaseConnection, is_legacy_false, mysql_connect_options,
+        parse_legacy_env_value, valid_table_prefix,
     };
     use std::path::Path;
+
+    #[test]
+    fn parses_laravel_reserved_environment_values() {
+        for value in ["null", "NULL", "(null)", "(NULL)"] {
+            assert_eq!(parse_legacy_env_value(value.to_owned()), None);
+        }
+        for value in ["empty", "EMPTY", "(empty)", "(EMPTY)"] {
+            assert_eq!(
+                parse_legacy_env_value(value.to_owned()),
+                Some(String::new())
+            );
+        }
+        assert_eq!(
+            parse_legacy_env_value("/srv/blessing/textures".to_owned()),
+            Some("/srv/blessing/textures".to_owned())
+        );
+        assert_eq!(
+            parse_legacy_env_value(" null ".to_owned()),
+            Some(" null ".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_laravel_false_values_for_database_options() {
+        assert!(is_legacy_false("false"));
+        assert!(is_legacy_false("FALSE"));
+        assert!(is_legacy_false("(false)"));
+        assert!(is_legacy_false("0"));
+        assert!(!is_legacy_false("true"));
+        assert!(!is_legacy_false("1"));
+    }
 
     #[test]
     fn defaults_sqlite_path_to_the_legacy_laravel_database_location() {
@@ -598,7 +640,7 @@ fn load_passport_key(
     environment_variable: &str,
     default_filename: &str,
 ) -> Option<Vec<u8>> {
-    if let Ok(configured) = env::var(environment_variable) {
+    if let Some(configured) = legacy_env(environment_variable) {
         if let Some(path) = configured.strip_prefix("file://") {
             return std::fs::read(path).ok();
         }

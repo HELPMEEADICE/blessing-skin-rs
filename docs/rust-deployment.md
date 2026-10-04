@@ -24,7 +24,7 @@ cargo build --locked --release
 
 ## 配置与旧安装
 
-程序启动时会从当前工作目录读取 `.env`。旧站的 `.env` 可作为起点；将 [rust.env.example](../rust.env.example) 中的 Rust 专用项合并进去。PHP 专用项（例如 `CACHE_DRIVER`、`SESSION_DRIVER`、`QUEUE_CONNECTION`、`REDIS_*`）不会被 Rust 服务使用。
+程序启动时会从当前工作目录读取 `.env`。旧站的 `.env` 可作为起点；将 [rust.env.example](../rust.env.example) 中的 Rust 专用项合并进去。PHP 专用项（例如 `CACHE_DRIVER`、`SESSION_DRIVER`、`QUEUE_CONNECTION`、`REDIS_*`）不会被 Rust 服务使用。 对旧 Laravel 保留值也保持兼容：`null` / `(null)` 按未配置处理，`empty` / `(empty)` 按空字符串处理；例如旧示例中的 `PLUGINS_DIR=null` 会采用 Rust 的默认插件目录。
 
 | 变量                                               | 用途与默认值                                                                                                                                   |
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |

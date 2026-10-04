@@ -870,7 +870,8 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn(infer_peer_client_ip));
     let app = if !cfg!(test)
-        && std::env::var("APP_ENV").unwrap_or_else(|_| "production".to_owned()) != "testing"
+        && crate::config::legacy_env("APP_ENV").unwrap_or_else(|| "production".to_owned())
+            != "testing"
     {
         legacy_api_throttle_layer(app, state.passport_key.clone())
     } else {
@@ -4502,14 +4503,14 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 
     let chinese = request_locale(&state).starts_with("zh");
-    let debug = std::env::var("APP_DEBUG").ok().is_some_and(|value| {
+    let debug = crate::config::legacy_env("APP_DEBUG").is_some_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     });
-    let commit = std::env::var("GIT_COMMIT")
-        .or_else(|_| std::env::var("SOURCE_VERSION"))
+    let commit = crate::config::legacy_env("GIT_COMMIT")
+        .or_else(|| crate::config::legacy_env("SOURCE_VERSION"))
         .unwrap_or_default();
     let commit = if commit.is_empty() {
         if chinese {
@@ -4536,7 +4537,8 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
                         "Environment"
                     }
                     .to_owned(),
-                    value: std::env::var("APP_ENV").unwrap_or_else(|_| "production".to_owned()),
+                    value: crate::config::legacy_env("APP_ENV")
+                        .unwrap_or_else(|| "production".to_owned()),
                 },
                 AdminStatusField {
                     label: if chinese {

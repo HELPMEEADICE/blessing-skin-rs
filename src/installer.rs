@@ -59,7 +59,9 @@ struct GeneratedKeys {
 }
 
 pub async fn run(config: &Config) -> Result<(), InstallError> {
-    let storage = PathBuf::from(env::var("STORAGE_PATH").unwrap_or_else(|_| "storage".to_owned()));
+    let storage = PathBuf::from(
+        crate::config::legacy_env("STORAGE_PATH").unwrap_or_else(|| "storage".to_owned()),
+    );
     if storage.join("install.lock").exists() {
         return Err(InstallError::AlreadyInstalled);
     }
