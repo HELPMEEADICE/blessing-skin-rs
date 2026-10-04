@@ -846,7 +846,8 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             detect_locale_preference,
-        ));
+        ))
+        .layer(axum::middleware::from_fn(infer_peer_client_ip));
     let app = if !cfg!(test)
         && std::env::var("APP_ENV").unwrap_or_else(|_| "production".to_owned()) != "testing"
     {
@@ -2689,6 +2690,24 @@ fn registration_client_ip(headers: &HeaderMap) -> String {
         }
     }
     "unknown".to_owned()
+}
+
+async fn infer_peer_client_ip(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if registration_client_ip(request.headers()) == "unknown"
+        && let Some(axum::extract::ConnectInfo(address)) =
+            request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        let peer_ip = address.ip().to_string();
+        if let Ok(value) = HeaderValue::from_str(&peer_ip) {
+            request.headers_mut().insert("x-real-ip", value);
+        }
+    }
+    next.run(request).await
 }
 
 async fn handle_register(
@@ -15386,6 +15405,54 @@ mod tests {
         public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview, router,
         safe_remote_component_url, valid_texture_hash,
     };
+
+    #[tokio::test]
+    async fn client_ip_prefers_valid_proxy_headers_then_uses_the_socket_peer() {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            extract::ConnectInfo,
+            http::{HeaderMap, Request},
+            routing::get,
+        };
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/ip",
+                get(|headers: HeaderMap| async move { super::registration_client_ip(&headers) }),
+            )
+            .layer(axum::middleware::from_fn(super::infer_peer_client_ip));
+        let peer: std::net::SocketAddr = "203.0.113.17:43120".parse().unwrap();
+
+        let direct = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ip")
+                    .extension(ConnectInfo(peer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct = to_bytes(direct.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(direct.as_ref(), b"203.0.113.17");
+
+        let proxied = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ip")
+                    .header("x-real-ip", "198.51.100.9")
+                    .extension(ConnectInfo(peer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let proxied = to_bytes(proxied.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(proxied.as_ref(), b"198.51.100.9");
+    }
 
     #[test]
     fn legacy_locale_aliases_and_accept_language_quality_are_resolved() {
