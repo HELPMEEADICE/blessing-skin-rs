@@ -1,5 +1,6 @@
 use std::{process::Stdio, time::Duration};
 
+use hmac::{Hmac, Mac};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
@@ -11,6 +12,7 @@ use lettre::{
 };
 use percent_encoding::percent_decode_str;
 use reqwest::{Client, multipart::Form, redirect::Policy};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::Command,
@@ -32,6 +34,12 @@ enum SmtpMode {
 enum SendmailMode {
     Smtp,
     Direct,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SesApiVersion {
+    Query,
+    V2,
 }
 
 fn smtp_mode(encryption: &str, port: u16) -> Result<SmtpMode, String> {
@@ -181,6 +189,8 @@ pub async fn send_email(
         "sendmail" => send_sendmail_email(config, recipient, subject, body).await,
         "mailgun" => send_mailgun_email(config, recipient, subject, body).await,
         "postmark" => send_postmark_email(config, recipient, subject, body).await,
+        "ses" => send_ses_email(config, recipient, subject, body, SesApiVersion::Query).await,
+        "ses-v2" => send_ses_email(config, recipient, subject, body, SesApiVersion::V2).await,
         "" => Err("Email delivery is not configured.".to_owned()),
         mailer => Err(format!("Unsupported mailer: {mailer}")),
     }
@@ -668,6 +678,199 @@ async fn send_postmark_email(
     check_mail_api_response("Postmark", response).await
 }
 
+fn ses_region_host(region: &str) -> Result<String, String> {
+    let region = region.trim();
+    if region.is_empty()
+        || !region.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        return Err("AWS_DEFAULT_REGION must be a lowercase AWS region name.".to_owned());
+    }
+    let dns_suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    Ok(format!("email.{region}.{dns_suffix}"))
+}
+
+fn ses_query_form(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String, String> {
+    let from = from_mailbox(config)?.to_string();
+    let fields = [
+        ("Action", "SendEmail".to_owned()),
+        ("Version", "2010-12-01".to_owned()),
+        ("Source", from),
+        ("Destination.ToAddresses.member.1", recipient.to_owned()),
+        ("Message.Subject.Data", subject.to_owned()),
+        ("Message.Subject.Charset", "UTF-8".to_owned()),
+        ("Message.Body.Text.Data", body.to_owned()),
+        ("Message.Body.Text.Charset", "UTF-8".to_owned()),
+    ];
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(fields);
+    Ok(serializer.finish())
+}
+
+fn ses_v2_payload(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "FromEmailAddress": from_mailbox(config)?.to_string(),
+        "Destination": {
+            "ToAddresses": [recipient],
+        },
+        "Content": {
+            "Simple": {
+                "Subject": {
+                    "Data": subject,
+                    "Charset": "UTF-8",
+                },
+                "Body": {
+                    "Text": {
+                        "Data": body,
+                        "Charset": "UTF-8",
+                    },
+                },
+            },
+        },
+    }))
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    hex::encode(Sha256::digest(value))
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
+    mac.update(value);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn aws_v4_authorization(
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    host: &str,
+    path: &str,
+    content_type: &str,
+    timestamp: &str,
+    payload: &[u8],
+) -> Result<String, String> {
+    let date = timestamp
+        .get(..8)
+        .filter(|date| date.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "Invalid AWS signing timestamp.".to_owned())?;
+    if [access_key, secret_key, host, path, content_type, timestamp]
+        .iter()
+        .any(|value| value.chars().any(char::is_control))
+        || session_token.is_some_and(|value| value.chars().any(char::is_control))
+    {
+        return Err(
+            "AWS SES credentials or signing values contain a control character.".to_owned(),
+        );
+    }
+
+    let scope = format!("{date}/{region}/ses/aws4_request");
+    let mut canonical_headers =
+        format!("content-type:{content_type}\nhost:{host}\nx-amz-date:{timestamp}");
+    let mut signed_headers = "content-type;host;x-amz-date".to_owned();
+    if let Some(token) = session_token {
+        canonical_headers.push_str(&format!("\nx-amz-security-token:{token}"));
+        signed_headers.push_str(";x-amz-security-token");
+    }
+    let canonical_request = format!(
+        "POST\n{path}\n\n{canonical_headers}\n{signed_headers}\n{}",
+        sha256_hex(payload)
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+
+    let initial_key = format!("AWS4{secret_key}");
+    let date_key = hmac_sha256(initial_key.as_bytes(), date.as_bytes());
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"ses");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    Ok(format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    ))
+}
+
+async fn send_ses_email(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    version: SesApiVersion,
+) -> Result<(), String> {
+    let access_key = config
+        .ses_access_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "AWS_ACCESS_KEY_ID is not configured.".to_owned())?;
+    let secret_key = config
+        .ses_secret_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "AWS_SECRET_ACCESS_KEY is not configured.".to_owned())?;
+    let host = ses_region_host(&config.ses_region)?;
+    let (path, content_type, payload) = match version {
+        SesApiVersion::Query => (
+            "/",
+            "application/x-www-form-urlencoded",
+            ses_query_form(config, recipient, subject, body)?.into_bytes(),
+        ),
+        SesApiVersion::V2 => (
+            "/v2/email/outbound-emails",
+            "application/json",
+            serde_json::to_vec(&ses_v2_payload(config, recipient, subject, body)?)
+                .map_err(|error| format!("Could not encode SES v2 request: {error}"))?,
+        ),
+    };
+    let url = Url::parse(&format!("https://{host}{path}"))
+        .map_err(|error| format!("Invalid Amazon SES endpoint: {error}"))?;
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let authorization = aws_v4_authorization(
+        access_key,
+        secret_key,
+        config.ses_session_token.as_deref(),
+        &config.ses_region,
+        &host,
+        path,
+        content_type,
+        &timestamp,
+        &payload,
+    )?;
+
+    let mut request = mail_api_client()?
+        .post(url)
+        .header("Host", &host)
+        .header("Content-Type", content_type)
+        .header("X-Amz-Date", timestamp)
+        .header("Authorization", authorization)
+        .body(payload);
+    if let Some(session_token) = &config.ses_session_token {
+        request = request.header("X-Amz-Security-Token", session_token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Amazon SES delivery failed: {error}"))?;
+    check_mail_api_response("Amazon SES", response).await
+}
+
 fn from_mailbox(config: &MailConfig) -> Result<Mailbox, String> {
     let address = config
         .from_address
@@ -759,9 +962,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SendmailMode, SmtpMode, build_message, mailgun_fields, mailgun_url, postmark_payload,
-        sendmail_mode, smtp_data, smtp_mode, smtp_sendmail_session, smtp_settings,
-        split_sendmail_command,
+        SendmailMode, SmtpMode, aws_v4_authorization, build_message, mailgun_fields, mailgun_url,
+        postmark_payload, sendmail_mode, ses_query_form, ses_region_host, ses_v2_payload,
+        smtp_data, smtp_mode, smtp_sendmail_session, smtp_settings, split_sendmail_command,
     };
     use crate::config::MailConfig;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -921,6 +1124,104 @@ mod tests {
 
         let data = server_task.await.unwrap();
         assert!(data.contains("..dot\r\n"));
+    }
+
+    #[test]
+    fn builds_ses_query_and_v2_message_payloads() {
+        let config = MailConfig {
+            from_address: "noreply@example.test".to_owned(),
+            from_name: "Blessing Skin".to_owned(),
+            ..MailConfig::default()
+        };
+        let query = ses_query_form(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            "Use this code: 123",
+        )
+        .unwrap();
+        let fields = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(fields["Action"], "SendEmail");
+        assert_eq!(fields["Version"], "2010-12-01");
+        assert_eq!(fields["Source"], "Blessing Skin <noreply@example.test>");
+        assert_eq!(
+            fields["Destination.ToAddresses.member.1"],
+            "skin-user@example.test"
+        );
+        assert_eq!(fields["Message.Subject.Data"], "Verify account");
+        assert_eq!(fields["Message.Body.Text.Data"], "Use this code: 123");
+
+        assert_eq!(
+            ses_v2_payload(
+                &config,
+                "skin-user@example.test",
+                "Verify account",
+                "Use this code: 123",
+            )
+            .unwrap(),
+            serde_json::json!({
+                "FromEmailAddress": "Blessing Skin <noreply@example.test>",
+                "Destination": { "ToAddresses": ["skin-user@example.test"] },
+                "Content": {
+                    "Simple": {
+                        "Subject": { "Data": "Verify account", "Charset": "UTF-8" },
+                        "Body": {
+                            "Text": { "Data": "Use this code: 123", "Charset": "UTF-8" }
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_ses_regional_endpoints_and_rejects_invalid_regions() {
+        assert_eq!(
+            ses_region_host("us-east-1").unwrap(),
+            "email.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            ses_region_host("cn-north-1").unwrap(),
+            "email.cn-north-1.amazonaws.com.cn"
+        );
+        assert!(ses_region_host("https://attacker.example").is_err());
+        assert!(ses_region_host("us-east-1/attacker").is_err());
+    }
+
+    #[test]
+    fn signs_ses_requests_with_optional_session_credentials() {
+        let authorization = aws_v4_authorization(
+            "AKIDEXAMPLE",
+            "secret-example",
+            Some("session-token"),
+            "us-east-1",
+            "email.us-east-1.amazonaws.com",
+            "/v2/email/outbound-emails",
+            "application/json",
+            "20261005T120000Z",
+            br#"{"test":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261005/us-east-1/ses/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=d1a759f341c6808321e7825567f9a925173d8955dd1d48808b7c140958fb1d16"
+        );
+        assert!(
+            aws_v4_authorization(
+                "AKIDEXAMPLE",
+                "secret-example",
+                Some("bad\r\ntoken"),
+                "us-east-1",
+                "email.us-east-1.amazonaws.com",
+                "/",
+                "application/x-www-form-urlencoded",
+                "20261005T120000Z",
+                b"Action=SendEmail",
+            )
+            .is_err()
+        );
     }
 
     #[test]

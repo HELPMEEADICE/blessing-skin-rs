@@ -68,6 +68,10 @@ pub struct MailConfig {
     pub mailgun_endpoint: String,
     pub postmark_token: Option<String>,
     pub postmark_message_stream: Option<String>,
+    pub ses_access_key: Option<String>,
+    pub ses_secret_key: Option<String>,
+    pub ses_session_token: Option<String>,
+    pub ses_region: String,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
@@ -187,6 +191,12 @@ impl MailConfig {
             postmark_token: value("POSTMARK_TOKEN").filter(|value| !value.trim().is_empty()),
             postmark_message_stream: value("POSTMARK_MESSAGE_STREAM_ID")
                 .filter(|value| !value.trim().is_empty()),
+            ses_access_key: value("AWS_ACCESS_KEY_ID").filter(|value| !value.trim().is_empty()),
+            ses_secret_key: value("AWS_SECRET_ACCESS_KEY").filter(|value| !value.trim().is_empty()),
+            ses_session_token: value("AWS_SESSION_TOKEN").filter(|value| !value.trim().is_empty()),
+            ses_region: value("AWS_DEFAULT_REGION")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "us-east-1".to_owned()),
             host: value("MAIL_HOST").unwrap_or_else(|| "smtp.mailgun.org".to_owned()),
             port: parse_port_value(value("MAIL_PORT"), 587),
             username: value("MAIL_USERNAME").filter(|value| !value.is_empty()),
@@ -605,6 +615,10 @@ mod tests {
         assert_eq!(mail.mailgun_endpoint, "api.mailgun.net");
         assert!(mail.postmark_token.is_none());
         assert!(mail.postmark_message_stream.is_none());
+        assert!(mail.ses_access_key.is_none());
+        assert!(mail.ses_secret_key.is_none());
+        assert!(mail.ses_session_token.is_none());
+        assert_eq!(mail.ses_region, "us-east-1");
         assert_eq!(mail.host, "smtp.mailgun.org");
         assert_eq!(mail.port, 587);
         assert_eq!(mail.encryption, "tls");
@@ -633,6 +647,21 @@ mod tests {
             mail.postmark_message_stream.as_deref(),
             Some("transactional")
         );
+    }
+
+    #[test]
+    fn mail_configuration_reads_legacy_ses_environment_values() {
+        let mail = MailConfig::from_values(|name| match name {
+            "AWS_ACCESS_KEY_ID" => Some("access-key".to_owned()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret-key".to_owned()),
+            "AWS_SESSION_TOKEN" => Some("session-token".to_owned()),
+            "AWS_DEFAULT_REGION" => Some("eu-west-1".to_owned()),
+            _ => None,
+        });
+        assert_eq!(mail.ses_access_key.as_deref(), Some("access-key"));
+        assert_eq!(mail.ses_secret_key.as_deref(), Some("secret-key"));
+        assert_eq!(mail.ses_session_token.as_deref(), Some("session-token"));
+        assert_eq!(mail.ses_region, "eu-west-1");
     }
 
     #[test]
