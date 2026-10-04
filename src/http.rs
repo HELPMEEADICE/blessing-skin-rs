@@ -8001,12 +8001,12 @@ async fn serve_public_asset(
     if !is_public && !is_legacy_storage_public {
         return None;
     }
-    let metadata = tokio::fs::metadata(&asset_path).await.ok()?;
+    let file = tokio::fs::File::open(&asset_path).await.ok()?;
+    let metadata = file.metadata().await.ok()?;
     if !metadata.is_file() {
         return None;
     }
-    let contents = tokio::fs::read(&asset_path).await.ok()?;
-    let etag = content_etag(&contents);
+    let etag = public_file_etag(&metadata);
     let modified = metadata.modified().ok();
     let not_modified = if request_headers.contains_key(IF_NONE_MATCH) {
         header_has_etag(request_headers, &etag)
@@ -8019,13 +8019,13 @@ async fn serve_public_asset(
         let body = if head_only {
             Body::empty()
         } else {
-            Body::from(contents)
+            Body::from_stream(tokio_util::io::ReaderStream::new(file))
         };
         Response::new(body)
     };
     response.headers_mut().insert(
         ETAG,
-        HeaderValue::from_str(&etag).expect("MD5 ETag is ASCII"),
+        HeaderValue::from_str(&etag).expect("public file ETag is ASCII"),
     );
     if let Some(modified) = modified {
         response.headers_mut().insert(
@@ -8049,6 +8049,15 @@ async fn serve_public_asset(
     Some(response)
 }
 
+fn public_file_etag(metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("\"{:x}-{:x}\"", metadata.len(), modified)
+}
 fn decode_uri_path(uri_path: &str) -> Option<String> {
     let path = uri_path.as_bytes();
     let mut decoded = Vec::with_capacity(path.len());
