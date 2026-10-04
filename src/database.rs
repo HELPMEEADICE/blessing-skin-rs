@@ -6250,36 +6250,38 @@ impl DatabasePool {
         }
         let texture_sql = match self {
             Self::Postgres(_) => {
-                format!("SELECT CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = $1")
+                format!(
+                    "SELECT CAST(uploader AS BIGINT), type FROM {prefix}textures WHERE tid = $1"
+                )
             }
             Self::MySql(_) => {
-                format!("SELECT CAST(uploader AS SIGNED) FROM {prefix}textures WHERE tid = ?")
+                format!("SELECT CAST(uploader AS SIGNED), type FROM {prefix}textures WHERE tid = ?")
             }
             Self::Sqlite(_) => {
-                format!("SELECT CAST(uploader AS BIGINT) FROM {prefix}textures WHERE tid = ?")
+                format!("SELECT CAST(uploader AS BIGINT), type FROM {prefix}textures WHERE tid = ?")
             }
         };
-        let uploader_id = match self {
+        let texture = match self {
             Self::Sqlite(pool) => {
-                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(texture_sql))
                     .bind(tid)
                     .fetch_optional(pool)
                     .await?
             }
             Self::MySql(pool) => {
-                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(texture_sql))
                     .bind(tid)
                     .fetch_optional(pool)
                     .await?
             }
             Self::Postgres(pool) => {
-                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(texture_sql))
+                sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(texture_sql))
                     .bind(tid)
                     .fetch_optional(pool)
                     .await?
             }
         };
-        let Some(uploader_id) = uploader_id else {
+        let Some((uploader_id, texture_type)) = texture else {
             return Ok(ClosetRemoveOutcome::NotInCloset);
         };
         let delete_sql = match self {
@@ -6399,6 +6401,44 @@ impl DatabasePool {
                         .execute(pool)
                         .await?;
                 }
+            }
+        }
+        let texture_column = if texture_type == "cape" {
+            "tid_cape"
+        } else {
+            "tid_skin"
+        };
+        let reset_players_sql = match self {
+            Self::Postgres(_) => format!(
+                "UPDATE {prefix}players SET {texture_column} = 0 \
+                 WHERE uid = $1 AND {texture_column} = $2"
+            ),
+            _ => format!(
+                "UPDATE {prefix}players SET {texture_column} = 0 \
+                 WHERE uid = ? AND {texture_column} = ?"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::MySql(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query(sqlx::AssertSqlSafe(reset_players_sql))
+                    .bind(user_id)
+                    .bind(tid)
+                    .execute(pool)
+                    .await?;
             }
         }
         Ok(ClosetRemoveOutcome::Removed)
@@ -9345,6 +9385,50 @@ mod language_line_tests {
                 .unwrap(),
             vec![("binary".to_owned(), vec![255, 0, 128])]
         );
+
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}textures (tid, name, type, hash, size, uploader, public, upload_at, likes) VALUES (20, 'Legacy cape', 'cape', '1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 96, 7, TRUE, '2026-09-30 12:00:00', 0)"
+            ),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!("UPDATE {prefix}players SET tid_cape = 20 WHERE pid = 3"),
+        )
+        .await
+        .unwrap();
+        execute_legacy_fixture_sql(
+            &database,
+            &format!(
+                "INSERT INTO {prefix}user_closet (user_uid, texture_tid, item_name) VALUES (7, 11, 'Legacy skin'), (7, 20, 'Legacy cape')"
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            database
+                .remove_closet_item(&prefix, 7, 11, false, 0, 0)
+                .await
+                .unwrap(),
+            super::ClosetRemoveOutcome::Removed
+        ));
+        assert!(matches!(
+            database
+                .remove_closet_item(&prefix, 7, 20, false, 0, 0)
+                .await
+                .unwrap(),
+            super::ClosetRemoveOutcome::Removed
+        ));
+        let remaining_players = database.players_for_user(&prefix, 7).await.unwrap();
+        let legacy_player = remaining_players
+            .iter()
+            .find(|player| player.pid == 3)
+            .expect("legacy player remains after closet cleanup");
+        assert_eq!(legacy_player.tid_skin, 0);
+        assert_eq!(legacy_player.tid_cape, 0);
 
         for suffix in [
             "wasm_plugin_state",
