@@ -6932,6 +6932,7 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
 async fn web_closet_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<ClosetListQuery>,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -6948,6 +6949,11 @@ async fn web_closet_list(
         .q
         .as_deref()
         .filter(|value| !value.is_empty() && *value != "0");
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .closet_items(
             &state.config.database.table_prefix,
@@ -6961,11 +6967,15 @@ async fn web_closet_list(
     {
         Ok((items, total)) => {
             let data = items.into_iter().map(closet_item_json).collect::<Vec<_>>();
-            let last_page = total.saturating_add(per_page - 1) / per_page;
-            let offset = page.saturating_sub(1).saturating_mul(per_page);
-            let from = (!data.is_empty()).then_some(offset + 1);
-            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
-            Json(serde_json::json!({"current_page":page,"data":data,"last_page":last_page.max(1),"per_page":per_page,"from":from,"to":to,"total":total})).into_response()
+            Json(legacy_paginator_json(
+                data,
+                total,
+                page,
+                per_page,
+                &path,
+                uri.query(),
+            ))
+            .into_response()
         }
         Err(error) => {
             tracing::error!(%error, user_id=user.uid, "failed to load web closet items");
@@ -6973,7 +6983,6 @@ async fn web_closet_list(
         }
     }
 }
-
 async fn web_closet_ids(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -12020,7 +12029,7 @@ async fn skinlib_list(
         uri.path()
     );
     if uploader_filter.is_some() && uploader.is_none() {
-        return Json(skinlib_list_paginator(
+        return Json(legacy_paginator_json(
             Vec::new(),
             0,
             page,
@@ -12049,7 +12058,7 @@ async fn skinlib_list(
                 .into_iter()
                 .map(skin_library_item_json)
                 .collect::<Vec<_>>();
-            Json(skinlib_list_paginator(
+            Json(legacy_paginator_json(
                 data,
                 total,
                 page,
@@ -12066,7 +12075,7 @@ async fn skinlib_list(
     }
 }
 
-fn skinlib_list_paginator(
+fn legacy_paginator_json(
     data: Vec<serde_json::Value>,
     total: i64,
     page: i64,
@@ -12076,7 +12085,7 @@ fn skinlib_list_paginator(
 ) -> serde_json::Value {
     let last_page = total.saturating_add(per_page - 1) / per_page;
     let last_page = last_page.max(1);
-    let page_url = |number: i64| skinlib_page_url(path, raw_query, number);
+    let page_url = |number: i64| legacy_paginator_page_url(path, raw_query, number);
     let previous = (page > 1).then(|| page_url(page - 1));
     let next = (page < last_page).then(|| page_url(page + 1));
     let offset = page.saturating_sub(1).saturating_mul(per_page);
@@ -12141,16 +12150,24 @@ fn skinlib_list_paginator(
     })
 }
 
-fn skinlib_page_url(path: &str, raw_query: Option<&str>, page: i64) -> String {
+fn legacy_paginator_page_url(path: &str, raw_query: Option<&str>, page: i64) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
+    let mut has_page = false;
     if let Some(raw_query) = raw_query {
         for (name, value) in form_urlencoded::parse(raw_query.as_bytes()) {
-            if name != "page" {
+            if name == "page" {
+                if !has_page {
+                    query.append_pair("page", &page.to_string());
+                    has_page = true;
+                }
+            } else {
                 query.append_pair(&name, &value);
             }
         }
     }
-    query.append_pair("page", &page.to_string());
+    if !has_page {
+        query.append_pair("page", &page.to_string());
+    }
     format!("{path}?{}", query.finish())
 }
 fn skin_library_item_json(item: crate::database::SkinLibraryRecord) -> serde_json::Value {
@@ -14438,6 +14455,7 @@ fn report_management_json(report: ReportManagementRecord) -> serde_json::Value {
 async fn api_closet(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<ClosetListQuery>,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -14457,6 +14475,11 @@ async fn api_closet(
         .q
         .as_deref()
         .filter(|value| !value.is_empty() && *value != "0");
+    let path = format!(
+        "{}{}",
+        request_app_url(&state).trim_end_matches('/'),
+        uri.path()
+    );
     match database
         .closet_items(
             &state.config.database.table_prefix,
@@ -14470,19 +14493,14 @@ async fn api_closet(
     {
         Ok((items, total)) => {
             let data = items.into_iter().map(closet_item_json).collect::<Vec<_>>();
-            let last_page = total.saturating_add(per_page - 1) / per_page;
-            let offset = page.saturating_sub(1).saturating_mul(per_page);
-            let from = (!data.is_empty()).then_some(offset + 1);
-            let to = (!data.is_empty()).then_some(offset + data.len() as i64);
-            Json(serde_json::json!({
-                "current_page": page,
-                "data": data,
-                "last_page": last_page.max(1),
-                "per_page": per_page,
-                "from": from,
-                "to": to,
-                "total": total
-            }))
+            Json(legacy_paginator_json(
+                data,
+                total,
+                page,
+                per_page,
+                &path,
+                uri.query(),
+            ))
             .into_response()
         }
         Err(error) => {
@@ -14491,7 +14509,6 @@ async fn api_closet(
         }
     }
 }
-
 fn closet_item_json(item: crate::database::ClosetTextureRecord) -> serde_json::Value {
     serde_json::json!({
         "tid": item.tid,
@@ -16069,7 +16086,7 @@ mod tests {
     }
     #[test]
     fn skinlib_paginator_preserves_query_and_builds_page_window() {
-        let paginator = super::skinlib_list_paginator(
+        let paginator = super::legacy_paginator_json(
             Vec::new(),
             2_000,
             50,
@@ -19727,6 +19744,20 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
 
+        assert_eq!(closet_list["per_page"], 6);
+        assert!(
+            closet_list["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/user/closet/list")
+        );
+        assert!(
+            closet_list["first_page_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/user/closet/list?category=skin&q=Closet&page=1&perPage=6")
+        );
+        assert!(closet_list["links"].as_array().is_some());
         let all_closet_ids =
             session_request(&app, &registered_cookie, "GET", "/user/closet/ids", None).await;
         let all_closet_ids: serde_json::Value = serde_json::from_slice(
