@@ -138,7 +138,10 @@
               {% if locale.starts_with("zh") %}WASM 插件管理{% else %}WASM
               plugin management{% endif %}
             </h1>
-            <a href="/admin"
+            {% if can_upload %}<a href="{{ base_url }}/admin/plugins/market"
+              >{% if locale.starts_with("zh") %}插件市场{% else %}Plugin
+              market{% endif %}</a
+            >{% endif %}<a href="/admin"
               >{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin
               dashboard{% endif %}</a
             >
@@ -154,7 +157,10 @@
           {% if locale.starts_with("zh") %}WASM 插件管理{% else %}WASM plugin
           management{% endif %}
         </h1>
-        <a href="/admin"
+        {% if can_upload %}<a href="{{ base_url }}/admin/plugins/market"
+          >{% if locale.starts_with("zh") %}插件市场{% else %}Plugin market{%
+          endif %}</a
+        >{% endif %}<a href="/admin"
           >{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin
           dashboard{% endif %}</a
         >

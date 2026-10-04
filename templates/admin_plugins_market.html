@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="{{ locale }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>
+      {% if locale.starts_with("zh") %}WASM 插件市场{% else %}WASM plugin
+      market{% endif %} - {{ site_name }}
+    </title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      main {
+        max-width: 1180px;
+        margin: 3rem auto;
+        padding: 2rem;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 8px 28px #0002;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      a {
+        color: #075fb8;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 1.25rem;
+      }
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 0.7rem;
+        border-bottom: 1px solid #d9dee5;
+        overflow-wrap: anywhere;
+      }
+      th {
+        background: #f4f6f9;
+      }
+      button {
+        padding: 0.5rem 0.75rem;
+        border: 0;
+        border-radius: 4px;
+        background: #007bff;
+        color: white;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+      .muted {
+        color: #59636e;
+      }
+      .status {
+        min-height: 1.5rem;
+        margin: 1rem 0;
+      }
+      @media (max-width: 700px) {
+        main {
+          margin: 1rem;
+          padding: 1rem;
+        }
+        th,
+        td {
+          padding: 0.45rem;
+        }
+      }
+    </style>
+    <meta name="csrf-token" content="" />
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body>
+    {% if frontend_script_available %}
+    <div class="wrapper">
+      <div
+        class="content-wrapper"
+        style="margin-left: 0; min-height: 0; background: transparent"
+      >
+        <section class="content-header">
+          <div class="container-fluid">
+            <h1>
+              {% if locale.starts_with("zh") %}WASM 插件市场{% else %}WASM
+              plugin market{% endif %}
+            </h1>
+            <a href="{{ base_url }}/admin/plugins/manage"
+              >{% if locale.starts_with("zh") %}插件管理{% else %}Plugin
+              management{% endif %}</a
+            >
+          </div>
+        </section>
+        <section class="content"><div class="container-fluid"></div></section>
+      </div>
+    </div>
+    {% else %}
+    <main id="plugin-market" data-base-url="{{ base_url }}">
+      <header>
+        <h1>
+          {% if locale.starts_with("zh") %}WASM 插件市场{% else %}WASM plugin
+          market{% endif %}
+        </h1>
+        <a href="{{ base_url }}/admin/plugins/manage"
+          >{% if locale.starts_with("zh") %}返回插件管理{% else %}Back to plugin
+          management{% endif %}</a
+        >
+      </header>
+      <p class="muted">
+        {% if locale.starts_with("zh") %}市场清单仅提供经过配置并校验的 WASM
+        组件。{% else %}The market only offers WASM components from the
+        configured, validated registry.{% endif %}
+      </p>
+      <p id="market-status" class="status" role="status" aria-live="polite">
+        {% if locale.starts_with("zh") %}正在加载…{% else %}Loading…{% endif %}
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>
+              {% if locale.starts_with("zh") %}插件{% else %}Plugin{% endif %}
+            </th>
+            <th>
+              {% if locale.starts_with("zh") %}说明{% else %}Description{% endif
+              %}
+            </th>
+            <th>
+              {% if locale.starts_with("zh") %}作者 / 版本{% else %}Author /
+              version{% endif %}
+            </th>
+            <th>
+              {% if locale.starts_with("zh") %}操作{% else %}Action{% endif %}
+            </th>
+          </tr>
+        </thead>
+        <tbody id="market-plugins"></tbody>
+      </table>
+    </main>
+    <script>
+      ;(() => {
+        const root = document.getElementById('plugin-market')
+        const base = root.dataset.baseUrl.replace(/\/$/, '')
+        const rows = document.getElementById('market-plugins')
+        const status = document.getElementById('market-status')
+        const zh = document.documentElement.lang.startsWith('zh')
+        const say = (en, cn) => (zh ? cn : en)
+        const cell = (value) => {
+          const node = document.createElement('td')
+          node.textContent = value == null ? '' : String(value)
+          return node
+        }
+        const request = async (url, options = {}) => {
+          const response = await fetch(base + url, {
+            credentials: 'same-origin',
+            ...options,
+          })
+          const body = await response.json().catch(() => ({}))
+          if (!response.ok || (body.code !== undefined && body.code !== 0))
+            throw new Error(
+              body.message || say('Request failed.', '请求失败。'),
+            )
+          return body
+        }
+        async function load() {
+          rows.replaceChildren()
+          status.textContent = say('Loading…', '正在加载…')
+          try {
+            const result = await request('/admin/plugins/market/list', {
+              headers: { Accept: 'application/json' },
+            })
+            if (!result.configured) {
+              status.textContent = say(
+                'The WASM plugin market is not configured.',
+                '尚未配置 WASM 插件市场。',
+              )
+              return
+            }
+            if (!result.plugins || result.plugins.length === 0) {
+              status.textContent = say(
+                'No plugins are available.',
+                '当前没有可用插件。',
+              )
+              return
+            }
+            for (const plugin of result.plugins) {
+              const row = document.createElement('tr')
+              row.append(
+                cell(plugin.title),
+                cell(plugin.description),
+                cell(
+                  [plugin.author, plugin.version].filter(Boolean).join(' · '),
+                ),
+              )
+              const action = cell('')
+              if (plugin.can_update || !plugin.installed) {
+                const button = document.createElement('button')
+                button.type = 'button'
+                button.textContent = plugin.can_update
+                  ? say('Update', '更新')
+                  : say('Install', '安装')
+                button.addEventListener('click', async () => {
+                  button.disabled = true
+                  status.textContent = say(
+                    'Installing validated component…',
+                    '正在安装已校验的组件…',
+                  )
+                  try {
+                    const installed = await request(
+                      '/admin/plugins/market/download',
+                      {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                          Accept: 'application/json',
+                        },
+                        body: JSON.stringify({ name: plugin.name }),
+                      },
+                    )
+                    status.textContent =
+                      installed.message ||
+                      say('Component installed.', '组件已安装。')
+                    await load()
+                  } catch (error) {
+                    status.textContent = error.message
+                    button.disabled = false
+                  }
+                })
+                action.append(button)
+              } else {
+                action.textContent = say('Installed', '已安装')
+              }
+              row.append(action)
+              rows.append(row)
+            }
+            status.textContent = ''
+          } catch (error) {
+            status.textContent = error.message
+          }
+        }
+        void load()
+      })()
+    </script>
+    {% endif %} {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
+</html>

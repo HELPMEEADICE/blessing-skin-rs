@@ -414,6 +414,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/update", get(web_admin_update))
         .route("/admin/update/download", post(web_admin_update_download))
         .route("/admin/plugins/data", get(web_admin_plugins_data))
+        .route("/admin/plugins/market", get(web_admin_plugins_market_page))
         .route(
             "/admin/plugins/market/list",
             get(web_admin_plugins_market_list),
@@ -3240,7 +3241,21 @@ struct AdminUpdatePage {
 struct AdminPluginsPage {
     site_name: String,
     locale: String,
+    base_url: String,
     can_upload: bool,
+    frontend_style_available: bool,
+    frontend_stylesheet: String,
+    frontend_script_available: bool,
+    frontend_script: String,
+    frontend_globals_b64: String,
+}
+
+#[derive(Template)]
+#[template(path = "admin_plugins_market.html")]
+struct AdminPluginMarketPage {
+    site_name: String,
+    locale: String,
+    base_url: String,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -4408,6 +4423,7 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
     let page = AdminPluginsPage {
         site_name,
         locale: request_locale(&state),
+        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
         can_upload,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
@@ -4419,6 +4435,49 @@ async fn web_admin_plugins_page(State(state): State<AppState>, headers: HeaderMa
         Ok(html) => Html(html).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to render administrator plugins page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn web_admin_plugins_market_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match authenticated_web_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if user.permission < 2 {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let site_name = site_name(&state).await;
+    let app_dir = state.public_dir.join("app");
+    let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &state.config.app_url).await;
+    let frontend_script = frontend_entrypoint(&app_dir, "app", "js", &state.config.app_url).await;
+    let locale = request_locale(&state);
+    let i18n = load_frontend_translations(&state, &app_dir, &locale).await;
+    let frontend_globals_b64 = encode_frontend_globals(
+        &state,
+        &site_name,
+        "admin/plugins/market",
+        serde_json::json!({ "wasm_plugins": true }),
+        i18n,
+    );
+    let page = AdminPluginMarketPage {
+        site_name,
+        locale,
+        base_url: state.config.app_url.trim_end_matches('/').to_owned(),
+        frontend_style_available: stylesheet.is_some(),
+        frontend_stylesheet: stylesheet.unwrap_or_default(),
+        frontend_script_available: frontend_script.is_some(),
+        frontend_script: frontend_script.unwrap_or_default(),
+        frontend_globals_b64,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render administrator WASM plugin market page");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -15214,10 +15273,46 @@ mod tests {
     }
 
     #[test]
+    fn admin_plugin_market_page_keeps_fallback_and_frontend_mount() {
+        let page = super::AdminPluginMarketPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "en".to_owned(),
+            base_url: "https://example.test/skin".to_owned(),
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("id=\"plugin-market\""));
+        assert!(html.contains("data-base-url=\"https://example.test/skin\""));
+        assert!(html.contains("/admin/plugins/market/list"));
+        assert!(html.contains("/admin/plugins/market/download"));
+        assert!(!html.contains("window.blessing=JSON.parse"));
+
+        let bundled_page = super::AdminPluginMarketPage {
+            site_name: "Blessing Skin".to_owned(),
+            locale: "zh_CN".to_owned(),
+            base_url: "https://example.test/skin".to_owned(),
+            frontend_style_available: true,
+            frontend_stylesheet: "https://example.test/skin/app/style.css".to_owned(),
+            frontend_script_available: true,
+            frontend_script: "https://example.test/skin/app/app.js".to_owned(),
+            frontend_globals_b64: "eyJyb3V0ZSI6ImFkbWluL3BsdWdpbnMvbWFya2V0In0=".to_owned(),
+        };
+        let html = bundled_page.render().unwrap();
+        assert!(html.contains("WASM 插件市场"));
+        assert!(html.contains(r#"class="content"><div class="container-fluid"></div>"#));
+        assert!(html.contains("https://example.test/skin/app/app.js"));
+        assert!(html.contains("window.blessing=JSON.parse"));
+    }
+    #[test]
     fn admin_plugins_page_keeps_inline_fallback_without_frontend_bundle() {
         let page = AdminPluginsPage {
             site_name: "Blessing Skin".to_owned(),
             locale: "en".to_owned(),
+            base_url: "https://example.test/skin".to_owned(),
             can_upload: true,
             frontend_style_available: false,
             frontend_stylesheet: String::new(),
@@ -15228,6 +15323,7 @@ mod tests {
         let html = page.render().unwrap();
 
         assert!(html.contains(r#"id="admin-plugins" data-can-upload="true""#));
+        assert!(html.contains("href=\"https://example.test/skin/admin/plugins/market\""));
         assert!(html.contains("fetch('/admin/plugins/data'"));
         assert!(html.contains("plugin-migrate"));
         assert!(html.contains("id=\"download-form\""));
@@ -17167,6 +17263,9 @@ mod tests {
         assert_eq!(plugins_globals["route"], "admin/plugins/manage");
         assert_eq!(plugins_globals["extra"]["wasm_plugins"], true);
         assert_eq!(plugins_globals["extra"]["can_upload"], false);
+        let denied_plugin_market =
+            session_request(&app, &admin_cookie, "GET", "/admin/plugins/market", None).await;
+        assert_eq!(denied_plugin_market.status(), StatusCode::FORBIDDEN);
         let plugin_data =
             session_request(&app, &admin_cookie, "GET", "/admin/plugins/data", None).await;
         assert_eq!(plugin_data.status(), StatusCode::OK);
@@ -17208,6 +17307,48 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let market_page =
+            session_request(&app, &admin_cookie, "GET", "/admin/plugins/market", None).await;
+        assert_eq!(market_page.status(), StatusCode::OK);
+        let market_html = String::from_utf8(
+            to_bytes(market_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(market_html.contains("WASM plugin market"));
+        assert!(market_html.contains(r#"class="content"><div class="container-fluid"></div>"#));
+        let encoded_market_globals = market_html
+            .split("atob('")
+            .nth(1)
+            .unwrap()
+            .split("')")
+            .next()
+            .unwrap();
+        let market_globals_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_market_globals)
+            .unwrap();
+        let market_globals: serde_json::Value =
+            serde_json::from_slice(&market_globals_bytes).unwrap();
+        assert_eq!(market_globals["route"], "admin/plugins/market");
+        assert_eq!(market_globals["extra"]["wasm_plugins"], true);
+        let market_list = session_request(
+            &app,
+            &admin_cookie,
+            "GET",
+            "/admin/plugins/market/list",
+            None,
+        )
+        .await;
+        assert_eq!(market_list.status(), StatusCode::OK);
+        let market_list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(market_list.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            market_list,
+            serde_json::json!({ "configured": false, "plugins": [] })
+        );
         let invalid_plugin_upload = app
             .clone()
             .oneshot(
