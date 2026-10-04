@@ -13399,10 +13399,7 @@ async fn review_report_action(
             .option(&state.config.database.table_prefix, "reporter_reward_score")
             .await
         {
-            Ok(value) => value
-                .as_deref()
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default(),
+            Ok(value) => legacy_option_integer(value.as_deref(), 0),
             Err(error) => {
                 tracing::error!(%error, "failed to read reporter reward score");
                 return unavailable();
@@ -13701,11 +13698,10 @@ async fn read_score_option(
     name: &str,
     default: i64,
 ) -> Result<i64, sqlx::Error> {
-    Ok(database
-        .option(prefix, name)
-        .await?
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(default))
+    Ok(legacy_option_integer(
+        database.option(prefix, name).await?.as_deref(),
+        default,
+    ))
 }
 
 async fn read_bool_option(
