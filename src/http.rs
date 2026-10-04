@@ -9972,6 +9972,12 @@ async fn api_delete_player(
     }
 }
 
+fn legacy_image_dimension(value: Option<&str>, default: u32) -> u32 {
+    u32::try_from(legacy_option_integer(value, i64::from(default)))
+        .ok()
+        .filter(|dimension| (1..=1024).contains(dimension))
+        .unwrap_or(default)
+}
 fn legacy_option_integer(value: Option<&str>, default: i64) -> i64 {
     let Some(value) = value else {
         return default;
@@ -14774,11 +14780,7 @@ async fn preview_for_texture(
     if !valid_texture_hash(&texture.hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let height = query
-        .get("height")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|height| (1..=1024).contains(height))
-        .unwrap_or(200);
+    let height = legacy_image_dimension(query.get("height").map(String::as_str), 200);
     let use_png = query.contains_key("png");
     let path = state.config.textures_dir.join(&texture.hash);
     let metadata = match tokio::fs::metadata(&path).await {
@@ -15032,11 +15034,7 @@ async fn render_avatar_response(
     http_cache: bool,
 ) -> Response {
     let three_d = query.contains_key("3d");
-    let size = query
-        .get("size")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|size| (1..=1024).contains(size))
-        .unwrap_or(100);
+    let size = legacy_image_dimension(query.get("size").map(String::as_str), 100);
     let use_png = query.contains_key("png");
     let format = if use_png {
         ImageFormat::Png
@@ -15959,6 +15957,17 @@ mod tests {
         assert_eq!(super::legacy_option_integer(Some("invalid"), 17), 0);
     }
 
+    #[test]
+    fn legacy_image_dimensions_preserve_php_integer_casts_with_safe_bounds() {
+        assert_eq!(super::legacy_image_dimension(None, 200), 200);
+        assert_eq!(super::legacy_image_dimension(Some("50px"), 100), 50);
+        assert_eq!(super::legacy_image_dimension(Some(" 50.9 pixels"), 100), 50);
+        assert_eq!(super::legacy_image_dimension(Some("1e2 items"), 100), 100);
+        assert_eq!(super::legacy_image_dimension(Some("invalid"), 100), 100);
+        assert_eq!(super::legacy_image_dimension(Some("0"), 100), 100);
+        assert_eq!(super::legacy_image_dimension(Some("-4"), 100), 100);
+        assert_eq!(super::legacy_image_dimension(Some("1025px"), 100), 100);
+    }
     #[test]
     fn texture_width_option_preserves_php_boolean_and_numeric_comparisons() {
         let (default_limit, default_label) = super::legacy_texture_width_limit(None);
