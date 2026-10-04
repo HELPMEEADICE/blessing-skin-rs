@@ -152,19 +152,40 @@ pub async fn send_email(
 ) -> Result<(), String> {
     match config.mailer.trim().to_ascii_lowercase().as_str() {
         "log" => {
-            tracing::info!(
-                to = recipient,
-                subject,
-                body,
-                "email captured by log mailer"
-            );
-            return Ok(());
+            log_email(recipient, subject, body);
+            Ok(())
         }
-        "array" => return Ok(()),
-        "smtp" => {}
-        "" => return Err("Email delivery is not configured.".to_owned()),
-        mailer => return Err(format!("Unsupported mailer: {mailer}")),
+        "array" => Ok(()),
+        "failover" => {
+            let mut smtp_config = config.clone();
+            smtp_config.mailer = "smtp".to_owned();
+            if let Err(error) = send_smtp_email(&smtp_config, recipient, subject, body).await {
+                tracing::warn!(%error, "SMTP delivery failed; falling back to the log mailer");
+                log_email(recipient, subject, body);
+            }
+            Ok(())
+        }
+        "smtp" => send_smtp_email(config, recipient, subject, body).await,
+        "" => Err("Email delivery is not configured.".to_owned()),
+        mailer => Err(format!("Unsupported mailer: {mailer}")),
     }
+}
+
+fn log_email(recipient: &str, subject: &str, body: &str) {
+    tracing::info!(
+        to = recipient,
+        subject,
+        body,
+        "email captured by log mailer"
+    );
+}
+
+async fn send_smtp_email(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
     let settings = smtp_settings(config)?;
     if settings.host.trim().is_empty() {
         return Err("MAIL_HOST is not configured.".to_owned());
@@ -306,6 +327,28 @@ mod tests {
             };
             assert!(smtp_settings(&config).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn failover_mailer_logs_when_smtp_is_misconfigured() {
+        let config = MailConfig {
+            mailer: "failover".to_owned(),
+            username: Some("smtp-user".to_owned()),
+            password: None,
+            ..MailConfig::default()
+        };
+
+        assert!(
+            super::send_email(
+                &config,
+                "skin-user@example.test",
+                "Test notification",
+                "Fallback body",
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(config.mailer, "failover");
     }
 
     #[test]
