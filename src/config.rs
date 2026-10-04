@@ -60,11 +60,13 @@ pub struct Config {
 #[derive(Clone, Debug)]
 pub struct MailConfig {
     pub mailer: String,
+    pub url: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
     pub encryption: String,
+    pub local_domain: Option<String>,
     pub from_address: String,
     pub from_name: String,
 }
@@ -166,11 +168,13 @@ impl MailConfig {
     fn from_values(mut value: impl FnMut(&str) -> Option<String>) -> Self {
         Self {
             mailer: value("MAIL_MAILER").unwrap_or_else(|| "smtp".to_owned()),
+            url: value("MAIL_URL").filter(|value| !value.trim().is_empty()),
             host: value("MAIL_HOST").unwrap_or_else(|| "smtp.mailgun.org".to_owned()),
             port: parse_port_value(value("MAIL_PORT"), 587),
             username: value("MAIL_USERNAME").filter(|value| !value.is_empty()),
             password: value("MAIL_PASSWORD").filter(|value| !value.is_empty()),
             encryption: value("MAIL_ENCRYPTION").unwrap_or_else(|| "tls".to_owned()),
+            local_domain: value("MAIL_EHLO_DOMAIN").filter(|value| !value.is_empty()),
             from_address: value("MAIL_FROM_ADDRESS")
                 .unwrap_or_else(|| "hello@example.com".to_owned()),
             from_name: value("MAIL_FROM_NAME").unwrap_or_else(|| "Example".to_owned()),
@@ -539,9 +543,11 @@ mod tests {
     fn mail_configuration_matches_laravel_defaults_when_unset() {
         let mail = MailConfig::from_values(|_| None);
         assert_eq!(mail.mailer, "smtp");
+        assert!(mail.url.is_none());
         assert_eq!(mail.host, "smtp.mailgun.org");
         assert_eq!(mail.port, 587);
         assert_eq!(mail.encryption, "tls");
+        assert!(mail.local_domain.is_none());
         assert_eq!(mail.from_address, "hello@example.com");
         assert_eq!(mail.from_name, "Example");
         assert!(mail.username.is_none());
@@ -552,13 +558,19 @@ mod tests {
     fn mail_configuration_keeps_explicit_legacy_smtp_values() {
         let mail = MailConfig::from_values(|name| match name {
             "MAIL_MAILER" => Some("smtp".to_owned()),
+            "MAIL_URL" => Some("smtp://url-user:url-pass@smtp-url.example.test:465".to_owned()),
             "MAIL_HOST" => Some("mail.example.test".to_owned()),
             "MAIL_PORT" => Some("2525".to_owned()),
             "MAIL_USERNAME" => Some("blessing".to_owned()),
             "MAIL_PASSWORD" => Some("secret".to_owned()),
             "MAIL_ENCRYPTION" => Some("ssl".to_owned()),
+            "MAIL_EHLO_DOMAIN" => Some("smtp.example.test".to_owned()),
             _ => None,
         });
+        assert_eq!(
+            mail.url.as_deref(),
+            Some("smtp://url-user:url-pass@smtp-url.example.test:465")
+        );
         assert_eq!(mail.host, "mail.example.test");
         assert_eq!(mail.port, 2525);
         assert_eq!(mail.encryption, "ssl");

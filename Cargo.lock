@@ -330,6 +330,7 @@ dependencies = [
  "lettre",
  "md-5 0.10.6",
  "pbkdf2",
+ "percent-encoding",
  "pulldown-cmark",
  "rand 0.8.8",
  "regex",
@@ -346,6 +347,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wasmtime",
 ]
 
