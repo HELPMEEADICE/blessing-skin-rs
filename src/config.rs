@@ -62,6 +62,7 @@ pub struct Config {
 pub struct MailConfig {
     pub mailer: String,
     pub url: Option<String>,
+    pub sendmail_path: String,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
@@ -171,6 +172,8 @@ impl MailConfig {
         Self {
             mailer: value("MAIL_MAILER").unwrap_or_else(|| "smtp".to_owned()),
             url: value("MAIL_URL").filter(|value| !value.trim().is_empty()),
+            sendmail_path: value("MAIL_SENDMAIL_PATH")
+                .unwrap_or_else(|| "/usr/sbin/sendmail -bs -i".to_owned()),
             host: value("MAIL_HOST").unwrap_or_else(|| "smtp.mailgun.org".to_owned()),
             port: parse_port_value(value("MAIL_PORT"), 587),
             username: value("MAIL_USERNAME").filter(|value| !value.is_empty()),
@@ -583,6 +586,7 @@ mod tests {
         let mail = MailConfig::from_values(|_| None);
         assert_eq!(mail.mailer, "smtp");
         assert!(mail.url.is_none());
+        assert_eq!(mail.sendmail_path, "/usr/sbin/sendmail -bs -i");
         assert_eq!(mail.host, "smtp.mailgun.org");
         assert_eq!(mail.port, 587);
         assert_eq!(mail.encryption, "tls");
