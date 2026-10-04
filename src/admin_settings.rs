@@ -250,7 +250,7 @@ const RESOURCE: &[Definition] = &[
     setting!("force_ssl", "checkbox", "false"),
     setting!("auto_detect_asset_url", "checkbox", "true"),
     setting!("cache_expire_time", "number", "31536000", 0, 31536000),
-    setting!("cdn_address", "url", ""),
+    setting!("cdn_address", "text", ""),
     setting!("enable_avatar_cache", "checkbox", "false"),
     setting!("enable_preview_cache", "checkbox", "false"),
 ];
@@ -630,7 +630,11 @@ fn normalize_value(definition: &Definition, value: &Value) -> Option<String> {
             if value.chars().count() > definition.max_length || value.contains('\0') {
                 return None;
             }
-            if definition.kind == "url" {
+            if definition.key == "cdn_address" {
+                if value.ends_with('/') {
+                    value.pop();
+                }
+            } else if definition.kind == "url" {
                 value = value.trim().to_owned();
                 while value.ends_with('/') {
                     value.pop();
@@ -825,8 +829,8 @@ fn chinese_choice(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION, SCORE,
-        normalize_value,
+        CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION,
+        RESOURCE, SCORE, normalize_value,
     };
     use serde_json::json;
 
@@ -905,6 +909,21 @@ mod tests {
         assert_eq!(
             normalize_value(sidebar, &json!("dark-maroon")),
             Some("dark-maroon".to_owned())
+        );
+    }
+    #[test]
+    fn cdn_address_only_trims_one_legacy_trailing_slash() {
+        let cdn = RESOURCE
+            .iter()
+            .find(|setting| setting.key == "cdn_address")
+            .unwrap();
+        assert_eq!(
+            normalize_value(cdn, &json!("https://cdn.example/assets/index.php/")),
+            Some("https://cdn.example/assets/index.php".to_owned())
+        );
+        assert_eq!(
+            normalize_value(cdn, &json!("https://cdn.example/assets//")),
+            Some("https://cdn.example/assets/".to_owned())
         );
     }
 }
