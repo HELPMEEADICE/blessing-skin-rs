@@ -14084,6 +14084,19 @@ struct SkinProfile {
     cape: Option<String>,
 }
 
+fn player_banned_message(locale: &str) -> &'static str {
+    match locale {
+        "de_DE" => "Das Konto dieses Spielers wurde gebannt.",
+        "es_ES" => "El dueño de este jugador ha sido baneado.",
+        "fr_FR" => "Le propriétaire de ce joueur a été banni.",
+        "ko_KR" => "본 사용자가 정지되었습니다.",
+        "ru_RU" => "Владелец этого игрока был заблокирован.",
+        "zh_CN" => "该角色拥有者已被本站封禁",
+        "zh_TW" => "該角色的所有者已被封禁。",
+        _ => "The owner of this player has been banned.",
+    }
+}
+
 async fn player_json(
     State(state): State<AppState>,
     RoutePath(profile_path): RoutePath<String>,
@@ -14108,12 +14121,8 @@ async fn player_json(
     };
 
     if profile.permission == -1 {
-        let message = if request_locale(&state).starts_with("zh") {
-            "该角色拥有者已被本站封禁"
-        } else {
-            "The owner of this player has been banned."
-        };
-        return (StatusCode::FORBIDDEN, message).into_response();
+        let locale = request_locale(&state);
+        return (StatusCode::FORBIDDEN, player_banned_message(&locale)).into_response();
     }
 
     let last_modified = profile
@@ -15147,6 +15156,26 @@ mod tests {
         assert!(public_download_ip("1.1.1.1".parse().unwrap()));
         assert!(public_download_ip("2606:4700:4700::1111".parse().unwrap()));
     }
+    #[test]
+    fn banned_player_message_uses_legacy_translations() {
+        let translations = [
+            ("de_DE", "Das Konto dieses Spielers wurde gebannt."),
+            ("es_ES", "El dueño de este jugador ha sido baneado."),
+            ("fr_FR", "Le propriétaire de ce joueur a été banni."),
+            ("ko_KR", "본 사용자가 정지되었습니다."),
+            ("ru_RU", "Владелец этого игрока был заблокирован."),
+            ("zh_CN", "该角色拥有者已被本站封禁"),
+            ("zh_TW", "該角色的所有者已被封禁。"),
+        ];
+        for (locale, expected) in translations {
+            assert_eq!(super::player_banned_message(locale), expected, "{locale}");
+        }
+        assert_eq!(
+            super::player_banned_message("unsupported"),
+            "The owner of this player has been banned."
+        );
+    }
+
     #[test]
     fn api_root_copyright_matches_php_array_key_lookup() {
         assert_eq!(
