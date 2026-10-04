@@ -98,7 +98,7 @@ def validate_fixture(document: Any) -> list[dict[str, Any]]:
             or name in names
         ):
             raise ValueError(f"{where}.name must be a unique printable non-empty string")
-        if not is_safe_path(path):
+        if not isinstance(path, str) or not is_safe_path(ENV_TOKEN.sub("1", path)):
             raise ValueError(f"{where}.path is not on the read-only GET allowlist")
         names.add(name)
         headers = item.get("headers", {})
@@ -112,7 +112,7 @@ def validate_fixture(document: Any) -> list[dict[str, Any]]:
         for value in headers.values():
             expanded = substitute_environment(value)
             if any(
-                (ord(character) < 32 and character != "\t") or ord(character) == 127
+                ord(character) < 32 or ord(character) == 127
                 for character in expanded
             ):
                 raise ValueError(f"{where}.headers values must not contain control characters")
@@ -148,6 +148,19 @@ def substitute_environment(value: str) -> str:
         return os.environ[variable]
 
     return ENV_TOKEN.sub(replace, value)
+
+
+def resolve_probe_path(value: str) -> str:
+    """Expand fixture path variables, then enforce the GET allowlist again."""
+    path = substitute_environment(value)
+    if any(
+        (ord(character) < 32 and character != "\t") or ord(character) == 127
+        for character in path
+    ):
+        raise ValueError("path variables must not contain control characters")
+    if not is_safe_path(path):
+        raise ValueError("resolved path is not on the read-only GET allowlist")
+    return path
 
 
 def build_url(base: str, path: str) -> str:
@@ -287,6 +300,7 @@ def run(php_url: str, rust_url: str, fixtures: Path, timeout: float) -> int:
     try:
         probes = validate_fixture(json.loads(fixtures.read_text(encoding="utf-8")))
         for probe in probes:
+            probe["path"] = resolve_probe_path(probe["path"])
             for value in probe["headers"].values():
                 substitute_environment(value)
         build_url(php_url, "/")

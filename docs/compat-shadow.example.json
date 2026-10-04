@@ -18,9 +18,23 @@
     },
     {
       "name": "Yggdrasil player profile (replace with a fixture player)",
-      "path": "/ExamplePlayer.json",
+      "path": "/${BS_SHADOW_PLAYER}.json",
       "headers": {
         "Accept": "application/json"
+      }
+    },
+    {
+      "name": "Texture by hash",
+      "path": "/textures/${BS_SHADOW_TEXTURE_HASH}",
+      "headers": {
+        "Accept": "image/png"
+      }
+    },
+    {
+      "name": "Raw texture by legacy ID",
+      "path": "/raw/${BS_SHADOW_TEXTURE_ID}",
+      "headers": {
+        "Accept": "image/png"
       }
     }
   ]

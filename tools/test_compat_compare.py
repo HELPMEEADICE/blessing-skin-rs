@@ -51,11 +51,50 @@ class CompatCompareTests(unittest.TestCase):
 
     def test_checked_in_example_fixture_is_valid(self):
         fixture_path = MODULE_PATH.parents[1] / "docs" / "compat-shadow.example.json"
-        with patch.dict(compat.os.environ, {"BS_SHADOW_OAUTH_TOKEN": "read-only-test-token"}):
+        with patch.dict(
+            compat.os.environ,
+            {
+                "BS_SHADOW_OAUTH_TOKEN": "read-only-test-token",
+                "BS_SHADOW_PLAYER": "ExamplePlayer",
+                "BS_SHADOW_TEXTURE_HASH": "a" * 64,
+                "BS_SHADOW_TEXTURE_ID": "42",
+            },
+        ):
             fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
             probes = compat.validate_fixture(fixture)
-        self.assertEqual(len(probes), 3)
+            for probe in probes:
+                probe["path"] = compat.resolve_probe_path(probe["path"])
+        self.assertEqual(len(probes), 5)
         self.assertTrue(all(compat.is_safe_path(probe["path"]) for probe in probes))
+
+    def test_path_variables_expand_only_to_allowlisted_read_routes(self):
+        with patch.dict(
+            compat.os.environ,
+            {
+                "BS_SHADOW_TEXTURE_HASH": "a" * 64,
+                "BS_SHADOW_TEXTURE_ID": "42",
+            },
+        ):
+            self.assertEqual(
+                compat.resolve_probe_path("/textures/${BS_SHADOW_TEXTURE_HASH}"),
+                "/textures/" + "a" * 64,
+            )
+            self.assertEqual(
+                compat.resolve_probe_path("/raw/${BS_SHADOW_TEXTURE_ID}"),
+                "/raw/42",
+            )
+
+    def test_path_variables_cannot_escape_the_read_only_allowlist(self):
+        with patch.dict(
+            compat.os.environ,
+            {"BS_SHADOW_TEXTURE_ID": "42/../api/user"},
+        ):
+            with self.assertRaisesRegex(ValueError, "read-only GET allowlist"):
+                compat.resolve_probe_path("/raw/${BS_SHADOW_TEXTURE_ID}")
+
+        with patch.dict(compat.os.environ, {"BS_SHADOW_TEXTURE_ID": "42\r\n"}):
+            with self.assertRaisesRegex(ValueError, "control characters"):
+                compat.resolve_probe_path("/raw/${BS_SHADOW_TEXTURE_ID}")
 
     def test_fixture_rejects_non_get_methods(self):
         with self.assertRaisesRegex(ValueError, "must be GET"):
