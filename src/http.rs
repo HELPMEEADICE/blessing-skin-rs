@@ -9391,7 +9391,7 @@ fn valid_player_name(
 }
 
 fn custom_player_name_matches(name: &str, pattern: &str) -> bool {
-    if pattern.is_empty() {
+    if !legacy_option_bool(Some(pattern)) {
         return true;
     }
     let Some((pattern, flags)) = split_php_delimited_regex(pattern) else {
@@ -20984,6 +20984,8 @@ mod tests {
         ));
         assert!(valid_player_name("a/b", "custom", "#^[a-z/]+$#i", 3, 16));
         assert!(!valid_player_name("abc", "custom", "^[a-z]+$", 3, 16));
+        assert!(valid_player_name("anything", "custom", "0", 3, 16));
+        assert!(valid_player_name("anything", "custom", "(false)", 3, 16));
         assert!(valid_player_name("abc\n", "custom", "/^[a-z]+$/", 3, 16));
         assert!(!valid_player_name("abc\n", "custom", "/^[a-z]+$/D", 3, 16));
         assert!(!valid_player_name("é", "custom", "/^\\w+$/", 1, 16));
