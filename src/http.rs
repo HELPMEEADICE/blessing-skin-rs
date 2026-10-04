@@ -2299,25 +2299,10 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
             None,
         );
     }
-    let Some(path) = signed_relative_url(&state, &format!("/auth/verify/{uid}"), None) else {
+    let locale = request_locale(&state);
+    let Some((subject, body)) = verification_mail_content(&state, uid, &locale).await else {
         release_mail_limit(&state, &key);
         return unavailable();
-    };
-    let url = format!("{}{}", request_app_url(&state).trim_end_matches('/'), path);
-    let site_name = site_name(&state).await;
-    let body = if request_locale(&state).starts_with("zh") {
-        format!(
-            "有人注册了 {site_name} 账户。如果这是你的账户，请访问以下链接验证邮箱：\n{url}\n\n如果你没有注册，请忽略此邮件。"
-        )
-    } else {
-        format!(
-            "Someone registered an account with this email address on {site_name}. Verify your email by visiting:\n{url}\n\nIf you did not register, you can ignore this email."
-        )
-    };
-    let subject = if request_locale(&state).starts_with("zh") {
-        format!("验证你的 {site_name} 账户")
-    } else {
-        format!("Verify your account on {site_name}")
     };
     match crate::mailer::send_email(&state.config.mail, &user.email, &subject, &body).await {
         Ok(()) => login_result(
@@ -2410,6 +2395,62 @@ fn signed_relative_url(state: &AppState, path: &str, expires: Option<u64>) -> Op
         format!("{path}?{query}&signature={signature}")
     };
     Some(signed)
+}
+
+async fn verification_mail_content(
+    state: &AppState,
+    uid: i64,
+    locale: &str,
+) -> Option<(String, String)> {
+    let path = signed_relative_url(state, &format!("/auth/verify/{uid}"), None)?;
+    let url = format!("{}{}", request_app_url(state).trim_end_matches('/'), path);
+    let site_name = site_name(state).await;
+    let (subject, body) = if locale.starts_with("zh") {
+        (
+            format!("验证你的 {site_name} 账户"),
+            format!(
+                "有人注册了 {site_name} 账户。如果这是你的账户，请访问以下链接验证邮箱：\n{url}\n\n如果你没有注册，请忽略此邮件。"
+            ),
+        )
+    } else {
+        (
+            format!("Verify your account on {site_name}"),
+            format!(
+                "Someone registered an account with this email address on {site_name}. Verify your email by visiting:\n{url}\n\nIf you did not register, you can ignore this email."
+            ),
+        )
+    };
+    Some((subject, body))
+}
+
+async fn send_registration_verification_email(
+    state: &AppState,
+    uid: i64,
+    email: &str,
+    locale: &str,
+) {
+    let Some(database) = &state.database else {
+        return;
+    };
+    match verification_is_required(database, &state.config.database.table_prefix).await {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(error) => {
+            tracing::warn!(%error, user_id = uid, "could not read email-verification setting after registration");
+            return;
+        }
+    }
+    let Some((subject, body)) = verification_mail_content(state, uid, locale).await else {
+        tracing::warn!(
+            user_id = uid,
+            "could not create signed email-verification link after registration"
+        );
+        return;
+    };
+    if let Err(error) = crate::mailer::send_email(&state.config.mail, email, &subject, &body).await
+    {
+        tracing::warn!(%error, user_id = uid, "failed to send registration email-verification message");
+    }
 }
 
 fn valid_relative_signature(
@@ -2953,6 +2994,7 @@ async fn handle_register(
                     tracing::warn!(%error, user_id = uid, "failed to save registration locale");
                 }
             }
+            send_registration_verification_email(&state, uid, email, &locale).await;
             let now_epoch = jsonwebtoken::get_current_timestamp();
             let claims = crate::auth::WebSessionClaims {
                 jti: Some(Alphanumeric.sample_string(&mut rand::thread_rng(), 32)),
@@ -20472,10 +20514,16 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE options SET option_value = 'false' WHERE option_name IN ('require_verification','return_score')")
+        sqlx::query("UPDATE options SET option_value = 'false' WHERE option_name = 'return_score'")
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE options SET option_value = 'true' WHERE option_name = 'require_verification'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let (second_captcha_cookie, second_captcha_answer) =
             issue_test_captcha(&app, &captcha_challenges).await;
@@ -20495,6 +20543,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second_registration["code"], 0);
+        let second_user_verified: bool =
+            sqlx::query_scalar("SELECT verified FROM users WHERE email = 'second@example.test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!second_user_verified);
+        sqlx::query(
+            "UPDATE options SET option_value = 'false' WHERE option_name = 'require_verification'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let (third_captcha_cookie, third_captcha_answer) =
             issue_test_captcha(&app, &captcha_challenges).await;
         let limited_registration = submit_test_registration(
