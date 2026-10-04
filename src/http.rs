@@ -14753,7 +14753,7 @@ async fn preview_by_hash(
             return unavailable();
         }
     };
-    preview_for_texture(&state, tid, &query, &request_headers, true).await
+    preview_for_texture(&state, tid, &query, &request_headers, false).await
 }
 
 async fn preview_for_texture(
@@ -21196,19 +21196,25 @@ mod tests {
                 .unwrap(),
             "image/png"
         );
-        let cape_preview_etag = cape_preview
-            .headers()
-            .get(axum::http::header::ETAG)
-            .unwrap()
-            .clone();
         assert!(
             cape_preview
+                .headers()
+                .get(axum::http::header::ETAG)
+                .is_none()
+        );
+        assert!(
+            !cape_preview
                 .headers()
                 .get(axum::http::header::CACHE_CONTROL)
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .starts_with("public, max-age=")
+                .starts_with("public")
+        );
+        assert!(
+            cape_preview
+                .headers()
+                .contains_key(axum::http::header::LAST_MODIFIED)
         );
         let cape_preview_bytes = to_bytes(cape_preview.into_body(), usize::MAX)
             .await
@@ -21219,18 +21225,18 @@ mod tests {
             (decoded_cape_preview.width(), decoded_cape_preview.height()),
             (100, 160)
         );
-        let cached_cape_preview = app
+        let repeated_cape_preview = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(&cape_preview_uri)
-                    .header(axum::http::header::IF_NONE_MATCH, cape_preview_etag)
+                    .header(axum::http::header::IF_NONE_MATCH, "*")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(cached_cape_preview.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(repeated_cape_preview.status(), StatusCode::OK);
         let avatar_by_hash = app
             .clone()
             .oneshot(
