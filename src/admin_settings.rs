@@ -635,15 +635,11 @@ fn normalize_value(definition: &Definition, value: &Value) -> Option<String> {
                     value.pop();
                 }
             } else if definition.kind == "url" {
-                value = value.trim().to_owned();
-                while value.ends_with('/') {
+                if value.ends_with('/') {
                     value.pop();
                 }
                 if value.ends_with("/index.php") {
                     value.truncate(value.len() - "/index.php".len());
-                }
-                while value.ends_with('/') {
-                    value.pop();
                 }
             }
             Some(value)
@@ -924,6 +920,21 @@ mod tests {
         assert_eq!(
             normalize_value(cdn, &json!("https://cdn.example/assets//")),
             Some("https://cdn.example/assets/".to_owned())
+        );
+    }
+    #[test]
+    fn site_url_normalization_matches_single_pass_legacy_formatting() {
+        let site_url = GENERAL
+            .iter()
+            .find(|setting| setting.key == "site_url")
+            .unwrap();
+        assert_eq!(
+            normalize_value(site_url, &json!("https://skin.example///")),
+            Some("https://skin.example//".to_owned())
+        );
+        assert_eq!(
+            normalize_value(site_url, &json!(" https://skin.example/ ")),
+            Some(" https://skin.example/ ".to_owned())
         );
     }
 }
