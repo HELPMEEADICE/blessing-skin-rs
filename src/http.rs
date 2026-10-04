@@ -7975,6 +7975,14 @@ async fn serve_public_asset(
         return None;
     }
     let relative = std::path::PathBuf::from(relative_path);
+    if relative.components().next().is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("storage")
+    }) {
+        return None;
+    }
     if relative.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return true;
@@ -7999,19 +8007,7 @@ async fn serve_public_asset(
     let asset_path = tokio::fs::canonicalize(state.public_dir.join(&relative))
         .await
         .ok()?;
-    let public_storage_path = relative
-        .components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == "storage");
-    let is_public = asset_path.starts_with(&public_root);
-    let is_legacy_storage_public = if public_storage_path {
-        tokio::fs::canonicalize(state.storage_dir.join("app/public"))
-            .await
-            .is_ok_and(|storage_public_root| asset_path.starts_with(&storage_public_root))
-    } else {
-        false
-    };
-    if !is_public && !is_legacy_storage_public {
+    if !asset_path.starts_with(&public_root) {
         return None;
     }
     let file = tokio::fs::File::open(&asset_path).await.ok()?;
@@ -17331,9 +17327,11 @@ mod tests {
         ));
         std::fs::create_dir_all(public_dir.join("app/i18n")).unwrap();
         std::fs::create_dir_all(public_dir.join("uploads")).unwrap();
+        std::fs::create_dir_all(public_dir.join("storage")).unwrap();
         std::fs::write(public_dir.join("uploads/banner.svg"), b"<svg>banner</svg>").unwrap();
         std::fs::write(public_dir.join("index.php"), b"<?php").unwrap();
         std::fs::write(public_dir.join(".env"), b"SECRET=private").unwrap();
+        std::fs::write(public_dir.join("storage/private.png"), b"private").unwrap();
         std::fs::write(
             public_dir.join("app/app.012abcd.js"),
             "window.fixture = true;",
@@ -17438,7 +17436,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached_public_upload.status(), StatusCode::NOT_MODIFIED);
-        for uri in ["/index.php", "/.env", "/uploads/%2e%2e/index.php"] {
+        for uri in [
+            "/index.php",
+            "/.env",
+            "/storage/private.png",
+            "/uploads/%2e%2e/index.php",
+        ] {
             let protected_public_path = app
                 .clone()
                 .oneshot(Request::get(uri).body(Body::empty()).unwrap())
