@@ -49,6 +49,7 @@ pub(crate) async fn run(
             .unwrap_or(normalized_target),
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    invalidate_legacy_option_cache(storage_dir)?;
     let background_migrated = if parsed_version < Version::new(5, 0, 0)
         && database
             .option(table_prefix, "home_pic_url")
@@ -74,6 +75,14 @@ pub(crate) async fn run(
         previous_version,
         background_migrated,
     })
+}
+
+fn invalidate_legacy_option_cache(storage_dir: &Path) -> io::Result<()> {
+    match std::fs::remove_file(storage_dir.join("options.php")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -138,9 +147,20 @@ mod tests {
         ])
         .await;
         let storage = test_storage("legacy");
+        std::fs::write(
+            storage.join("options.php"),
+            "<?php return ['version' => '4.9.9'];",
+        )
+        .unwrap();
+        std::fs::write(storage.join("preserve.txt"), "keep").unwrap();
         let result = run(&database, "", &storage, "6.0.2").await.unwrap();
 
         assert_eq!(result.previous_version, "4.9.9");
+        assert!(!storage.join("options.php").exists());
+        assert_eq!(
+            std::fs::read_to_string(storage.join("preserve.txt")).unwrap(),
+            "keep"
+        );
         assert!(result.background_migrated);
         assert_eq!(
             database.option("", "version").await.unwrap().as_deref(),
@@ -202,10 +222,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_to_update_when_the_legacy_cache_cannot_be_removed() {
+        let database =
+            test_database(&[("version", "4.9.9"), ("home_pic_url", "./app/bg.jpg")]).await;
+        let storage = test_storage("blocked-cache");
+        std::fs::create_dir(storage.join("options.php")).unwrap();
+
+        assert!(run(&database, "", &storage, "6.0.2").await.is_err());
+        assert_eq!(
+            database.option("", "version").await.unwrap().as_deref(),
+            Some("4.9.9")
+        );
+        assert_eq!(
+            database
+                .option("", "home_pic_url")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("./app/bg.jpg")
+        );
+        assert!(!storage.join("install.lock").exists());
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn refuses_an_invalid_target_version_before_writing_anything() {
         let database = test_database(&[("version", "6.0.2")]).await;
         let storage = test_storage("invalid-target");
+        std::fs::write(storage.join("options.php"), "keep until a valid update").unwrap();
         assert!(run(&database, "", &storage, "next").await.is_err());
+        assert!(storage.join("options.php").is_file());
         assert_eq!(
             database.option("", "version").await.unwrap().as_deref(),
             Some("6.0.2")
