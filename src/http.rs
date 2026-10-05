@@ -6986,15 +6986,22 @@ async fn player_name_settings(
 async fn web_add_player(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+    let request = match parse_player_name_request(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &request_locale(&state)),
+        Err(()) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
         return validation_error("name", &request_locale(&state));
@@ -7066,6 +7073,7 @@ async fn web_rename_player(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -7075,9 +7083,15 @@ async fn web_rename_player(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+    let request = match parse_player_name_request(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &request_locale(&state)),
+        Err(()) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
         return validation_error("name", &request_locale(&state));
@@ -10062,10 +10076,44 @@ struct RenamePlayerRequest {
     name: Option<String>,
 }
 
+fn parse_player_name_request(
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<RenamePlayerRequest, ()> {
+    let mut fields = query
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    if let Ok(serde_json::Value::Object(body_fields)) =
+        serde_json::from_slice::<serde_json::Value>(body)
+    {
+        fields.extend(body_fields);
+    } else if content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+    {
+        for (key, value) in form_urlencoded::parse(body) {
+            fields.insert(
+                key.into_owned(),
+                serde_json::Value::String(value.into_owned()),
+            );
+        }
+    } else if !body.is_empty() {
+        return Err(());
+    }
+    serde_json::from_value(serde_json::Value::Object(fields)).map_err(|_| ())
+}
+
 async fn api_rename_player(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -10078,9 +10126,15 @@ async fn api_rename_player(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request: RenamePlayerRequest = match serde_json::from_slice(&body) {
+    let request = match parse_player_name_request(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &request_locale(&state)),
+        Err(()) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
         return validation_error("name", &request_locale(&state));
@@ -10542,6 +10596,7 @@ fn dollar_end_only_pattern(pattern: &str, allow_final_newline: bool) -> String {
 async fn api_add_player(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -10551,9 +10606,15 @@ async fn api_add_player(
     if !identity.has_scope("Player.ReadWrite") {
         return missing_scope();
     }
-    let request = match serde_json::from_slice::<RenamePlayerRequest>(&body) {
+    let request = match parse_player_name_request(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
         Ok(request) => request,
-        Err(_) => return validation_error("name", &request_locale(&state)),
+        Err(()) => return validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.name.filter(|name| !name.is_empty()) else {
         return validation_error("name", &request_locale(&state));
@@ -17289,6 +17350,41 @@ mod tests {
         assert!(!super::legacy_option_bool(Some("")));
         assert!(super::legacy_option_bool(Some("no")));
         assert!(!super::legacy_option_bool(None));
+    }
+    #[test]
+    fn player_name_inputs_read_query_json_and_form_values() {
+        use std::collections::BTreeMap;
+
+        let query = BTreeMap::from([("name".to_owned(), "QueryName".to_owned())]);
+        assert_eq!(
+            super::parse_player_name_request(
+                &query,
+                br#"{"name":"JsonName"}"#,
+                Some("application/json"),
+            )
+            .unwrap()
+            .name
+            .as_deref(),
+            Some("JsonName")
+        );
+        assert_eq!(
+            super::parse_player_name_request(
+                &BTreeMap::new(),
+                b"name=FormName",
+                Some("application/x-www-form-urlencoded"),
+            )
+            .unwrap()
+            .name
+            .as_deref(),
+            Some("FormName")
+        );
+        assert_eq!(
+            super::parse_player_name_request(&query, b"", None)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("QueryName")
+        );
     }
     #[test]
     fn player_texture_input_ids_read_query_json_and_form_inputs() {
