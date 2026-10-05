@@ -3062,6 +3062,7 @@ fn registration_plugin_events(
 async fn handle_register(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
@@ -3074,9 +3075,15 @@ async fn handle_register(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => {
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => {
             return registration_validation_error("email", "required", &request_locale(&state));
         }
     };
@@ -16643,25 +16650,22 @@ mod tests {
         use tower::ServiceExt;
 
         let (cookie, csrf_token) = test_web_csrf_credentials(app, cookie).await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("email", email)
+            .append_pair("password", "secure pass 123")
+            .append_pair("player_name", player_name)
+            .append_pair("captcha", captcha)
+            .finish();
         app.clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/auth/register")
+                    .uri("/auth/register?lang=en")
                     .header("cookie", cookie)
                     .header("x-csrf-token", csrf_token)
                     .header("x-real-ip", ip)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "email": email,
-                            "password": "secure pass 123",
-                            "player_name": player_name,
-                            "captcha": captcha,
-                            "lang": "en"
-                        })
-                        .to_string(),
-                    ))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
