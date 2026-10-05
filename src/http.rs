@@ -2579,16 +2579,17 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         Err(error) => {
             release_mail_limit(&state, &key);
             tracing::warn!(%error, uid, "failed to send email verification mail");
-            login_result(
-                2,
-                &auth_message(
-                    &state,
-                    "验证邮件发送失败。",
-                    "We failed to send you the verification link.",
-                ),
-                None,
-            )
+            let message = verification_email_failure_message(&request_locale(&state), &error);
+            login_result(2, &message, None)
         }
+    }
+}
+
+fn verification_email_failure_message(locale: &str, error: &impl std::fmt::Display) -> String {
+    if locale.starts_with("zh") {
+        format!("邮件发送失败，详细信息：{error}")
+    } else {
+        format!("We failed to send you the verification link. Detailed message {error}")
     }
 }
 
@@ -16757,6 +16758,18 @@ mod tests {
         assert!(public_download_ip("1.1.1.1".parse().unwrap()));
         assert!(public_download_ip("2606:4700:4700::1111".parse().unwrap()));
     }
+    #[test]
+    fn verification_email_failure_includes_legacy_diagnostic() {
+        assert_eq!(
+            super::verification_email_failure_message("en", &"A fake exception."),
+            "We failed to send you the verification link. Detailed message A fake exception."
+        );
+        assert_eq!(
+            super::verification_email_failure_message("zh_CN", &"A fake exception."),
+            "邮件发送失败，详细信息：A fake exception."
+        );
+    }
+
     #[test]
     fn banned_player_message_uses_legacy_translations() {
         let translations = [
