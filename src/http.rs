@@ -439,6 +439,36 @@ fn valid_web_csrf_request(state: &AppState, headers: &HeaderMap, submitted: Opti
         && verify_web_csrf_token(key, cookie)
 }
 
+fn request_wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            let media_type = media_type.trim();
+            media_type.eq_ignore_ascii_case("application/json")
+                || media_type.to_ascii_lowercase().ends_with("+json")
+        })
+}
+
+fn web_csrf_mismatch_response(headers: &HeaderMap) -> Response {
+    let status = StatusCode::from_u16(419).expect("HTTP 419 is a valid status");
+    if request_wants_json(headers) {
+        (
+            status,
+            Json(serde_json::json!({"message": "CSRF token mismatched."})),
+        )
+            .into_response()
+    } else {
+        (
+            status,
+            Html("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Page Expired</title></head><body><h1>Page Expired</h1><p>CSRF token mismatched.</p></body></html>"),
+        )
+            .into_response()
+    }
+}
+
 fn web_csrf_token_for_page(state: &AppState, headers: &HeaderMap) -> Option<(String, bool)> {
     let key = state.config.app_key.as_deref()?;
     if let Some(token) = cookie_value(headers, WEB_CSRF_COOKIE)
@@ -696,11 +726,7 @@ async fn detect_locale_preference(
                 .or(form_csrf_token.as_deref()),
         )
     {
-        return (
-            StatusCode::from_u16(419).expect("HTTP 419 is a valid status"),
-            Json(serde_json::json!({"message": "CSRF token mismatched."})),
-        )
-            .into_response();
+        return web_csrf_mismatch_response(&request_headers);
     }
     let inject_csrf = state.session_key.is_some()
         && method == Method::GET
@@ -16405,6 +16431,7 @@ mod tests {
                         .method("POST")
                         .uri("/auth/login")
                         .header("cookie", &cookie)
+                        .header("accept", "application/json")
                         .header("content-type", "application/json")
                         .body(Body::from(
                             r#"{"identification":"alex@example.test","password":"correct horse"}"#,
@@ -16419,6 +16446,42 @@ mod tests {
                     .unwrap();
             assert_eq!(body["message"], "CSRF token mismatched.");
 
+            let browser_rejected = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/login")
+                        .header("cookie", &cookie)
+                        .header("accept", "text/html")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from("identification=alex%40example.test"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                browser_rejected.status(),
+                StatusCode::from_u16(419).unwrap()
+            );
+            assert!(
+                browser_rejected
+                    .headers()
+                    .get("content-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            let browser_error = String::from_utf8(
+                to_bytes(browser_rejected.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(browser_error.contains("Page Expired"));
+
             let signature_char = csrf_token.as_bytes()[49];
             let replacement = if signature_char == b'0' { "1" } else { "0" };
             let forged_csrf_token = format!("{}{replacement}", &csrf_token[..49]);
@@ -16430,6 +16493,7 @@ mod tests {
                         .uri("/auth/login")
                         .header("cookie", format!("blessing_skin_csrf={forged_csrf_token}"))
                         .header("x-csrf-token", forged_csrf_token)
+                        .header("accept", "application/json")
                         .header("content-type", "application/json")
                         .body(Body::from(
                             r#"{"identification":"alex@example.test","password":"correct horse"}"#,
@@ -19543,6 +19607,15 @@ mod tests {
         assert_eq!(
             missing_native_form_csrf.status(),
             StatusCode::from_u16(419).unwrap()
+        );
+        assert!(
+            missing_native_form_csrf
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
         );
         let native_form_csrf = app
             .clone()
