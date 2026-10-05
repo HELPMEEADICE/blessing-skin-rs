@@ -3351,10 +3351,13 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let logout = if chinese { "登出" } else { "Log Out" }.to_owned();
     let site_description =
         legacy_site_description(localized_site_option(&state, "site_description").await);
-    let home_pic_url = site_option(&state, "home_pic_url")
-        .await
-        .filter(|value| legacy_option_bool(Some(value)))
-        .unwrap_or_else(|| "./app/bg.webp".to_owned());
+    let home_pic_url = resolve_legacy_home_background(
+        site_option(&state, "home_pic_url")
+            .await
+            .filter(|value| legacy_option_bool(Some(value))),
+        state.public_dir.join("app/bg.jpg").is_file(),
+        state.public_dir.join("app/bg.webp").is_file(),
+    );
     let fixed_bg = option_is_enabled(&state, "fixed_bg").await;
     let hide_intro = option_is_enabled(&state, "hide_intro").await;
     let transparent_navbar = option_is_enabled(&state, "transparent_navbar").await;
@@ -14907,6 +14910,19 @@ async fn api_root(State(state): State<AppState>) -> Response {
     }
 }
 
+fn resolve_legacy_home_background(
+    configured: Option<String>,
+    legacy_jpg_exists: bool,
+    webp_exists: bool,
+) -> String {
+    let configured = configured.unwrap_or_else(|| "./app/bg.webp".to_owned());
+    if configured == "./app/bg.jpg" && !legacy_jpg_exists && webp_exists {
+        "./app/bg.webp".to_owned()
+    } else {
+        configured
+    }
+}
+
 fn legacy_boolean_option_index(value: &str) -> Option<usize> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "(true)" => Some(1),
@@ -15730,9 +15746,29 @@ mod tests {
         AdminPluginsPage, BindEmailPage, EmailVerificationPage, ForgotPage, HomePage,
         PasswordResetPage, PluginConfigurationPage, RegisterPage, Rgba, RgbaImage, content_etag,
         merge_frontend_language_lines, normalize_skin_dimensions, parse_legacy_datetime,
-        public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview, router,
-        safe_remote_component_url, valid_texture_hash,
+        public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview,
+        resolve_legacy_home_background, router, safe_remote_component_url, valid_texture_hash,
     };
+
+    #[test]
+    fn old_default_home_background_uses_the_available_webp_asset() {
+        assert_eq!(
+            resolve_legacy_home_background(Some("./app/bg.jpg".to_owned()), false, true),
+            "./app/bg.webp"
+        );
+        assert_eq!(
+            resolve_legacy_home_background(Some("./app/bg.jpg".to_owned()), true, true),
+            "./app/bg.jpg"
+        );
+        assert_eq!(
+            resolve_legacy_home_background(Some("/uploads/custom.jpg".to_owned()), false, true),
+            "/uploads/custom.jpg"
+        );
+        assert_eq!(
+            resolve_legacy_home_background(None, false, true),
+            "./app/bg.webp"
+        );
+    }
 
     #[test]
     fn plugin_inventory_reports_startup_failures_in_both_locales() {
