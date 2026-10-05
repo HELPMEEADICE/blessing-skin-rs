@@ -2087,15 +2087,8 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
         Err(error) => {
             release_mail_limit(&state, &key);
             tracing::warn!(%error, recipient = %email, "failed to send password reset email");
-            login_result(
-                2,
-                &auth_message(
-                    &state,
-                    "重置邮件发送失败。",
-                    "Failed to send password reset mail.",
-                ),
-                None,
-            )
+            let message = forgot_password_failure_message(&request_locale(&state), &error);
+            login_result(2, &message, None)
         }
     }
 }
@@ -2582,6 +2575,14 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
             let message = verification_email_failure_message(&request_locale(&state), &error);
             login_result(2, &message, None)
         }
+    }
+}
+
+fn forgot_password_failure_message(locale: &str, error: &impl std::fmt::Display) -> String {
+    if locale.starts_with("zh") {
+        format!("邮件发送失败，详细信息：{error}")
+    } else {
+        format!("Failed to send verification mail. {error}")
     }
 }
 
@@ -16758,6 +16759,18 @@ mod tests {
         assert!(public_download_ip("1.1.1.1".parse().unwrap()));
         assert!(public_download_ip("2606:4700:4700::1111".parse().unwrap()));
     }
+    #[test]
+    fn forgot_password_failure_includes_legacy_diagnostic() {
+        assert_eq!(
+            super::forgot_password_failure_message("en", &"A fake exception."),
+            "Failed to send verification mail. A fake exception."
+        );
+        assert_eq!(
+            super::forgot_password_failure_message("zh_CN", &"A fake exception."),
+            "邮件发送失败，详细信息：A fake exception."
+        );
+    }
+
     #[test]
     fn verification_email_failure_includes_legacy_diagnostic() {
         assert_eq!(
