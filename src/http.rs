@@ -811,6 +811,20 @@ async fn detect_locale_preference(
     }
     response
 }
+async fn apply_plugin_filter_value(
+    state: &AppState,
+    filter_name: &str,
+    value: &serde_json::Value,
+    context: &serde_json::Value,
+) -> serde_json::Value {
+    state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(filter_name, value, context)
+        .await
+}
+
 fn texture_plugin_record(texture: &TextureInfoRecord) -> serde_json::Value {
     serde_json::json!({
         "tid": texture.tid,
@@ -12723,6 +12737,7 @@ async fn upload_texture(
     let mut texture_type = None;
     let mut public = None;
     let mut file_bytes = None;
+    let mut file_name = None;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -12735,6 +12750,7 @@ async fn upload_texture(
         let Some(field_name) = field.name().map(str::to_owned) else {
             continue;
         };
+        let upload_filename = field.file_name().map(str::to_owned);
         let bytes = match field.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -12743,6 +12759,7 @@ async fn upload_texture(
             }
         };
         if field_name == "file" {
+            file_name = upload_filename;
             file_bytes = Some(bytes.to_vec());
             continue;
         }
@@ -12793,6 +12810,29 @@ async fn upload_texture(
             return upload_validation_error("name", &request_locale(&state));
         }
     }
+    let file_context = serde_json::json!({
+        "name": file_name,
+        "size": file_bytes.len(),
+        "mime_type": "image/png",
+    });
+    let filtered_name = apply_plugin_filter_value(
+        &state,
+        "uploaded_texture_name",
+        &serde_json::json!(name),
+        &serde_json::json!({"file": file_context.clone()}),
+    )
+    .await;
+    let name = filtered_name.as_str().unwrap_or(&name).to_owned();
+    let can_upload = apply_plugin_filter_value(
+        &state,
+        "can_upload_texture",
+        &serde_json::json!(true),
+        &serde_json::json!({"file": file_context, "name": name}),
+    )
+    .await;
+    if let Some(reason) = plugin_filter_rejection(&can_upload) {
+        return login_result(1, reason, None);
+    }
     let max_upload_kb = match database
         .option(&state.config.database.table_prefix, "max_upload_file_size")
         .await
@@ -12839,10 +12879,25 @@ async fn upload_texture(
             return upload_validation_error("file", &request_locale(&state));
         }
     };
-    let hash = Sha256::digest(&sanitized)
+    let computed_hash = Sha256::digest(&sanitized)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    let filtered_hash = apply_plugin_filter_value(
+        &state,
+        "uploaded_texture_hash",
+        &serde_json::json!(computed_hash),
+        &serde_json::json!({"image": {"width": width, "height": height, "format": "png"}}),
+    )
+    .await;
+    let Some(hash) = filtered_hash
+        .as_str()
+        .filter(|hash| valid_texture_hash(hash))
+        .map(str::to_owned)
+    else {
+        tracing::warn!("WASM texture hash filter returned an unsafe hash");
+        return unavailable();
+    };
     match database
         .texture_upload_duplicate_id(&state.config.database.table_prefix, &hash, reporter.uid)
         .await

@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.27.0";
+const HOST_API_VERSION: &str = "1.28.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -822,6 +822,9 @@ fn validate_plugin_filter(
             | "can_update_texture_name"
             | "can_update_texture_privacy"
             | "can_update_texture_type"
+            | "can_upload_texture"
+            | "uploaded_texture_name"
+            | "uploaded_texture_hash"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -854,6 +857,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_update_texture_name"
         | "can_update_texture_privacy"
         | "can_update_texture_type"
+        | "can_upload_texture"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -861,7 +865,14 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         {
             Ok(())
         }
-        "new_player_name" if value.is_string() => Ok(()),
+        "new_player_name" | "uploaded_texture_name" if value.is_string() => Ok(()),
+        "uploaded_texture_hash"
+            if value.as_str().is_some_and(|hash| {
+                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+            }) =>
+        {
+            Ok(())
+        }
         "sign_score" if value.as_i64().is_some() => Ok(()),
         "can_sign"
         | "can_add_player"
@@ -874,11 +885,17 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_texture"
         | "can_update_texture_name"
         | "can_update_texture_privacy"
-        | "can_update_texture_type" => Err(
+        | "can_update_texture_type"
+        | "can_upload_texture" => Err(
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
-        "new_player_name" => Err("new_player_name filters must return a string".to_owned()),
+        "new_player_name" | "uploaded_texture_name" => {
+            Err("name filters must return a string".to_owned())
+        }
+        "uploaded_texture_hash" => {
+            Err("uploaded_texture_hash must return 64 hexadecimal characters".to_owned())
+        }
         "sign_score" => Err("sign_score filters must return a signed integer".to_owned()),
         _ => Err("unsupported plugin filter name".to_owned()),
     }
@@ -1538,6 +1555,47 @@ mod tests {
             );
             assert!(validate_plugin_filter_value(name, &serde_json::json!("false")).is_err());
         }
+    }
+
+    #[test]
+    fn legacy_texture_upload_filters_validate_safe_results() {
+        let context =
+            serde_json::json!({"file": {"name": "skin.png", "size": 128}, "name": "Alex"});
+        assert!(
+            validate_plugin_filter("can_upload_texture", &serde_json::json!(true), &context)
+                .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "can_upload_texture",
+                &serde_json::json!({"rejection": "uploads disabled"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value("can_upload_texture", &serde_json::json!("false"))
+                .is_err()
+        );
+        assert!(
+            validate_plugin_filter(
+                "uploaded_texture_name",
+                &serde_json::json!("Alex"),
+                &context
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter(
+                "uploaded_texture_hash",
+                &serde_json::json!("a".repeat(64)),
+                &context
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value("uploaded_texture_hash", &serde_json::json!("../outside"))
+                .is_err()
+        );
     }
 
     #[test]
