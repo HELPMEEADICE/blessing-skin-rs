@@ -5,6 +5,7 @@ mod database;
 mod defuse;
 mod http;
 mod image_cache;
+mod install_command;
 mod installer;
 mod mailer;
 mod oauth;
@@ -103,6 +104,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             plugin_command::PluginCommandOutcome::NotFound => "WASM plugin not found.",
         };
         println!("{message}");
+        return Ok(());
+    }
+
+    if let Some(arguments) = install_command::parse(&arguments)? {
+        if storage_dir.join("install.lock").exists() {
+            println!("You have installed Blessing Skin Server. Nothing to do.");
+            return Ok(());
+        }
+        let config = Config::from_env()?;
+        let site_name = crate::config::legacy_env("BS_INSTALL_SITE_NAME")
+            .unwrap_or_else(|| "Blessing Skin".to_owned());
+        installer::install_with_details(
+            &config,
+            &storage_dir,
+            &arguments.email,
+            &arguments.nickname,
+            &arguments.password,
+            &site_name,
+        )
+        .await?;
+        println!("Installation completed!");
+        println!("We recommend to modify your Site URL option if incorrect.");
         return Ok(());
     }
 
