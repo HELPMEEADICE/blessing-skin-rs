@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.32.0";
+const HOST_API_VERSION: &str = "1.33.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -838,6 +838,7 @@ fn validate_plugin_filter(
             | "uploaded_texture_hash"
             | "uploaded_texture_file"
             | "client_ip"
+            | "can_register"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -865,6 +866,7 @@ fn valid_client_ip(value: &str) -> bool {
 
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
+        "can_register" => Ok(()),
         "can_sign"
         | "can_add_player"
         | "can_rename_player"
@@ -1499,6 +1501,15 @@ mod tests {
         assert!(validate_plugin_filter("can_sign", &serde_json::json!(true), &context).is_ok());
         assert!(
             validate_plugin_filter("can_add_player", &serde_json::json!(true), &context).is_ok()
+        );
+        assert!(validate_plugin_filter("can_register", &serde_json::Value::Null, &context).is_ok());
+        assert!(validate_plugin_filter_value("can_register", &serde_json::json!(false)).is_ok());
+        assert!(
+            validate_plugin_filter_value(
+                "can_register",
+                &serde_json::json!({"rejection": "registration disabled"})
+            )
+            .is_ok()
         );
         assert!(validate_plugin_filter_value("can_sign", &serde_json::json!(false)).is_ok());
         assert!(

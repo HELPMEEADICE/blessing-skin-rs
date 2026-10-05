@@ -3591,6 +3591,16 @@ async fn handle_register(
     if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
         return response;
     }
+    let can_register = apply_plugin_filter_value(
+        &state,
+        "can_register",
+        &serde_json::Value::Null,
+        &serde_json::json!({}),
+    )
+    .await;
+    if let Some(reason) = plugin_filter_rejection(&can_register) {
+        return login_result(1, reason, None);
+    }
     if state.session_key.is_none() {
         tracing::error!("APP_KEY is required to create a web login session");
         return unavailable();
