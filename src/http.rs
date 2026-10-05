@@ -12473,12 +12473,24 @@ async fn rename_texture(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(tid_path): RoutePath<String>,
-    Json(request): Json<serde_json::Value>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
         Ok(context) => context,
         Err(response) => return response,
     };
+    let fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return texture_name_validation_error(&request_locale(&state)),
+    };
+    let request = serde_json::Value::Object(fields);
     let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
         return texture_name_validation_error(&request_locale(&state));
     };
@@ -12882,12 +12894,24 @@ async fn update_texture_type(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(tid_path): RoutePath<String>,
-    Json(request): Json<serde_json::Value>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let (tid, texture) = match texture_mutation_context(&state, &headers, &tid_path).await {
         Ok(context) => context,
         Err(response) => return response,
     };
+    let fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return texture_type_validation_error(&request_locale(&state)),
+    };
+    let request = serde_json::Value::Object(fields);
     let Some(texture_type) = request.get("type").and_then(serde_json::Value::as_str) else {
         return texture_type_validation_error(&request_locale(&state));
     };
@@ -20092,6 +20116,62 @@ mod tests {
         )
         .unwrap();
         assert!(invalid_form_report["errors"]["tid"].is_array());
+        let invalid_texture_name = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/texture/2/name")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("name="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_texture_name.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let invalid_texture_name: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_texture_name.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(invalid_texture_name["errors"]["name"].is_array());
+        let invalid_texture_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/texture/2/type?type=invalid")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_texture_type.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let invalid_texture_type: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_texture_type.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(invalid_texture_type["errors"]["type"].is_array());
         let plugin_manage = app
             .clone()
             .oneshot(
