@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.20.0";
+const HOST_API_VERSION: &str = "1.21.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -40,6 +40,9 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "auth.login.failed",
     "auth.logout.before",
     "auth.logout.after",
+    "auth.registration.attempt",
+    "auth.registration.ready",
+    "auth.registration.completed",
     "user.registered",
     "user.profile.updated",
     "user.profile.updating",
@@ -1192,6 +1195,9 @@ mod tests {
             "auth.login.failed",
             "auth.logout.before",
             "auth.logout.after",
+            "auth.registration.attempt",
+            "auth.registration.ready",
+            "auth.registration.completed",
             "user.email.updating",
             "user.email.updated",
             "user.nickname.updating",

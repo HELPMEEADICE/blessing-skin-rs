@@ -3413,14 +3413,20 @@ fn registration_plugin_events(
     uid: i64,
     initial_player: Option<&crate::database::PlayerRecord>,
 ) -> Vec<(&'static str, serde_json::Value)> {
-    let mut events = vec![("user.registered", serde_json::json!({"user_id": uid}))];
+    let user_event = serde_json::json!({"user_id": uid});
+    let mut events = vec![
+        ("auth.registration.completed", user_event.clone()),
+        ("user.registered", user_event.clone()),
+    ];
     if let Some(player) = initial_player {
         events.push((
             "player.added",
             serde_json::json!({"user_id": uid, "player_id": player.pid, "name": player.name}),
         ));
     }
-    events.push(("user.logged-in", serde_json::json!({"user_id": uid})));
+    events.push(("auth.login.ready", user_event.clone()));
+    events.push(("auth.login.succeeded", user_event.clone()));
+    events.push(("user.logged-in", user_event));
     events
 }
 
@@ -3558,6 +3564,40 @@ async fn handle_register(
         nickname
     };
 
+    match database.user_email_exists(prefix, email, 0).await {
+        Ok(true) => return registration_validation_error("email", "unique", &locale),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, "failed to check registration email uniqueness");
+            return unavailable();
+        }
+    }
+    emit_plugin_event(
+        &state,
+        "auth.registration.attempt",
+        serde_json::json!({"with_player_name": player_name.is_some()}),
+    )
+    .await;
+    if let Some(name) = player_name {
+        match database.admin_player_name_exists(prefix, name).await {
+            Ok(true) => {
+                return login_result(
+                    1,
+                    if locale.starts_with("zh") {
+                        "该角色名已被占用"
+                    } else {
+                        "The player name is already registered."
+                    },
+                    None,
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "failed to check registration player name");
+                return unavailable();
+            }
+        }
+    }
     let client_ip = registration_client_ip(&headers);
     let max_registrations_per_ip = match database.option(prefix, "regs_per_ip").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 3),
@@ -3566,6 +3606,33 @@ async fn handle_register(
             return unavailable();
         }
     };
+    let registered_from_ip = match database
+        .registered_user_count_by_ip(prefix, &client_ip)
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(%error, "failed to count registrations from client IP");
+            return unavailable();
+        }
+    };
+    if registered_from_ip >= max_registrations_per_ip {
+        return login_result(
+            1,
+            &if locale.starts_with("zh") {
+                format!("你在本站注册的账号已达到上限 {max_registrations_per_ip} 个，无法继续注册")
+            } else {
+                format!("You can't register more than {max_registrations_per_ip} accounts.")
+            },
+            None,
+        );
+    }
+    emit_plugin_event(
+        &state,
+        "auth.registration.ready",
+        serde_json::json!({"with_player_name": player_name.is_some()}),
+    )
+    .await;
     let initial_score = match database.option(prefix, "user_initial_score").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 1000),
         Err(error) => {
@@ -18834,18 +18901,30 @@ mod tests {
         assert_eq!(
             super::registration_plugin_events(7, Some(&player)),
             vec![
+                (
+                    "auth.registration.completed",
+                    serde_json::json!({"user_id": 7}),
+                ),
                 ("user.registered", serde_json::json!({"user_id": 7})),
                 (
                     "player.added",
                     serde_json::json!({"user_id": 7, "player_id": 11, "name": "Alex"}),
                 ),
+                ("auth.login.ready", serde_json::json!({"user_id": 7})),
+                ("auth.login.succeeded", serde_json::json!({"user_id": 7})),
                 ("user.logged-in", serde_json::json!({"user_id": 7})),
             ]
         );
         assert_eq!(
             super::registration_plugin_events(7, None),
             vec![
+                (
+                    "auth.registration.completed",
+                    serde_json::json!({"user_id": 7}),
+                ),
                 ("user.registered", serde_json::json!({"user_id": 7})),
+                ("auth.login.ready", serde_json::json!({"user_id": 7})),
+                ("auth.login.succeeded", serde_json::json!({"user_id": 7})),
                 ("user.logged-in", serde_json::json!({"user_id": 7})),
             ]
         );
