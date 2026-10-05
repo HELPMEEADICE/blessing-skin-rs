@@ -1021,13 +1021,28 @@ async fn filter_user_menu(
 }
 
 async fn filter_player_page_widgets(state: &AppState) -> Vec<String> {
-    const DEFAULTS: &[&str] = &["player_management", "previewer"];
-    let initial = serde_json::json!(DEFAULTS);
-    let filtered =
-        apply_plugin_filter_value(state, "grid:user.player", &initial, &serde_json::json!({}))
-            .await;
+    filter_page_widgets(
+        state,
+        "grid:user.player",
+        &["player_management", "previewer"],
+    )
+    .await
+}
+
+async fn filter_closet_page_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(
+        state,
+        "grid:user.closet",
+        &["closet_management", "previewer"],
+    )
+    .await
+}
+
+async fn filter_page_widgets(state: &AppState, name: &str, defaults: &[&str]) -> Vec<String> {
+    let initial = serde_json::json!(defaults);
+    let filtered = apply_plugin_filter_value(state, name, &initial, &serde_json::json!({})).await;
     serde_json::from_value(filtered)
-        .unwrap_or_else(|_| DEFAULTS.iter().map(|widget| (*widget).to_owned()).collect())
+        .unwrap_or_else(|_| defaults.iter().map(|widget| (*widget).to_owned()).collect())
 }
 
 async fn filter_auth_page_rows(state: &AppState, page: &str, defaults: &[&str]) -> Vec<String> {
@@ -5081,6 +5096,8 @@ struct ClosetManagementPage {
     site_name: String,
     locale: String,
     user: UserProfile,
+    page_widgets: Vec<String>,
+    has_closet_management: bool,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -8480,6 +8497,10 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
         Ok(user) => user,
         Err(response) => return response,
     };
+    let page_widgets = filter_closet_page_widgets(&state).await;
+    let has_closet_management = page_widgets
+        .iter()
+        .any(|widget| widget == "closet_management");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -8497,6 +8518,8 @@ async fn web_closet_page(State(state): State<AppState>, headers: HeaderMap) -> R
         site_name,
         locale: request_locale(&state),
         user,
+        page_widgets,
+        has_closet_management,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
