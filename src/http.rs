@@ -7504,15 +7504,22 @@ async fn web_closet_ids(State(state): State<AppState>, headers: HeaderMap) -> Re
 async fn web_add_closet_item(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => return closet_validation_error("tid", &request_locale(&state)),
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return closet_validation_error("tid", &request_locale(&state)),
     };
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
         return closet_validation_error("tid", &request_locale(&state));
@@ -7623,6 +7630,7 @@ async fn web_rename_closet_item(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_tid): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -7632,9 +7640,15 @@ async fn web_rename_closet_item(
     let Ok(tid) = raw_tid.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => return closet_validation_error("name", &request_locale(&state)),
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return closet_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request
         .get("name")
@@ -10076,11 +10090,11 @@ struct RenamePlayerRequest {
     name: Option<String>,
 }
 
-fn parse_player_name_request(
+fn parse_legacy_input_object(
     query: &BTreeMap<String, String>,
     body: &[u8],
     content_type: Option<&str>,
-) -> Result<RenamePlayerRequest, ()> {
+) -> Result<serde_json::Map<String, serde_json::Value>, ()> {
     let mut fields = query
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
@@ -10106,9 +10120,17 @@ fn parse_player_name_request(
     } else if !body.is_empty() {
         return Err(());
     }
-    serde_json::from_value(serde_json::Value::Object(fields)).map_err(|_| ())
+    Ok(fields)
 }
 
+fn parse_player_name_request(
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<RenamePlayerRequest, ()> {
+    let fields = parse_legacy_input_object(query, body, content_type)?;
+    serde_json::from_value(serde_json::Value::Object(fields)).map_err(|_| ())
+}
 async fn api_rename_player(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10923,6 +10945,7 @@ fn texture_id_from_request(value: Option<&serde_json::Value>) -> Option<i64> {
 async fn api_add_closet_item(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -10932,9 +10955,15 @@ async fn api_add_closet_item(
     if !identity.has_scope("Closet.ReadWrite") {
         return missing_scope();
     }
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => return closet_validation_error("tid", &request_locale(&state)),
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return closet_validation_error("tid", &request_locale(&state)),
     };
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
         return closet_validation_error("tid", &request_locale(&state));
@@ -11052,6 +11081,7 @@ async fn api_rename_closet_item(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_tid): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -11064,9 +11094,15 @@ async fn api_rename_closet_item(
     let Ok(tid) = raw_tid.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => return closet_validation_error("name", &request_locale(&state)),
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return closet_validation_error("name", &request_locale(&state)),
     };
     let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
         return closet_validation_error("name", &request_locale(&state));
@@ -17351,6 +17387,30 @@ mod tests {
         assert!(super::legacy_option_bool(Some("no")));
         assert!(!super::legacy_option_bool(None));
     }
+    #[test]
+    fn legacy_input_object_merges_query_json_and_form_fields() {
+        use std::collections::BTreeMap;
+
+        let query = BTreeMap::from([("tid".to_owned(), "7".to_owned())]);
+        let form = super::parse_legacy_input_object(
+            &query,
+            b"tid=8&name=My+Texture",
+            Some("application/x-www-form-urlencoded"),
+        )
+        .unwrap();
+        assert_eq!(form["tid"], "8");
+        assert_eq!(form["name"], "My Texture");
+
+        let json = super::parse_legacy_input_object(
+            &query,
+            br#"{"tid":9,"name":"JSON Texture"}"#,
+            Some("application/json"),
+        )
+        .unwrap();
+        assert_eq!(json["tid"], 9);
+        assert_eq!(json["name"], "JSON Texture");
+    }
+
     #[test]
     fn player_name_inputs_read_query_json_and_form_values() {
         use std::collections::BTreeMap;
