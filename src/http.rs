@@ -1378,7 +1378,12 @@ async fn bind_email_page(State(state): State<AppState>, headers: HeaderMap) -> R
     }
 }
 
-async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn bind_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
         return Redirect::to("/auth/login").into_response();
     };
@@ -1409,28 +1414,35 @@ async fn bind_email(State(state): State<AppState>, headers: HeaderMap, body: Byt
     if !user.email.is_empty() {
         return Redirect::to("/user").into_response();
     }
-    let is_json = headers
+    let content_type = headers
         .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"));
-    let email = if is_json {
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("email")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
+        .and_then(|value| value.to_str().ok());
+    let is_json = content_type.is_some_and(|value| value.starts_with("application/json"));
+    let input_content_type = if is_json {
+        content_type
     } else {
-        form_urlencoded::parse(&body)
-            .find(|(key, _)| key == "email")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.trim().is_empty())
+        Some("application/x-www-form-urlencoded")
     };
-    let Some(email) = email.filter(|email| valid_email_address(email) && email.len() <= 100) else {
+    let fields = match parse_legacy_input_object(&query, &body, input_content_type) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return registration_validation_error("email", "required", &request_locale(&state));
+        }
+    };
+    let Some(email_value) = fields.get("email").filter(|value| !value.is_null()) else {
+        return registration_validation_error("email", "required", &request_locale(&state));
+    };
+    let Some(email) = email_value.as_str() else {
         return registration_validation_error("email", "email", &request_locale(&state));
     };
+    let email = email.trim();
+    if email.is_empty() {
+        return registration_validation_error("email", "required", &request_locale(&state));
+    }
+    if !valid_email_address(email) || email.len() > 100 {
+        return registration_validation_error("email", "email", &request_locale(&state));
+    }
+    let email = email.to_owned();
     let prefix = &state.config.database.table_prefix;
     match database.user_email_exists(prefix, &email, user_id).await {
         Ok(true) => {
@@ -19968,6 +19980,28 @@ mod tests {
         )
         .unwrap();
         let admin_cookie = format!("blessing_skin_session={admin_token}");
+        sqlx::query("UPDATE users SET email = '' WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bound_email = session_request(
+            &app,
+            &admin_cookie,
+            "POST",
+            "/auth/bind?email=bound%40example.test",
+            None,
+        )
+        .await;
+        assert_eq!(bound_email.status(), StatusCode::SEE_OTHER);
+        let bound_email: String = sqlx::query_scalar("SELECT email FROM users WHERE uid = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(bound_email, "bound@example.test");
+        sqlx::query("UPDATE users SET email = 'alex@example.test' WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
         let denied_translation_page =
             session_request(&app, &registered_cookie, "GET", "/admin/i18n", None).await;
         assert_eq!(denied_translation_page.status(), StatusCode::FORBIDDEN);
