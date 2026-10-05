@@ -8656,6 +8656,28 @@ async fn user_set_avatar(
     else {
         return profile_validation_error("tid", "integer", &request_locale(&state));
     };
+    let can_update = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "user_can_update_avatar",
+            &serde_json::json!(true),
+            &serde_json::json!({
+                "user_id": user.uid,
+                "texture_id": tid,
+            }),
+        )
+        .await;
+    if let Some(reason) = plugin_filter_rejection(&can_update) {
+        return login_result(1, reason, None);
+    }
+    emit_plugin_event(
+        &state,
+        "user.avatar.updating",
+        serde_json::json!({"user_id": user.uid, "texture_id": tid}),
+    )
+    .await;
     if tid != 0 {
         let texture = match database
             .texture_info(&state.config.database.table_prefix, tid)
