@@ -1029,6 +1029,10 @@ async fn filter_player_page_widgets(state: &AppState) -> Vec<String> {
     .await
 }
 
+async fn filter_skinlib_upload_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(state, "grid:skinlib.upload", &["upload_form", "previewer"]).await
+}
+
 async fn filter_skinlib_show_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -5165,6 +5169,8 @@ struct TextureUploadPage {
     upload_award: i64,
     max_upload_kb: i64,
     content_policy: String,
+    page_widgets: Vec<String>,
+    has_upload_form: bool,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -12952,6 +12958,8 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
         )
     };
     let rendered_content_policy = render_notification_markdown(&content_policy);
+    let page_widgets = filter_skinlib_upload_widgets(&state).await;
+    let has_upload_form = page_widgets.iter().any(|widget| widget == "upload_form");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -12984,6 +12992,8 @@ async fn texture_upload_page(State(state): State<AppState>, headers: HeaderMap) 
         upload_award,
         max_upload_kb,
         content_policy,
+        page_widgets,
+        has_upload_form,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
