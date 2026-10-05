@@ -7147,6 +7147,7 @@ async fn web_set_player_textures(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -7156,8 +7157,13 @@ async fn web_set_player_textures(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request =
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let (skin, cape) = player_texture_input_ids(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -7166,8 +7172,8 @@ async fn web_set_player_textures(
             &state.config.database.table_prefix,
             user.uid,
             player_id,
-            texture_request_id(request.get("skin")),
-            texture_request_id(request.get("cape")),
+            skin,
+            cape,
         )
         .await;
     match result {
@@ -10171,6 +10177,7 @@ async fn api_set_player_textures(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -10183,10 +10190,13 @@ async fn api_set_player_textures(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request =
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
-    let skin = texture_request_id(request.get("skin"));
-    let cape = texture_request_id(request.get("cape"));
+    let (skin, cape) = player_texture_input_ids(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -10261,6 +10271,46 @@ async fn api_clear_player_textures(
     }
 }
 
+fn player_texture_input_ids(
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (Option<i64>, Option<i64>) {
+    let mut skin = query
+        .get("skin")
+        .map(|value| serde_json::Value::String(value.clone()));
+    let mut cape = query
+        .get("cape")
+        .map(|value| serde_json::Value::String(value.clone()));
+    let media_type = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice::<serde_json::Value>(body)
+    {
+        if let Some(value) = fields.get("skin") {
+            skin = Some(value.clone());
+        }
+        if let Some(value) = fields.get("cape") {
+            cape = Some(value.clone());
+        }
+    } else if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        for (key, value) in form_urlencoded::parse(body) {
+            let value = serde_json::Value::String(value.into_owned());
+            match key.as_ref() {
+                "skin" => skin = Some(value),
+                "cape" => cape = Some(value),
+                _ => {}
+            }
+        }
+    }
+    (
+        texture_request_id(skin.as_ref()),
+        texture_request_id(cape.as_ref()),
+    )
+}
 fn texture_request_id(value: Option<&serde_json::Value>) -> Option<i64> {
     match value? {
         serde_json::Value::Null => None,
@@ -17239,6 +17289,35 @@ mod tests {
         assert!(!super::legacy_option_bool(Some("")));
         assert!(super::legacy_option_bool(Some("no")));
         assert!(!super::legacy_option_bool(None));
+    }
+    #[test]
+    fn player_texture_input_ids_read_query_json_and_form_inputs() {
+        use std::collections::BTreeMap;
+
+        let query = BTreeMap::from([
+            ("skin".to_owned(), "12".to_owned()),
+            ("cape".to_owned(), "13".to_owned()),
+        ]);
+        assert_eq!(
+            super::player_texture_input_ids(
+                &query,
+                br#"{"skin":14,"cape":null}"#,
+                Some("application/json"),
+            ),
+            (Some(14), None)
+        );
+        assert_eq!(
+            super::player_texture_input_ids(
+                &BTreeMap::new(),
+                b"skin=21&cape=22",
+                Some("application/x-www-form-urlencoded"),
+            ),
+            (Some(21), Some(22))
+        );
+        assert_eq!(
+            super::player_texture_input_ids(&query, b"", None),
+            (Some(12), Some(13))
+        );
     }
     #[test]
     fn player_texture_clear_flags_read_query_json_and_form_inputs() {
