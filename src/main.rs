@@ -9,6 +9,7 @@ mod installer;
 mod mailer;
 mod oauth;
 mod plugin_runtime;
+mod salt_command;
 mod skin_renderer;
 mod update;
 
@@ -71,10 +72,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(%error, "could not load the configured environment file");
     }
 
-    let config = Arc::new(Config::from_env()?);
     let storage_dir = PathBuf::from(
         crate::config::legacy_env("STORAGE_PATH").unwrap_or_else(|| "storage".to_owned()),
     );
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(result) = salt_command::run(&arguments, &env_file, &storage_dir)? {
+        if result.persisted {
+            println!("Application salt [{}] set successfully.", result.salt);
+        } else {
+            println!("{}", result.salt);
+        }
+        return Ok(());
+    }
+
+    let config = Arc::new(Config::from_env()?);
     let public_dir = PathBuf::from(
         crate::config::legacy_env("PUBLIC_PATH").unwrap_or_else(|| "public".to_owned()),
     );

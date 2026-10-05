@@ -8667,7 +8667,7 @@ async fn setup_database_save(
         ("DB_PREFIX", form.prefix.clone()),
     ];
     let write_path = env_file.clone();
-    let saved = tokio::task::spawn_blocking(move || write_setup_env(&write_path, &entries)).await;
+    let saved = tokio::task::spawn_blocking(move || write_env_file(&write_path, &entries)).await;
     match saved {
         Ok(Ok(())) => {
             let csrf = setup_csrf_for_page(&headers);
@@ -9124,7 +9124,7 @@ fn render_setup_page(
     response
 }
 
-fn write_setup_env(
+pub(crate) fn write_env_file(
     path: &std::path::Path,
     entries: &[(&str, String)],
 ) -> Result<(), std::io::Error> {
@@ -16401,7 +16401,7 @@ mod tests {
         )
         .unwrap();
         let password = r#"two words; "quoted" \ #value"#;
-        super::write_setup_env(
+        super::write_env_file(
             &path,
             &[
                 ("DB_CONNECTION", "pgsql".to_owned()),
