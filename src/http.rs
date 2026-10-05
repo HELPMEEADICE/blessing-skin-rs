@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Form, FromRequestParts, Multipart, OriginalUri, Path as RoutePath, Query,
+        DefaultBodyLimit, FromRequestParts, Multipart, OriginalUri, Path as RoutePath, Query,
         RawQuery, State,
     },
     http::{
@@ -9354,8 +9354,36 @@ async fn setup_info_page(State(state): State<AppState>, headers: HeaderMap) -> R
 async fn setup_finish(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<SetupFinishRequest>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let fields = parse_legacy_input_object(&query, &body, content_type).unwrap_or_default();
+    let site_name = fields
+        .get("site_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let form = match serde_json::from_value::<SetupFinishRequest>(serde_json::Value::Object(fields))
+    {
+        Ok(form) => form,
+        Err(_) => {
+            return setup_info_error(
+                &state,
+                &headers,
+                &site_name,
+                setup_message(
+                    &state,
+                    "Complete all required setup fields.",
+                    "请填写所有必需的安装信息。",
+                ),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
     if setup_is_locked(&state) {
         return render_setup_page(
             &SetupLockedPage {
@@ -18878,7 +18906,6 @@ mod tests {
         );
         let finish_form = form_urlencoded::Serializer::new(String::new())
             .append_pair("csrf", finish_cookie.split_once('=').unwrap().1)
-            .append_pair("email", "first-admin@example.test")
             .append_pair("nickname", "First admin")
             .append_pair("password", "correct horse")
             .append_pair("password_confirmation", "correct horse")
@@ -18887,7 +18914,7 @@ mod tests {
         let installed = finish_app
             .clone()
             .oneshot(
-                Request::post("/setup/finish")
+                Request::post("/setup/finish?email=first-admin%40example.test")
                     .header("cookie", &finish_cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(finish_form))
