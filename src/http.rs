@@ -4801,9 +4801,9 @@ async fn web_admin_update_download(State(state): State<AppState>, headers: Heade
     }
 
     let message = if request_locale(&state).starts_with("zh") {
-        "Rust 服务以独立程序发行。请下载对应平台的软件包，并按更新说明停止服务、替换程序后重新启动。"
+        "Rust 服务以独立程序发行。请下载对应平台的软件包，停止服务并替换程序和前端资源，然后运行 blessing-skin-rs update 并重新启动。"
     } else {
-        "The Rust service is distributed as a standalone program. Download the package for your platform, then follow the update instructions to stop the service, replace the program, and restart it."
+        "The Rust service is distributed as a standalone program. Download the package for your platform, stop the service, replace the program and frontend assets, run blessing-skin-rs update, then restart it."
     };
     Json(serde_json::json!({ "code": 1, "message": message })).into_response()
 }

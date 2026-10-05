@@ -14,6 +14,7 @@ mod plugin_runtime;
 mod salt_command;
 mod skin_renderer;
 mod update;
+mod update_command;
 
 use std::{
     collections::HashMap,
@@ -126,6 +127,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         println!("Installation completed!");
         println!("We recommend to modify your Site URL option if incorrect.");
+        return Ok(());
+    }
+
+    if update_command::parse(&arguments)? {
+        let config = Config::from_env()?;
+        let database = DatabasePool::connect(&config.database).await?;
+        let result = update_command::run(
+            &database,
+            &config.database.table_prefix,
+            &storage_dir,
+            &config.legacy_app_version,
+        )
+        .await?;
+        println!("Legacy database updated to {}.", config.legacy_app_version);
+        if result.background_migrated {
+            println!("Updated the legacy default background to WebP.");
+        }
+        println!("Restart the Rust service to complete the upgrade.");
         return Ok(());
     }
 

@@ -68,7 +68,7 @@ Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-in
 
 ## 版本升级
 
-从 [GitHub Releases](https://github.com/HELPMEEADICE/blessing-skin-rs/releases) 下载与你的系统和架构匹配的软件包。发行包包含独立 Rust 程序、前端资源和部署文档。升级前备份数据库与纹理目录；停止当前服务后替换程序和 `public/app`，保留 `.env`、`storage`、Passport 密钥和纹理文件，再启动服务并检查 `/health/ready`。已有 PHP 站点不需要重新运行安装器。
+从 [GitHub Releases](https://github.com/HELPMEEADICE/blessing-skin-rs/releases) 下载与你的系统和架构匹配的软件包。发行包包含独立 Rust 程序、前端资源和部署文档。升级前备份数据库与纹理目录；停止当前服务后替换程序和 `public/app`，保留 `.env`、`storage`、Passport 密钥和纹理文件。重新启动前运行 `./blessing-skin-rs update`（Windows 为 `./blessing-skin-rs.exe update`），它会将旧数据库的兼容版本选项更新到 `BS_LEGACY_APP_VERSION`、执行适用的默认背景 URL 更新并确保 `STORAGE_PATH/install.lock` 存在；该命令不会运行 PHP migrations 或修改其他业务数据。完成后启动服务并检查 `/health/ready`。已有 PHP 站点不需要重新运行安装器。
 
 管理后台的“版本更新”页面查询配置的 latest release API，并显示最新版本和更新状态；尚无正式发行版时会明确提示，网络失败只显示提示，不影响服务。Rust 服务不在运行中覆盖自身文件，`POST /admin/update/download` 会返回人工升级步骤，需由管理员下载匹配平台发行包并停止服务后替换程序和前端资源。
 
