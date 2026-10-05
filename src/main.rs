@@ -8,6 +8,7 @@ mod image_cache;
 mod installer;
 mod mailer;
 mod oauth;
+mod plugin_command;
 mod plugin_runtime;
 mod salt_command;
 mod skin_renderer;
@@ -82,6 +83,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("{}", result.salt);
         }
+        return Ok(());
+    }
+
+    let plugins_dir = crate::config::legacy_env("PLUGINS_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage_dir.join("plugins"));
+    if let Some(outcome) = plugin_command::run(&arguments, &plugins_dir)? {
+        let message = match outcome {
+            plugin_command::PluginCommandOutcome::Enabled => {
+                "Plugin enabled. Restart the service for the change to take effect."
+            }
+            plugin_command::PluginCommandOutcome::Disabled => {
+                "Plugin disabled. Restart the service for the change to take effect."
+            }
+            plugin_command::PluginCommandOutcome::AlreadyEnabled => "Plugin is already enabled.",
+            plugin_command::PluginCommandOutcome::AlreadyDisabled => "Plugin is already disabled.",
+            plugin_command::PluginCommandOutcome::NotFound => "WASM plugin not found.",
+        };
+        println!("{message}");
         return Ok(());
     }
 
