@@ -5413,6 +5413,7 @@ async fn web_admin_plugin_config(
 async fn web_admin_plugins_manage(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -5422,10 +5423,22 @@ async fn web_admin_plugins_manage(
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let request = match serde_json::from_slice::<AdminPluginManageRequest>(&body) {
-        Ok(request) => request,
-        Err(_) => return admin_plugin_result(1, "Invalid plugin request."),
+    let fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return admin_plugin_result(1, "Invalid plugin request."),
     };
+    let request =
+        match serde_json::from_value::<AdminPluginManageRequest>(serde_json::Value::Object(fields))
+        {
+            Ok(request) => request,
+            Err(_) => return admin_plugin_result(1, "Invalid plugin request."),
+        };
     if !crate::plugin_runtime::valid_plugin_name(&request.name) {
         return admin_plugin_result(1, "Invalid plugin name.");
     }
@@ -19999,6 +20012,32 @@ mod tests {
         assert_eq!(plugins_globals["route"], "admin/plugins/manage");
         assert_eq!(plugins_globals["extra"]["wasm_plugins"], true);
         assert_eq!(plugins_globals["extra"]["can_upload"], false);
+        let plugin_manage = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/manage?name=bad%20plugin")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("action=enable"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plugin_manage.status(), StatusCode::OK);
+        let plugin_manage: serde_json::Value = serde_json::from_slice(
+            &to_bytes(plugin_manage.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plugin_manage["code"], 1);
+        assert_eq!(plugin_manage["message"], "Invalid plugin name.");
         let denied_plugin_market =
             session_request(&app, &admin_cookie, "GET", "/admin/plugins/market", None).await;
         assert_eq!(denied_plugin_market.status(), StatusCode::FORBIDDEN);
