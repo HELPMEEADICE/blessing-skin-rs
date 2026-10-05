@@ -819,6 +819,17 @@ fn user_score_updated_event(user_id: i64, previous_score: i64, score: i64) -> se
     })
 }
 
+fn legacy_sign_is_eligible(last_sign_at: &str, eligible_before: &str) -> bool {
+    last_sign_at <= eligible_before
+}
+
+fn user_sign_plugin_event(user_id: i64, score: i64) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": user_id,
+        "score": score,
+    })
+}
+
 fn password_reset_plugin_event(user_id: i64) -> serde_json::Value {
     serde_json::json!({"user_id": user_id, "action": "password"})
 }
@@ -6912,7 +6923,6 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
         }
     };
     let (minimum, maximum) = (minimum.min(maximum), minimum.max(maximum));
-    let reward = rand::thread_rng().gen_range(minimum..=maximum);
     let now = shanghai_now();
     let eligible_before = if sign_after_zero {
         now.date().and_hms_opt(0, 0, 0).unwrap_or(now)
@@ -6921,11 +6931,27 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
     };
     let now = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let eligible_before = eligible_before.format("%Y-%m-%d %H:%M:%S").to_string();
+    if !legacy_sign_is_eligible(&user.last_sign_at, &eligible_before) {
+        return login_result(1, "", None);
+    }
+    let reward = rand::thread_rng().gen_range(minimum..=maximum);
+    emit_plugin_event(
+        &state,
+        "user.sign.before",
+        user_sign_plugin_event(user.uid, reward),
+    )
+    .await;
     match database
         .sign_user(prefix, user.uid, reward, &now, &eligible_before)
         .await
     {
         Ok(crate::database::UserSignOutcome::Signed(score)) => {
+            emit_plugin_event(
+                &state,
+                "user.sign.after",
+                user_sign_plugin_event(user.uid, reward),
+            )
+            .await;
             emit_plugin_event(
                 &state,
                 "user.score.updated",
@@ -17808,6 +17834,27 @@ mod tests {
                 "previous_score": 5,
                 "score": 15,
             })
+        );
+    }
+
+    #[test]
+    fn legacy_sign_eligibility_matches_the_database_cutoff() {
+        assert!(super::legacy_sign_is_eligible("", "2026-10-05 00:00:00"));
+        assert!(super::legacy_sign_is_eligible(
+            "2026-10-04 23:59:59",
+            "2026-10-05 00:00:00"
+        ));
+        assert!(!super::legacy_sign_is_eligible(
+            "2026-10-05 00:00:01",
+            "2026-10-05 00:00:00"
+        ));
+    }
+
+    #[test]
+    fn user_sign_plugin_events_report_the_reward_not_the_total_score() {
+        assert_eq!(
+            super::user_sign_plugin_event(7, 10),
+            serde_json::json!({ "user_id": 7, "score": 10 })
         );
     }
 

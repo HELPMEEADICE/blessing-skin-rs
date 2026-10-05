@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.7.0";
+const HOST_API_VERSION: &str = "1.8.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -39,6 +39,8 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.verification.updated",
     "user.permission.updated",
     "user.score.updated",
+    "user.sign.before",
+    "user.sign.after",
     "closet.added",
     "closet.renamed",
     "closet.removed",
@@ -933,6 +935,8 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(validate_plugin_event("user.sign.before", br#"{"user_id":7,"score":10}"#).is_ok());
+        assert!(validate_plugin_event("user.sign.after", br#"{"user_id":7,"score":10}"#).is_ok());
         assert!(
             validate_plugin_event(
                 "player.owner.updated",
