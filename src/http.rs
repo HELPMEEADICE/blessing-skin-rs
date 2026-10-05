@@ -332,16 +332,16 @@ fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
 
 async fn buffer_request_body_for_locale(
     request: axum::extract::Request,
-) -> Result<(axum::extract::Request, Option<String>), Response> {
+) -> Result<(axum::extract::Request, Option<String>, Option<String>), Response> {
     if matches!(*request.method(), Method::GET | Method::HEAD) {
-        return Ok((request, None));
+        return Ok((request, None, None));
     }
     let Some(content_type) = request
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
     else {
-        return Ok((request, None));
+        return Ok((request, None, None));
     };
     let media_type = content_type
         .split(';')
@@ -353,7 +353,7 @@ async fn buffer_request_body_for_locale(
         && !media_type.ends_with("+json")
         && media_type != "application/x-www-form-urlencoded"
     {
-        return Ok((request, None));
+        return Ok((request, None, None));
     }
 
     let (parts, request_body) = request.into_parts();
@@ -361,9 +361,17 @@ async fn buffer_request_body_for_locale(
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
     let locale = body_locale(&request_body, &media_type);
+    let form_csrf_token = (media_type == "application/x-www-form-urlencoded")
+        .then(|| {
+            form_urlencoded::parse(&request_body)
+                .filter_map(|(key, value)| (key == "_token").then(|| value.into_owned()))
+                .last()
+        })
+        .flatten();
     Ok((
         axum::extract::Request::from_parts(parts, Body::from(request_body)),
         locale,
+        form_csrf_token,
     ))
 }
 
@@ -450,7 +458,7 @@ fn add_web_csrf_to_html(html: &str, token: &str) -> String {
             .expect("CSRF meta tag expression is valid")
     });
     let meta = format!(r#"<meta name="csrf-token" content="{token}">"#);
-    let mut rendered = if pattern.is_match(html) {
+    let rendered = if pattern.is_match(html) {
         pattern.replace_all(html, meta.as_str()).into_owned()
     } else if let Some(head_end) = html.find("</head>") {
         let mut rendered = html.to_owned();
@@ -459,6 +467,30 @@ fn add_web_csrf_to_html(html: &str, token: &str) -> String {
     } else {
         html.to_owned()
     };
+    static FORM_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let form_pattern = FORM_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"(?is)<form\b[^>]*>").expect("form tag expression is valid")
+    });
+    static METHOD_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let method_pattern = METHOD_PATTERN.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bmethod\s*=\s*["']?([a-z]+)"#)
+            .expect("form method expression is valid")
+    });
+    let mut rendered = form_pattern
+        .replace_all(&rendered, |captures: &regex::Captures<'_>| {
+            let tag = captures.get(0).expect("form tag capture exists").as_str();
+            let method = method_pattern
+                .captures(tag)
+                .and_then(|captures| captures.get(1))
+                .map(|method| method.as_str().to_ascii_lowercase())
+                .unwrap_or_else(|| "get".to_owned());
+            if matches!(method.as_str(), "get" | "head" | "options") {
+                tag.to_owned()
+            } else {
+                format!("{tag}<input type=\"hidden\" name=\"_token\" value=\"{token}\">")
+            }
+        })
+        .into_owned();
     const FETCH_CSRF_BRIDGE: &str = r#"<script>(()=>{const originalFetch=window.fetch.bind(window);window.fetch=(input,init)=>{const options=init||{};const method=(options.method||(input instanceof Request?input.method:'GET')).toUpperCase();let url;try{url=new URL(input instanceof Request?input.url:String(input),window.location.href)}catch(_){return originalFetch(input,init)}if(url.origin===window.location.origin&&!['GET','HEAD','OPTIONS'].includes(method)){const headers=new Headers(input instanceof Request?input.headers:undefined);if(options.headers)new Headers(options.headers).forEach((value,key)=>headers.set(key,value));const token=document.querySelector('meta[name="csrf-token"]')?.content;if(token&&!headers.has('X-CSRF-TOKEN'))headers.set('X-CSRF-TOKEN',token);return originalFetch(input,{...options,headers})}return originalFetch(input,init)}})();</script>"#;
     if let Some(head_end) = rendered.find("</head>") {
         rendered.insert_str(head_end, FETCH_CSRF_BRIDGE);
@@ -644,10 +676,11 @@ async fn detect_locale_preference(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let (request, body_locale) = match buffer_request_body_for_locale(request).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
+    let (request, body_locale, form_csrf_token) =
+        match buffer_request_body_for_locale(request).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
     let path = request.uri().path();
     let method = request.method().clone();
     let request_headers = request.headers().clone();
@@ -659,7 +692,8 @@ async fn detect_locale_preference(
             &request_headers,
             request_headers
                 .get("X-CSRF-TOKEN")
-                .and_then(|value| value.to_str().ok()),
+                .and_then(|value| value.to_str().ok())
+                .or(form_csrf_token.as_deref()),
         )
     {
         return (
@@ -16718,11 +16752,14 @@ mod tests {
             save_label: "保存".to_owned(),
             back_label: "返回插件管理".to_owned(),
         };
-        let html = page.render().unwrap();
+        let html = super::add_web_csrf_to_html(&page.render().unwrap(), "a".repeat(48).as_str());
 
         assert!(
             html.contains("action=\"https://example.test/skin/admin/plugins/config/demo-plugin\"")
         );
+        assert!(html.contains(
+            r#"<form method="post" action="https://example.test/skin/admin/plugins/config/demo-plugin"><input type="hidden" name="_token" value=""#
+        ));
         assert!(html.contains("href=\"https://example.test/skin/admin/plugins/manage\""));
         assert!(html.contains("JSON 配置"));
         assert!(!html.contains("<script>alert(1)</script>"));
@@ -19483,6 +19520,45 @@ mod tests {
         )
         .await;
         assert_eq!(unavailable_plugin_config.status(), StatusCode::NOT_FOUND);
+        let missing_native_form_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/config/unavailable-plugin")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("configuration=%7B%7D"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_native_form_csrf.status(),
+            StatusCode::from_u16(419).unwrap()
+        );
+        let native_form_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/config/unavailable-plugin")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "configuration=%7B%7D&_token={test_csrf_token}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(native_form_csrf.status(), StatusCode::NOT_FOUND);
         let boundary = "blessing-wasm-upload-test";
         let upload_body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"broken.wasm\"\r\nContent-Type: application/wasm\r\n\r\nnot wasm\r\n--{boundary}--\r\n"
