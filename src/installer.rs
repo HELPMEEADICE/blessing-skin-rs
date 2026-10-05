@@ -133,6 +133,7 @@ pub async fn install_with_details(
         &config.database.table_prefix,
         &admin.site_name,
         site_url,
+        &config.legacy_app_version,
     )
     .await?;
     let score = initial_score(&pool, &config.database.table_prefix).await?;
@@ -371,9 +372,9 @@ async fn seed_options(
     prefix: &str,
     site_name: &str,
     site_url: &str,
+    app_version: &str,
 ) -> Result<(), sqlx::Error> {
-    let version = env!("CARGO_PKG_VERSION");
-    let announcement = format!("Welcome to Blessing Skin {version}!");
+    let announcement = format!("Welcome to Blessing Skin {app_version}!");
     let year = chrono::Utc::now().year();
     let copyright = format!(
         "<b>Copyright &copy; {year} <a href=\"{site_url}\">{site_name}</a>.</b> All rights reserved."
@@ -404,7 +405,7 @@ async fn seed_options(
         ("return_score", "true".to_owned()),
         ("score_per_player", "100".to_owned()),
         ("sign_after_zero", "false".to_owned()),
-        ("version", version.to_owned()),
+        ("version", app_version.to_owned()),
         ("copyright_text", copyright),
         ("auto_del_invalid_texture", "false".to_owned()),
         ("allow_downloading_texture", "true".to_owned()),
@@ -631,9 +632,17 @@ mod tests {
         );
         ensure_database_empty(&pool, "bs_").await.unwrap();
         initialize_schema(&pool, "bs_").await.unwrap();
-        seed_options(&pool, "bs_", "Test Skin", "https://skin.example")
+        seed_options(&pool, "bs_", "Test Skin", "https://skin.example", "6.0.2")
             .await
             .unwrap();
+        assert_eq!(
+            pool.option("bs_", "version").await.unwrap().as_deref(),
+            Some("6.0.2")
+        );
+        assert_eq!(
+            pool.option("bs_", "announcement").await.unwrap().as_deref(),
+            Some("Welcome to Blessing Skin 6.0.2!")
+        );
         let password_hash = hash_legacy_password("correct horse", "BCRYPT", "", 10).unwrap();
         let admin = Admin {
             email: "admin@example.test".to_owned(),

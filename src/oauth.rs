@@ -2018,7 +2018,8 @@ mod integration_tests {
         std::fs::write(frontend_app.join("style.012abcd.css"), b"/* test styles */").unwrap();
         let config = Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
-            version: "test",
+            rust_version: "test",
+            legacy_app_version: "test".to_owned(),
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: DatabaseConfig {

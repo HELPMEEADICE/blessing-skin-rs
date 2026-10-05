@@ -1362,7 +1362,7 @@ pub(crate) fn encode_frontend_globals(
     i18n: serde_json::Value,
 ) -> String {
     let globals = serde_json::json!({
-        "version": state.config.version,
+        "version": state.config.legacy_app_version,
         "locale": request_locale(&state),
         "base_url": request_app_url(&state).trim_end_matches('/'),
         "site_name": site_name,
@@ -4610,7 +4610,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             fields: vec![
                 AdminStatusField {
                     label: if chinese { "版本" } else { "Version" }.to_owned(),
-                    value: state.config.version.to_owned(),
+                    value: state.config.legacy_app_version.clone(),
                 },
                 AdminStatusField {
                     label: if chinese {
@@ -4753,7 +4753,7 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
         update_check_failed,
         update_check_no_release,
     ) = if let Some(api_url) = &state.config.rust_releases_api_url {
-        match crate::update::check_latest_release(api_url, state.config.version).await {
+        match crate::update::check_latest_release(api_url, state.config.rust_version).await {
             Ok(Some(release)) => (
                 release.version,
                 true,
@@ -4773,7 +4773,7 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
     let page = AdminUpdatePage {
         site_name: site_name(&state).await,
         locale: request_locale(&state),
-        version: state.config.version.to_owned(),
+        version: state.config.rust_version.to_owned(),
         latest_version,
         has_release_info,
         update_available,
@@ -8408,7 +8408,7 @@ async fn setup_welcome(State(state): State<AppState>, headers: HeaderMap) -> Res
             None,
         );
     }
-    let version = state.config.version.to_owned();
+    let version = state.config.legacy_app_version.clone();
     let assets = setup_page_assets(
         &state,
         "setup",
@@ -9187,7 +9187,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 
 #[derive(Serialize)]
 struct ApiRoot {
-    blessing_skin: &'static str,
+    blessing_skin: String,
     spec: u8,
     copyright: Option<&'static str>,
     site_name: String,
@@ -14958,7 +14958,7 @@ async fn build_api_root(database: &DatabasePool, state: &AppState) -> Result<Api
         .unwrap_or_else(|| "Blessing Skin".to_owned());
 
     Ok(ApiRoot {
-        blessing_skin: state.config.version,
+        blessing_skin: state.config.legacy_app_version.clone(),
         spec: 0,
         copyright,
         site_name,
@@ -17304,7 +17304,8 @@ mod tests {
 
         let config = crate::config::Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
-            version: "test",
+            rust_version: "test",
+            legacy_app_version: "test".to_owned(),
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
@@ -18006,7 +18007,8 @@ mod tests {
         let secret = "a test APP_KEY with enough entropy".to_owned();
         let config = crate::config::Config {
             bind: "127.0.0.1:3000".parse().unwrap(),
-            version: "test",
+            rust_version: "0.1.0-test",
+            legacy_app_version: "6.0.2".to_owned(),
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
@@ -18116,6 +18118,20 @@ mod tests {
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
+        let api_root_response = app
+            .clone()
+            .oneshot(Request::get("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(api_root_response.status(), StatusCode::OK);
+        let api_root: serde_json::Value = serde_json::from_slice(
+            &to_bytes(api_root_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(api_root["blessing_skin"], "6.0.2");
+
         let public_upload = app
             .clone()
             .oneshot(

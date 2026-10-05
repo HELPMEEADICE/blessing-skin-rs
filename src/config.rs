@@ -6,6 +6,7 @@ use thiserror::Error;
 const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
 const DEFAULT_RUST_RELEASES_API_URL: &str =
     "https://api.github.com/repos/HELPMEEADICE/blessing-skin-rs/releases/latest";
+const DEFAULT_LEGACY_APP_VERSION: &str = "6.0.2";
 
 /// Read an environment value using Laravel's reserved `.env` value semantics.
 /// Laravel's `Env::get` converts `null` and `(null)` to `None`, and `empty` and
@@ -43,7 +44,8 @@ fn is_legacy_false(value: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
-    pub version: &'static str,
+    pub rust_version: &'static str,
+    pub legacy_app_version: String,
     pub locale: String,
     pub fallback_locale: String,
     pub database: DatabaseConfig,
@@ -147,7 +149,8 @@ impl Config {
 
         Ok(Self {
             bind,
-            version: env!("CARGO_PKG_VERSION"),
+            rust_version: env!("CARGO_PKG_VERSION"),
+            legacy_app_version: legacy_app_version(legacy_env("BS_LEGACY_APP_VERSION")),
             locale: legacy_env("APP_LOCALE").unwrap_or_else(|| "zh_CN".to_owned()),
             fallback_locale: legacy_env("APP_FALLBACK_LOCALE").unwrap_or_else(|| "en".to_owned()),
             database: DatabaseConfig::from_env(table_prefix)?,
@@ -178,6 +181,13 @@ impl Config {
             mail: MailConfig::from_env(),
         })
     }
+}
+
+fn legacy_app_version(value: Option<String>) -> String {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_LEGACY_APP_VERSION.to_owned())
 }
 
 impl MailConfig {
@@ -545,8 +555,8 @@ fn valid_table_prefix(prefix: &str) -> bool {
 mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
-        mysql_connect_options, parse_bcrypt_rounds, parse_legacy_env_os, parse_legacy_env_value,
-        valid_table_prefix, with_mysql_ssl_ca,
+        legacy_app_version, mysql_connect_options, parse_bcrypt_rounds, parse_legacy_env_os,
+        parse_legacy_env_value, valid_table_prefix, with_mysql_ssl_ca,
     };
     use sqlx::{ConnectOptions, mysql::MySqlConnectOptions};
     use std::{ffi::OsString, path::Path};
@@ -557,6 +567,13 @@ mod tests {
             .query_pairs()
             .find(|(name, _)| name == "ssl-ca")
             .map(|(_, value)| value.strip_prefix("file: ").unwrap_or(&value).to_owned())
+    }
+
+    #[test]
+    fn legacy_application_version_defaults_to_php_and_supports_overrides() {
+        assert_eq!(legacy_app_version(None), "6.0.2");
+        assert_eq!(legacy_app_version(Some(" 6.1.0 ".to_owned())), "6.1.0");
+        assert_eq!(legacy_app_version(Some(String::new())), "6.0.2");
     }
 
     #[test]
