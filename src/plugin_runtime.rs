@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.18.0";
+const HOST_API_VERSION: &str = "1.19.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -37,6 +37,16 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.registered",
     "user.profile.updated",
     "user.profile.updating",
+    "user.email.updating",
+    "user.email.updated",
+    "user.nickname.updating",
+    "user.nickname.updated",
+    "user.password.updating",
+    "user.password.updated",
+    "user.verification.updating",
+    "user.score.updating",
+    "user.permission.updating",
+    "user.banned",
     "user.avatar.updated",
     "user.avatar.updating",
     "user.deleted",
@@ -1169,6 +1179,23 @@ mod tests {
             .is_ok()
         );
         assert!(validate_plugin_event("user.deleting", br#"{"user_id":7}"#).is_ok());
+        for name in [
+            "user.email.updating",
+            "user.email.updated",
+            "user.nickname.updating",
+            "user.nickname.updated",
+            "user.password.updating",
+            "user.password.updated",
+            "user.verification.updating",
+            "user.score.updating",
+            "user.permission.updating",
+            "user.banned",
+        ] {
+            assert!(
+                validate_plugin_event(name, br#"{"user_id":7}"#).is_ok(),
+                "{name}"
+            );
+        }
         assert!(
             validate_plugin_event(
                 "player.renamed",

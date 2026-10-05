@@ -13940,6 +13940,12 @@ async fn apply_admin_user_mutation(
                     return unavailable();
                 }
             }
+            emit_plugin_event(
+                state,
+                "user.email.updating",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
             if let Err(error) = database
                 .update_user_text(
                     &state.config.database.table_prefix,
@@ -13954,6 +13960,12 @@ async fn apply_admin_user_mutation(
             }
             emit_plugin_event(
                 state,
+                "user.email.updated",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
+            emit_plugin_event(
+                state,
                 "user.profile.updated",
                 serde_json::json!({"user_id": target_uid, "action": "email"}),
             )
@@ -13961,6 +13973,12 @@ async fn apply_admin_user_mutation(
             admin_user_success(AdminUserMutation::Email, &request_locale(&state), None)
         }
         AdminUserMutation::Verification => {
+            emit_plugin_event(
+                state,
+                "user.verification.updating",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
             if let Err(error) = database
                 .toggle_user_verification(&state.config.database.table_prefix, target_uid)
                 .await
@@ -13999,6 +14017,12 @@ async fn apply_admin_user_mutation(
                     &request_locale(&state),
                 );
             };
+            emit_plugin_event(
+                state,
+                "user.nickname.updating",
+                serde_json::json!({"user_id": target_uid, "nickname": nickname}),
+            )
+            .await;
             if let Err(error) = database
                 .update_user_text(
                     &state.config.database.table_prefix,
@@ -14011,6 +14035,16 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user nickname");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.nickname.updated",
+                serde_json::json!({
+                    "user_id": target_uid,
+                    "previous_nickname": target.nickname,
+                    "nickname": nickname,
+                }),
+            )
+            .await;
             emit_plugin_event(
                 state,
                 "user.profile.updated",
@@ -14048,6 +14082,12 @@ async fn apply_admin_user_mutation(
                 tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
                 return unavailable();
             };
+            emit_plugin_event(
+                state,
+                "user.password.updating",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
             if let Err(error) = database
                 .update_user_text(
                     &state.config.database.table_prefix,
@@ -14060,6 +14100,12 @@ async fn apply_admin_user_mutation(
                 tracing::error!(%error, target_uid, "failed to update user password");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "user.password.updated",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
             emit_plugin_event(
                 state,
                 "user.profile.updated",
@@ -14077,6 +14123,12 @@ async fn apply_admin_user_mutation(
             else {
                 return admin_user_validation_error("score", "integer", &request_locale(&state));
             };
+            emit_plugin_event(
+                state,
+                "user.score.updating",
+                serde_json::json!({"user_id": target_uid, "previous_score": target.score, "score": score}),
+            )
+            .await;
             if let Err(error) = database
                 .update_user_integer(
                     &state.config.database.table_prefix,
@@ -14110,6 +14162,16 @@ async fn apply_admin_user_mutation(
             if target_uid == actor_uid || (permission == 1 && actor_permission < 2) {
                 return admin_user_permission_error(&request_locale(&state));
             }
+            emit_plugin_event(
+                state,
+                "user.permission.updating",
+                serde_json::json!({
+                    "user_id": target_uid,
+                    "previous_permission": target.permission,
+                    "permission": permission,
+                }),
+            )
+            .await;
             if let Err(error) = database
                 .update_user_integer(
                     &state.config.database.table_prefix,
@@ -14121,6 +14183,14 @@ async fn apply_admin_user_mutation(
             {
                 tracing::error!(%error, target_uid, "failed to update user permission");
                 return unavailable();
+            }
+            if permission == -1 {
+                emit_plugin_event(
+                    state,
+                    "user.banned",
+                    serde_json::json!({"user_id": target_uid}),
+                )
+                .await;
             }
             emit_plugin_event(
                 state,
@@ -14134,25 +14204,33 @@ async fn apply_admin_user_mutation(
             .await;
             admin_user_success(AdminUserMutation::Permission, &request_locale(&state), None)
         }
-        AdminUserMutation::Delete => match database
-            .delete_user(&state.config.database.table_prefix, target_uid)
-            .await
-        {
-            Ok(true) => {
-                emit_plugin_event(
-                    state,
-                    "user.deleted",
-                    serde_json::json!({"user_id": target_uid}),
-                )
-                .await;
-                admin_user_success(AdminUserMutation::Delete, &request_locale(&state), None)
+        AdminUserMutation::Delete => {
+            emit_plugin_event(
+                state,
+                "user.deleting",
+                serde_json::json!({"user_id": target_uid}),
+            )
+            .await;
+            match database
+                .delete_user(&state.config.database.table_prefix, target_uid)
+                .await
+            {
+                Ok(true) => {
+                    emit_plugin_event(
+                        state,
+                        "user.deleted",
+                        serde_json::json!({"user_id": target_uid}),
+                    )
+                    .await;
+                    admin_user_success(AdminUserMutation::Delete, &request_locale(&state), None)
+                }
+                Ok(false) => StatusCode::NOT_FOUND.into_response(),
+                Err(error) => {
+                    tracing::error!(%error, target_uid, "failed to delete user");
+                    unavailable()
+                }
             }
-            Ok(false) => StatusCode::NOT_FOUND.into_response(),
-            Err(error) => {
-                tracing::error!(%error, target_uid, "failed to delete user");
-                unavailable()
-            }
-        },
+        }
     }
 }
 
