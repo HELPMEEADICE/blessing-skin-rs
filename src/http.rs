@@ -7188,6 +7188,7 @@ async fn web_clear_player_textures(
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
     Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -7196,12 +7197,13 @@ async fn web_clear_player_textures(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let clear_type = |kind: &str| {
-        query.contains_key(kind)
-            || query
-                .get("type")
-                .is_some_and(|types| types.split(',').any(|value| value == kind))
-    };
+    let (clear_skin, clear_cape) = web_player_texture_clear_flags(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -7210,8 +7212,8 @@ async fn web_clear_player_textures(
             &state.config.database.table_prefix,
             user.uid,
             player_id,
-            clear_type("skin"),
-            clear_type("cape"),
+            clear_skin,
+            clear_cape,
         )
         .await;
     match result {
@@ -7225,6 +7227,69 @@ async fn web_clear_player_textures(
         }
         result => player_texture_response(result, &request_locale(&state), true),
     }
+}
+
+fn web_player_texture_clear_flags(
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (bool, bool) {
+    let mut skin = query.contains_key("skin");
+    let mut cape = query.contains_key("cape");
+    let mut types = Vec::new();
+    if let Some(value) = query.get("type") {
+        types.extend(value.split(',').map(str::to_owned));
+    }
+    if let Some(value) = query.get("type[]") {
+        types.push(value.clone());
+    }
+
+    let media_type = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+    {
+        if let Ok(serde_json::Value::Object(fields)) =
+            serde_json::from_slice::<serde_json::Value>(body)
+        {
+            skin |= fields.contains_key("skin");
+            cape |= fields.contains_key("cape");
+            match fields.get("type") {
+                Some(serde_json::Value::Array(values)) => {
+                    types.extend(
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+                Some(serde_json::Value::String(value)) => {
+                    types.extend(value.split(',').map(str::to_owned));
+                }
+                _ => {}
+            }
+        }
+    } else if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        for (key, value) in form_urlencoded::parse(body) {
+            match key.as_ref() {
+                "skin" => skin = true,
+                "cape" => cape = true,
+                "type" | "type[]" => {
+                    types.extend(value.split(',').map(str::to_owned));
+                }
+                key if key.starts_with("type[") => types.push(value.into_owned()),
+                _ => {}
+            }
+        }
+    }
+
+    skin |= types.iter().any(|value| value == "skin");
+    cape |= types.iter().any(|value| value == "cape");
+    (skin, cape)
 }
 
 async fn web_delete_player(
@@ -17177,6 +17242,29 @@ mod tests {
         assert!(!super::legacy_option_bool(None));
     }
     #[test]
+    fn web_player_texture_clear_flags_read_query_json_and_form_inputs() {
+        use std::collections::BTreeMap;
+
+        let query = BTreeMap::from([("skin".to_owned(), "true".to_owned())]);
+        assert_eq!(
+            super::web_player_texture_clear_flags(
+                &query,
+                br#"{"type":["cape"]}"#,
+                Some("application/json")
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            super::web_player_texture_clear_flags(
+                &BTreeMap::new(),
+                b"type%5B%5D=skin&cape=false",
+                Some("application/x-www-form-urlencoded"),
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn parses_legacy_texture_ids_and_clear_request_shapes() {
         use serde_json::json;
 
@@ -21059,6 +21147,32 @@ mod tests {
         assert_eq!(cleared_texture["code"], 0);
         assert_eq!(cleared_texture["data"]["tid_skin"], 0);
         assert_eq!(cleared_texture["data"]["tid_cape"], 0);
+
+        let reapplied_texture = session_request(
+            &app,
+            &registered_cookie,
+            "PUT",
+            &format!("/user/player/{added_pid}/textures"),
+            Some(r#"{"skin":2}"#),
+        )
+        .await;
+        assert_eq!(reapplied_texture.status(), StatusCode::OK);
+        let cleared_texture_from_body = session_request(
+            &app,
+            &registered_cookie,
+            "DELETE",
+            &format!("/user/player/{added_pid}/textures"),
+            Some(r#"{"type":["skin"]}"#),
+        )
+        .await;
+        let cleared_texture_from_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cleared_texture_from_body.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleared_texture_from_body["code"], 0);
+        assert_eq!(cleared_texture_from_body["data"]["tid_skin"], 0);
 
         let deleted_player = session_request(
             &app,
