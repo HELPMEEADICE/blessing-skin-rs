@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 use crate::database::DatabasePool;
 
 use wasmtime::{
@@ -12,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.28.0";
+const HOST_API_VERSION: &str = "1.29.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -21,6 +23,7 @@ const PLUGIN_FILTERS_INTERFACE: &str = "blessing-skin:plugin/filters@1.0.0";
 const PLUGIN_DOCUMENTATION_INTERFACE: &str = "blessing-skin:plugin/documentation@1.0.0";
 const PLUGIN_CONFIGURATION_INTERFACE: &str = "blessing-skin:plugin/configuration@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
+const COMPONENT_BINARY_FILTER_FUEL: u64 = 100_000_000;
 const COMPONENT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const PLUGIN_LOG_MESSAGE_LIMIT: usize = 4 * 1024;
 const PLUGIN_STATE_KEY_LIMIT: usize = 128;
@@ -29,6 +32,8 @@ const PLUGIN_STATE_ENTRY_LIMIT: usize = 256;
 const PLUGIN_STATE_TOTAL_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
 const PLUGIN_FILTER_VALUE_LIMIT: usize = 64 * 1024;
+pub const PLUGIN_FILTER_FILE_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+const PLUGIN_FILTER_FILE_VALUE_LIMIT: usize = PLUGIN_FILTER_FILE_BYTES_LIMIT.div_ceil(3) * 4 + 2;
 const PLUGIN_CONFIGURATION_LIMIT: usize = 64 * 1024;
 const PLUGIN_README_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
@@ -825,6 +830,7 @@ fn validate_plugin_filter(
             | "can_upload_texture"
             | "uploaded_texture_name"
             | "uploaded_texture_hash"
+            | "uploaded_texture_file"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -834,10 +840,13 @@ fn validate_plugin_filter(
     validate_plugin_filter_value(name, value)?;
     for (label, value) in [("value", value), ("context", context)] {
         let encoded = serde_json::to_vec(value).map_err(|_| "plugin filter input is not JSON")?;
-        if encoded.len() > PLUGIN_FILTER_VALUE_LIMIT {
-            return Err(format!(
-                "plugin filter {label} exceeds {PLUGIN_FILTER_VALUE_LIMIT} bytes"
-            ));
+        let value_limit = if name == "uploaded_texture_file" && label == "value" {
+            PLUGIN_FILTER_FILE_VALUE_LIMIT
+        } else {
+            PLUGIN_FILTER_VALUE_LIMIT
+        };
+        if encoded.len() > value_limit {
+            return Err(format!("plugin filter {label} exceeds {value_limit} bytes"));
         }
     }
     Ok(())
@@ -866,6 +875,16 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             Ok(())
         }
         "new_player_name" | "uploaded_texture_name" if value.is_string() => Ok(()),
+        "uploaded_texture_file"
+            if value.as_str().is_some_and(|encoded| {
+                encoded.len() <= PLUGIN_FILTER_FILE_VALUE_LIMIT
+                    && STANDARD
+                        .decode(encoded)
+                        .is_ok_and(|bytes| bytes.len() <= PLUGIN_FILTER_FILE_BYTES_LIMIT)
+            }) =>
+        {
+            Ok(())
+        }
         "uploaded_texture_hash"
             if value.as_str().is_some_and(|hash| {
                 hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
@@ -896,6 +915,9 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "uploaded_texture_hash" => {
             Err("uploaded_texture_hash must return 64 hexadecimal characters".to_owned())
         }
+        "uploaded_texture_file" => {
+            Err("uploaded_texture_file must return bounded standard base64 PNG bytes".to_owned())
+        }
         "sign_score" => Err("sign_score filters must return a signed integer".to_owned()),
         _ => Err("unsupported plugin filter name".to_owned()),
     }
@@ -923,7 +945,11 @@ fn invoke_plugin_filter(
         .map_err(|error| error.to_string())?;
     plugin
         .store
-        .set_fuel(COMPONENT_FUEL)
+        .set_fuel(if name == "uploaded_texture_file" {
+            COMPONENT_BINARY_FILTER_FUEL
+        } else {
+            COMPONENT_FUEL
+        })
         .map_err(|error| error.to_string())?;
     let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
     let context = serde_json::to_string(context).map_err(|error| error.to_string())?;
@@ -934,10 +960,13 @@ fn invoke_plugin_filter(
     else {
         return Ok(None);
     };
-    if filtered.len() > PLUGIN_FILTER_VALUE_LIMIT {
-        return Err(format!(
-            "plugin filter result exceeds {PLUGIN_FILTER_VALUE_LIMIT} bytes"
-        ));
+    let result_limit = if name == "uploaded_texture_file" {
+        PLUGIN_FILTER_FILE_VALUE_LIMIT
+    } else {
+        PLUGIN_FILTER_VALUE_LIMIT
+    };
+    if filtered.len() > result_limit {
+        return Err(format!("plugin filter result exceeds {result_limit} bytes"));
     }
     let filtered: serde_json::Value = serde_json::from_str(&filtered)
         .map_err(|_| "plugin filter result must be UTF-8 JSON".to_owned())?;
@@ -1129,11 +1158,12 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_FILTER_VALUE_LIMIT,
-        PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore,
-        StoreLimitsBuilder, checkpoint_plugin_state, log_plugin_message, plugin_state_delete,
-        plugin_state_get, plugin_state_set, validate_plugin_configuration, validate_plugin_event,
-        validate_plugin_filter, validate_plugin_filter_value, validated_plugin_state,
+        PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_FILTER_FILE_BYTES_LIMIT,
+        PLUGIN_FILTER_VALUE_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT,
+        PluginRuntime, PluginStore, StoreLimitsBuilder, checkpoint_plugin_state,
+        log_plugin_message, plugin_state_delete, plugin_state_get, plugin_state_set,
+        validate_plugin_configuration, validate_plugin_event, validate_plugin_filter,
+        validate_plugin_filter_value, validated_plugin_state,
     };
     use std::{
         collections::HashMap,
@@ -1594,6 +1624,43 @@ mod tests {
         );
         assert!(
             validate_plugin_filter_value("uploaded_texture_hash", &serde_json::json!("../outside"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uploaded_texture_file_filter_is_binary_safe_and_bounded() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let context = serde_json::json!({"file": {"size": 3}});
+        let encoded = STANDARD.encode(b"png");
+        assert!(
+            validate_plugin_filter(
+                "uploaded_texture_file",
+                &serde_json::json!(encoded),
+                &context
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "uploaded_texture_file",
+                &serde_json::json!("not base64!")
+            )
+            .is_err()
+        );
+        let maximum_size = STANDARD.encode(vec![0; PLUGIN_FILTER_FILE_BYTES_LIMIT]);
+        assert!(
+            validate_plugin_filter(
+                "uploaded_texture_file",
+                &serde_json::json!(maximum_size),
+                &context
+            )
+            .is_ok()
+        );
+        let oversized = STANDARD.encode(vec![0; PLUGIN_FILTER_FILE_BYTES_LIMIT + 1]);
+        assert!(
+            validate_plugin_filter_value("uploaded_texture_file", &serde_json::json!(oversized))
                 .is_err()
         );
     }

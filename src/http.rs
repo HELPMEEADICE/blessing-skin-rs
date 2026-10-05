@@ -28,7 +28,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, delete, get, post, put},
 };
-use base64::Engine as _;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use fancy_regex::{BytesMode, RegexBuilder as FancyRegexBuilder};
 use hmac::{Hmac, Mac};
@@ -12779,7 +12779,7 @@ async fn upload_texture(
     else {
         return upload_validation_error("name", &request_locale(&state));
     };
-    let Some(file_bytes) = file_bytes.filter(|bytes: &Vec<u8>| !bytes.is_empty()) else {
+    let Some(mut file_bytes) = file_bytes.filter(|bytes: &Vec<u8>| !bytes.is_empty()) else {
         return upload_validation_error("file", &request_locale(&state));
     };
     let Some(texture_type) = texture_type else {
@@ -12810,6 +12810,36 @@ async fn upload_texture(
             return upload_validation_error("name", &request_locale(&state));
         }
     }
+    let max_upload_kb = match database
+        .option(&state.config.database.table_prefix, "max_upload_file_size")
+        .await
+    {
+        Ok(value) => legacy_option_integer(value.as_deref(), 1024).max(0),
+        Err(error) => {
+            tracing::error!(%error, "failed to read maximum texture upload size");
+            return unavailable();
+        }
+    };
+    if file_bytes.len() as u64 > max_upload_kb.saturating_mul(1024) as u64 {
+        return upload_validation_error("file", &request_locale(&state));
+    }
+    if file_bytes.len() <= crate::plugin_runtime::PLUGIN_FILTER_FILE_BYTES_LIMIT {
+        let encoded_file = STANDARD.encode(&file_bytes);
+        let filtered_file = apply_plugin_filter_value(
+            &state,
+            "uploaded_texture_file",
+            &serde_json::json!(encoded_file),
+            &serde_json::json!({"file": {"name": file_name, "size": file_bytes.len(), "mime_type": "image/png"}}),
+        )
+        .await;
+        let Some(encoded_file) = filtered_file.as_str() else {
+            return upload_validation_error("file", &request_locale(&state));
+        };
+        let Ok(filtered_file) = STANDARD.decode(encoded_file) else {
+            return upload_validation_error("file", &request_locale(&state));
+        };
+        file_bytes = filtered_file;
+    }
     let file_context = serde_json::json!({
         "name": file_name,
         "size": file_bytes.len(),
@@ -12832,19 +12862,6 @@ async fn upload_texture(
     .await;
     if let Some(reason) = plugin_filter_rejection(&can_upload) {
         return login_result(1, reason, None);
-    }
-    let max_upload_kb = match database
-        .option(&state.config.database.table_prefix, "max_upload_file_size")
-        .await
-    {
-        Ok(value) => legacy_option_integer(value.as_deref(), 1024).max(0),
-        Err(error) => {
-            tracing::error!(%error, "failed to read maximum texture upload size");
-            return unavailable();
-        }
-    };
-    if file_bytes.len() as u64 > max_upload_kb.saturating_mul(1024) as u64 {
-        return upload_validation_error("file", &request_locale(&state));
     }
     let Some((width, height)) = png_dimensions(&file_bytes) else {
         return upload_validation_error("file", &request_locale(&state));
