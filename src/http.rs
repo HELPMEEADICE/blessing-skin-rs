@@ -2364,6 +2364,7 @@ async fn handle_forgot(
         }
         Err(response) => return response,
     }
+    emit_plugin_event(&state, "auth.forgot.attempt", serde_json::json!({})).await;
     let ip = registration_client_ip(&headers);
     let key = format!("forgot:{ip}");
     if reserve_mail_limit(&state, &key, Duration::from_secs(180)).is_err() {
@@ -2400,6 +2401,12 @@ async fn handle_forgot(
             return unavailable();
         }
     };
+    emit_plugin_event(
+        &state,
+        "auth.forgot.ready",
+        serde_json::json!({"user_id": uid}),
+    )
+    .await;
     let Some(path) = signed_relative_url(
         &state,
         &format!("/auth/reset/{uid}"),
@@ -2425,16 +2432,30 @@ async fn handle_forgot(
         format!("Reset your {site_name} password")
     };
     match crate::mailer::send_email(&state.config.mail, email, &subject, &body).await {
-        Ok(()) => login_result(
-            0,
-            &auth_message(
+        Ok(()) => {
+            emit_plugin_event(
                 &state,
-                "重置邮件已发送，请检查收件箱。",
-                "Mail sent, please check your inbox. The link will be expired in 1 hour.",
-            ),
-            None,
-        ),
+                "auth.forgot.sent",
+                serde_json::json!({"user_id": uid}),
+            )
+            .await;
+            login_result(
+                0,
+                &auth_message(
+                    &state,
+                    "重置邮件已发送，请检查收件箱。",
+                    "Mail sent, please check your inbox. The link will be expired in 1 hour.",
+                ),
+                None,
+            )
+        }
         Err(error) => {
+            emit_plugin_event(
+                &state,
+                "auth.forgot.failed",
+                serde_json::json!({"user_id": uid}),
+            )
+            .await;
             release_mail_limit(&state, &key);
             tracing::warn!(%error, recipient = %email, "failed to send password reset email");
             let message = forgot_password_failure_message(&request_locale(&state), &error);
@@ -2598,6 +2619,12 @@ async fn handle_password_reset(
             return unavailable();
         }
     }
+    emit_plugin_event(
+        &state,
+        "auth.reset.before",
+        serde_json::json!({"user_id": uid}),
+    )
+    .await;
     let Some(password_hash) = hash_legacy_password(
         password,
         &state.config.password_method,
@@ -2619,6 +2646,12 @@ async fn handle_password_reset(
         tracing::error!(%error, uid, "failed to update password through reset link");
         return unavailable();
     }
+    emit_plugin_event(
+        &state,
+        "auth.reset.after",
+        serde_json::json!({"user_id": uid}),
+    )
+    .await;
     emit_plugin_event(
         &state,
         "user.profile.updated",
