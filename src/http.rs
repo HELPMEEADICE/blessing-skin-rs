@@ -14867,6 +14867,7 @@ async fn web_review_report(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(id): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let Some(user_id) = session_user_id(&state, &headers) else {
@@ -14880,7 +14881,18 @@ async fn web_review_report(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            return review_report_action(&state, id, &body, user.uid, user.permission).await;
+            return review_report_action(
+                &state,
+                id,
+                &query,
+                &body,
+                headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                user.uid,
+                user.permission,
+            )
+            .await;
         }
         Ok(Some(_)) => {
             return (
@@ -14901,6 +14913,7 @@ async fn api_review_report(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(id): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -14918,8 +14931,18 @@ async fn api_review_report(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            return review_report_action(&state, id, &body, identity.user_id, user.permission)
-                .await;
+            return review_report_action(
+                &state,
+                id,
+                &query,
+                &body,
+                headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                identity.user_id,
+                user.permission,
+            )
+            .await;
         }
         Ok(Some(_)) | Ok(None) => {
             return (
@@ -14938,11 +14961,15 @@ async fn api_review_report(
 async fn review_report_action(
     state: &AppState,
     id: i64,
+    query: &BTreeMap<String, String>,
     body: &[u8],
+    content_type: Option<&str>,
     admin_user_id: i64,
     admin_permission: i32,
 ) -> Response {
-    let request = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let request = parse_legacy_input_object(query, body, content_type)
+        .ok()
+        .map(serde_json::Value::Object);
     let Some(action) = request
         .as_ref()
         .and_then(|request| request.get("action"))
@@ -23168,6 +23195,35 @@ mod tests {
         );
         assert!(report_page["links"].as_array().is_some());
 
+        let invalid_review_query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/reports/1?action=invalid")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_review_query.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let invalid_review_query: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_review_query.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(invalid_review_query["errors"]["action"].is_array());
+
         let rejected = app
             .clone()
             .oneshot(
@@ -23179,8 +23235,8 @@ mod tests {
                         format!("{}; {}", cookie.clone(), test_csrf_cookie),
                     )
                     .header("x-csrf-token", test_csrf_token.as_str())
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"action":"reject"}"#))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("action=reject"))
                     .unwrap(),
             )
             .await
