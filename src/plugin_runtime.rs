@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.36.0";
+const HOST_API_VERSION: &str = "1.38.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -843,6 +843,8 @@ fn validate_plugin_filter(
             | "head_links"
             | "user_badges"
             | "user_avatar"
+            | "auth_page_rows:login"
+            | "auth_page_rows:register"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -968,9 +970,44 @@ fn valid_plugin_head_link(value: &serde_json::Value) -> bool {
     true
 }
 
+fn valid_auth_page_rows(name: &str, value: &serde_json::Value) -> bool {
+    let allowed: &[&str] = match name {
+        "auth_page_rows:login" => &[
+            "auth.rows.login.notice",
+            "auth.rows.login.message",
+            "auth.rows.login.form",
+            "auth.rows.login.registration-link",
+        ],
+        "auth_page_rows:register" => &["auth.rows.register.notice", "auth.rows.register.form"],
+        _ => return false,
+    };
+    let Some(rows) = value.as_array() else {
+        return false;
+    };
+    if rows.len() > allowed.len() {
+        return false;
+    }
+    let mut seen = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(row) = row.as_str() else {
+            return false;
+        };
+        if !allowed.contains(&row) || seen.contains(&row) {
+            return false;
+        }
+        seen.push(row);
+    }
+    true
+}
+
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
         "can_register" => Ok(()),
+        "auth_page_rows:login" | "auth_page_rows:register"
+            if valid_auth_page_rows(name, value) =>
+        {
+            Ok(())
+        }
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
@@ -1077,6 +1114,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "user_badges" => Err(
             "user_badges must return up to 64 objects with bounded text and CSS-safe color fields"
+                .to_owned(),
+        ),
+        "auth_page_rows:login" | "auth_page_rows:register" => Err(
+            "auth_page_rows must return a unique subset of the built-in page row identifiers"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1644,6 +1685,39 @@ mod tests {
             validate_plugin_filter("can_add_player", &serde_json::json!(true), &context).is_ok()
         );
         assert!(validate_plugin_filter("can_register", &serde_json::Value::Null, &context).is_ok());
+        assert!(
+            validate_plugin_filter(
+                "auth_page_rows:login",
+                &serde_json::json!([
+                    "auth.rows.login.notice",
+                    "auth.rows.login.form",
+                    "auth.rows.login.registration-link"
+                ]),
+                &serde_json::json!({})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "auth_page_rows:register",
+                &serde_json::json!(["auth.rows.register.form"])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "auth_page_rows:login",
+                &serde_json::json!(["auth.rows.login.form", "auth.rows.login.form"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "auth_page_rows:register",
+                &serde_json::json!(["plugin.custom.twig"])
+            )
+            .is_err()
+        );
         assert!(validate_plugin_filter("head_links", &serde_json::json!([]), &context).is_ok());
         assert!(
             validate_plugin_filter(

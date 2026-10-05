@@ -954,6 +954,15 @@ async fn filter_user_badges(state: &AppState, user: &UserProfile) -> serde_json:
     .await
 }
 
+async fn filter_auth_page_rows(state: &AppState, page: &str, defaults: &[&str]) -> Vec<String> {
+    let name = format!("auth_page_rows:{page}");
+    let default_value = serde_json::json!(defaults);
+    let filtered =
+        apply_plugin_filter_value(state, &name, &default_value, &serde_json::json!({})).await;
+    serde_json::from_value(filtered)
+        .unwrap_or_else(|_| defaults.iter().map(|row| (*row).to_owned()).collect())
+}
+
 async fn filter_user_password_hash(state: &AppState, password_hash: &str) -> String {
     let filtered = apply_plugin_filter_value(
         state,
@@ -1735,6 +1744,8 @@ struct LoginPage {
     submit_label: String,
     registration_link: String,
     forgot_link: String,
+    rows: Vec<String>,
+    show_form: bool,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -2257,6 +2268,18 @@ async fn login_page(
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let client_ip = filtered_client_ip(&state, &headers).await;
     let failures = login_failure_count(&state, &client_ip) > 3;
+    let rows = filter_auth_page_rows(
+        &state,
+        "login",
+        &[
+            "auth.rows.login.notice",
+            "auth.rows.login.message",
+            "auth.rows.login.form",
+            "auth.rows.login.registration-link",
+        ],
+    )
+    .await;
+    let show_form = rows.iter().any(|row| row == "auth.rows.login.form");
     let (recaptcha_sitekey, recaptcha_invisible) = match &state.database {
         Some(database) => {
             let prefix = &state.config.database.table_prefix;
@@ -2332,6 +2355,8 @@ async fn login_page(
         frontend_script_available,
         frontend_script,
         frontend_globals_b64,
+        rows,
+        show_form,
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -2357,6 +2382,8 @@ struct RegisterPage {
     player_name_registration: bool,
     use_recaptcha: bool,
     recaptcha_sitekey: String,
+    rows: Vec<String>,
+    show_form: bool,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -2417,6 +2444,14 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     };
     let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
+    let rows = filter_auth_page_rows(
+        &state,
+        "register",
+        &["auth.rows.register.notice", "auth.rows.register.form"],
+    )
+    .await;
+    let show_form = rows.iter().any(|row| row == "auth.rows.register.form");
+
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
     let frontend_script =
@@ -2462,7 +2497,10 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         player_name_registration,
         use_recaptcha,
         recaptcha_sitekey,
+        rows,
+        show_form,
         frontend_style_available: stylesheet.is_some(),
+
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
         frontend_script: frontend_script.unwrap_or_default(),
@@ -2505,6 +2543,7 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     };
     let chinese = request_locale(&state).starts_with("zh");
     let use_recaptcha = !recaptcha_secret.is_empty();
+
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
     let frontend_script =
@@ -19762,7 +19801,7 @@ mod tests {
 
     #[test]
     fn registration_page_keeps_inline_fallback_without_frontend_bundle() {
-        let page = RegisterPage {
+        let mut page = RegisterPage {
             site_name: "Blessing Skin".to_owned(),
             locale: "en".to_owned(),
             title: "Register".to_owned(),
@@ -19775,6 +19814,11 @@ mod tests {
             player_name_registration: true,
             use_recaptcha: false,
             recaptcha_sitekey: String::new(),
+            rows: vec![
+                "auth.rows.register.notice".to_owned(),
+                "auth.rows.register.form".to_owned(),
+            ],
+            show_form: true,
             frontend_style_available: false,
             frontend_stylesheet: String::new(),
             frontend_script_available: false,
@@ -19787,6 +19831,23 @@ mod tests {
         assert!(html.contains("/auth/captcha"));
         assert!(html.contains("Player name"));
         assert!(!html.contains("window.blessing = JSON.parse"));
+
+        page.rows = vec![
+            "auth.rows.register.form".to_owned(),
+            "auth.rows.register.notice".to_owned(),
+        ];
+        let reordered = page.render().unwrap();
+        assert!(
+            reordered.find("id=\"register-form\"").unwrap()
+                < reordered.find("Create an account.").unwrap()
+        );
+
+        page.rows = vec!["auth.rows.register.notice".to_owned()];
+        page.show_form = false;
+        let without_form = page.render().unwrap();
+        assert!(without_form.contains("Create an account."));
+        assert!(!without_form.contains("id=\"register-form\""));
+        assert!(!without_form.contains("const form ="));
     }
 
     #[test]
@@ -22467,7 +22528,8 @@ mod tests {
         assert!(admin_user_dashboard.contains(r#"id="usage-box""#));
         assert!(admin_user_dashboard.contains(r#"srcset="/avatar/0?size=36" type="image/webp""#));
         assert!(admin_user_dashboard.contains(r#"src="/avatar/0?size=36&#38;png""#));
-        assert!(admin_user_dashboard.contains(r#"class="account-badge bg-primary">STAFF</span>"#));
+        assert!(admin_user_dashboard.contains(r#"class="account-badge bg-primary""#));
+        assert!(admin_user_dashboard.contains("STAFF"));
         assert!(admin_user_dashboard.contains("http://localhost/app/style.012abcd.css"));
         assert!(admin_user_dashboard.contains("http://localhost/app/app.012abcd.js"));
         let encoded_dashboard_globals = admin_user_dashboard

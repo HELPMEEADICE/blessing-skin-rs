@@ -1,75 +1,173 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ locale }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="csrf-token" content="">
-  <title>{{ title }} - {{ site_name }}</title>
-  <style>
-    body { background: #f4f6f9; color: #343a40; font: 16px system-ui, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; }
-    main { background: white; border-radius: 8px; box-shadow: 0 8px 28px #0002; box-sizing: border-box; max-width: 420px; padding: 2rem; width: calc(100% - 2rem); }
-    h1 { font-size: 1.6rem; margin: 0 0 .4rem; } p { color: #667085; margin: 0 0 1.5rem; }
-    label { display: block; font-weight: 600; margin: 1rem 0 .4rem; }
-    input[type=text], input[type=password] { border: 1px solid #c9ced6; border-radius: 4px; box-sizing: border-box; font: inherit; padding: .7rem; width: 100%; }
-    .remember { align-items: center; display: flex; gap: .5rem; font-weight: 400; }
-    button { background: #007bff; border: 0; border-radius: 4px; color: white; cursor: pointer; font: inherit; margin-top: 1.3rem; padding: .75rem; width: 100%; }
-    #error { color: #b42318; min-height: 1.4rem; }
-  </style>
-  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
-</head>
-<body>
-  <main>
-    <h1>{{ site_name }}</h1>
-    <p>{{ prompt }}</p>
-    <div id="login-app">
-      <form id="login-form">
-      <input id="redirect-to" type="hidden" value="{{ redirect_to }}">
-      <label for="identification">{{ identification_label }}</label>
-      <input id="identification" name="identification" type="text" autocomplete="username" required>
-      <label for="password">{{ password_label }}</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" minlength="6" maxlength="32" required>
-      <label class="remember"><input id="keep" type="checkbox"> {{ remember_label }}</label>
-      <div id="error" role="alert"></div>
-      <button type="submit">{{ submit_label }}</button>
-      </form>
-    </div>
-    {% if frontend_script_available %}
-    <p><a href="/auth/register">{{ registration_link }}</a></p>
-    {% else %}
-    <p><a href="/auth/register">{{ registration_link }}</a> · <a href="/auth/forgot">{{ forgot_link }}</a></p>
-    {% endif %}
-  </main>
-  <script>
-    document.getElementById('login-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const error = document.getElementById('error');
-      const button = event.currentTarget.querySelector('button[type=submit]');
-      button.disabled = true;
-      error.textContent = '';
-      try {
-        const response = await fetch('/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({
-            identification: document.getElementById('identification').value,
-            password: document.getElementById('password').value,
-            keep: document.getElementById('keep').checked,
-            redirect_to: document.getElementById('redirect-to').value
-          })
-        });
-        const result = await response.json();
-        if (response.ok && result.code === 0) {
-          window.location.href = result.data.redirectTo;
-          return;
-        }
-        error.textContent = result.message || 'Login failed.';
-      } catch (_) {
-        error.textContent = 'Unable to connect to the server.';
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content="" />
+    <title>{{ title }} - {{ site_name }}</title>
+    <style>
+      body {
+        background: #f4f6f9;
+        color: #343a40;
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
       }
-      button.disabled = false;
-    });
-  </script>
-  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
-</body>
+      main {
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 8px 28px #0002;
+        box-sizing: border-box;
+        max-width: 420px;
+        padding: 2rem;
+        width: calc(100% - 2rem);
+      }
+      h1 {
+        font-size: 1.6rem;
+        margin: 0 0 0.4rem;
+      }
+      p {
+        color: #667085;
+        margin: 0 0 1.5rem;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin: 1rem 0 0.4rem;
+      }
+      input[type='text'],
+      input[type='password'] {
+        border: 1px solid #c9ced6;
+        border-radius: 4px;
+        box-sizing: border-box;
+        font: inherit;
+        padding: 0.7rem;
+        width: 100%;
+      }
+      .remember {
+        align-items: center;
+        display: flex;
+        gap: 0.5rem;
+        font-weight: 400;
+      }
+      button {
+        background: #007bff;
+        border: 0;
+        border-radius: 4px;
+        color: white;
+        cursor: pointer;
+        font: inherit;
+        margin-top: 1.3rem;
+        padding: 0.75rem;
+        width: 100%;
+      }
+      #error {
+        color: #b42318;
+        min-height: 1.4rem;
+      }
+    </style>
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body>
+    <main>
+      <h1>{{ site_name }}</h1>
+      {% for row in rows %} {% if row == "auth.rows.login.notice" %}
+      <p>{{ prompt }}</p>
+      {% else if row == "auth.rows.login.message" %}
+      <div id="login-message" role="status"></div>
+      {% else if row == "auth.rows.login.form" %}
+      <div id="login-app">
+        <form id="login-form">
+          <input id="redirect-to" type="hidden" value="{{ redirect_to }}" />
+          <label for="identification">{{ identification_label }}</label>
+          <input
+            id="identification"
+            name="identification"
+            type="text"
+            autocomplete="username"
+            required
+          />
+          <label for="password">{{ password_label }}</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            minlength="6"
+            maxlength="32"
+            required
+          />
+          <label class="remember"
+            ><input id="keep" type="checkbox" /> {{ remember_label }}</label
+          >
+          <div id="error" role="alert"></div>
+          <button type="submit">{{ submit_label }}</button>
+        </form>
+      </div>
+      {% else if row == "auth.rows.login.registration-link" %}
+      <p><a href="/auth/register">{{ registration_link }}</a></p>
+      {% endif %} {% endfor %} {% if !frontend_script_available %}
+      <p><a href="/auth/forgot">{{ forgot_link }}</a></p>
+      {% endif %}
+    </main>
+    {% if show_form %}
+    <script>
+      const loginForm = document.getElementById('login-form')
+      if (loginForm)
+        loginForm.addEventListener('submit', async (event) => {
+          event.preventDefault()
+          const error = document.getElementById('error')
+          const button = event.currentTarget.querySelector(
+            'button[type=submit]',
+          )
+          button.disabled = true
+          error.textContent = ''
+          try {
+            const response = await fetch('/auth/login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+              },
+              body: JSON.stringify({
+                identification: document.getElementById('identification').value,
+                password: document.getElementById('password').value,
+                keep: document.getElementById('keep').checked,
+                redirect_to: document.getElementById('redirect-to').value,
+              }),
+            })
+            const result = await response.json()
+            if (response.ok && result.code === 0) {
+              window.location.href = result.data.redirectTo
+              return
+            }
+            error.textContent = result.message || 'Login failed.'
+          } catch (_) {
+            error.textContent = 'Unable to connect to the server.'
+          }
+          button.disabled = false
+        })
+    </script>
+    {% endif %} {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
 </html>
