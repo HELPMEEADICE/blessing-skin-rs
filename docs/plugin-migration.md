@@ -23,3 +23,5 @@ The host does not expose filesystem, network, raw database, WASI, or arbitrary h
 See the [Bytecode Alliance Rust component guide](https://component-model.bytecodealliance.org/language-support/building-a-simple-component/rust.html) for the WIT and `wit-bindgen` component workflow.
 
 Host API version 1.45 adds `grid:admin.index` to the admin dashboard with the `usage`, `notification`, and `chart` region identifiers; legacy PHP/Twig partials are rejected.
+
+Host API version 1.46 adds `grid:user.index` to the user dashboard with the `email_verification`, `usage`, and `announcement` region identifiers; legacy PHP/Twig partials are rejected.

@@ -81,6 +81,15 @@
         vertical-align: middle;
         margin-right: 0.45rem;
       }
+      .announcement {
+        margin: 1.5rem 0;
+        padding: 1rem 1.25rem;
+        background: #f4f6f9;
+        border-radius: 8px;
+      }
+      .announcement h3 {
+        margin-top: 0;
+      }
       .account-badge {
         display: inline-block;
         margin-right: 0.35rem;
@@ -150,9 +159,8 @@
       </p>
       {% endif %}
       <p>{{ user.email }}</p>
-      {% if frontend_script_available %}
-      <section id="usage-box" aria-label="Account usage and score"></section>
-      {% endif %} {% if show_email_verification %}
+      {% for widget in page_widgets %}
+      {% if widget == "email_verification" && show_email_verification %}
       <p>
         <button id="send-verification">
           {% if locale.starts_with("zh") %}发送验证邮件{% else %}Send
@@ -161,6 +169,21 @@
         <span id="verification-status" role="status"></span>
       </p>
       {% endif %}
+      {% if widget == "usage" && frontend_script_available %}
+      <section id="usage-box" aria-label="Account usage and score"></section>
+      {% endif %}
+      {% if widget == "announcement" %}
+      <section class="announcement">
+        <h3>
+          {% if locale.starts_with("zh") %}公告{% else %}Announcement{% endif %}
+          {% if user.permission >= 1 %} ·
+          <a href="/admin/options">{% if locale.starts_with("zh") %}编辑{% else %}Edit{% endif %}</a>
+          {% endif %}
+        </h3>
+        <div>{{ announcement_html|safe }}</div>
+      </section>
+      {% endif %}
+      {% endfor %}
       <section aria-labelledby="notifications-title">
         <h3 id="notifications-title">
           {% if locale.starts_with("zh") %}站内通知{% else %}Notifications{%

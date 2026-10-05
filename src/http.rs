@@ -1033,6 +1033,15 @@ async fn filter_skinlib_upload_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(state, "grid:skinlib.upload", &["upload_form", "previewer"]).await
 }
 
+async fn filter_user_dashboard_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(
+        state,
+        "grid:user.index",
+        &["email_verification", "usage", "announcement"],
+    )
+    .await
+}
+
 async fn filter_admin_dashboard_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -4808,6 +4817,8 @@ struct DashboardPage {
     user: UserProfile,
     players: Vec<PlayerRecord>,
     notifications: Vec<DashboardNotification>,
+    announcement_html: String,
+    page_widgets: Vec<String>,
     show_email_verification: bool,
     locale: String,
     frontend_style_available: bool,
@@ -5460,12 +5471,30 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let locale = request_locale(&state);
+    let prefix = &state.config.database.table_prefix;
+    let localized_announcement_key = format!("announcement_{locale}");
+    let announcement = match database.option(prefix, &localized_announcement_key).await {
+        Ok(Some(announcement)) => announcement,
+        Ok(None) => match database.option(prefix, "announcement").await {
+            Ok(announcement) => announcement.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to load dashboard announcement fallback");
+                return unavailable();
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "failed to load localized dashboard announcement");
+            return unavailable();
+        }
+    };
+    let announcement_html = render_notification_markdown(&announcement);
+    let page_widgets = filter_user_dashboard_widgets(&state).await;
     let avatar_url = filter_user_avatar_url(&state, &user, false).await;
     let avatar_png_url = filter_user_avatar_url(&state, &user, true).await;
     let badges =
         serde_json::from_value::<Vec<DashboardBadge>>(filter_user_badges(&state, &user).await)
             .unwrap_or_default();
-    let locale = request_locale(&state);
     let menu = filter_user_menu(&state, &user, &locale).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
@@ -5477,7 +5506,10 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         &state,
         &site_name,
         "user",
-        serde_json::json!({ "unverified": show_email_verification }),
+        serde_json::json!({
+            "unverified": show_email_verification,
+            "page_widgets": &page_widgets,
+        }),
         i18n,
     );
     let page = DashboardPage {
@@ -5489,6 +5521,8 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         user,
         players,
         notifications,
+        announcement_html,
+        page_widgets,
         show_email_verification,
         locale,
         frontend_style_available: stylesheet.is_some(),
@@ -22755,6 +22789,11 @@ mod tests {
         assert_eq!(dashboard_globals["route"], "user");
         assert_eq!(dashboard_globals["base_url"], "http://localhost");
         assert_eq!(dashboard_globals["extra"]["unverified"], false);
+        assert_eq!(
+            dashboard_globals["extra"]["page_widgets"],
+            serde_json::json!(["email_verification", "usage", "announcement"])
+        );
+        assert!(admin_user_dashboard.contains("Announcement"));
         assert_eq!(dashboard_globals["i18n"]["auth"]["login"], "Log In");
         let profile_page =
             session_request(&app, &registered_cookie, "GET", "/user/profile", None).await;
