@@ -5572,6 +5572,7 @@ async fn web_admin_plugins_market_list(
 async fn web_admin_plugins_market_download(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -5584,7 +5585,19 @@ async fn web_admin_plugins_market_download(
     if body.len() > 8 * 1024 {
         return admin_plugin_result(1, "Invalid plugin request.");
     }
-    let request = match serde_json::from_slice::<AdminPluginMarketDownloadRequest>(&body) {
+    let fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return admin_plugin_result(1, "Invalid plugin request."),
+    };
+    let request = match serde_json::from_value::<AdminPluginMarketDownloadRequest>(
+        serde_json::Value::Object(fields),
+    ) {
         Ok(request) => request,
         Err(_) => return admin_plugin_result(1, "Invalid plugin request."),
     };
@@ -20038,6 +20051,40 @@ mod tests {
         .unwrap();
         assert_eq!(plugin_manage["code"], 1);
         assert_eq!(plugin_manage["message"], "Invalid plugin name.");
+        sqlx::query("UPDATE users SET permission = 2 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let plugin_market_download = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/plugins/market/download?name=bad%20plugin")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plugin_market_download.status(), StatusCode::OK);
+        let plugin_market_download: serde_json::Value = serde_json::from_slice(
+            &to_bytes(plugin_market_download.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plugin_market_download["code"], 1);
+        assert_eq!(plugin_market_download["message"], "Invalid plugin name.");
+        sqlx::query("UPDATE users SET permission = 1 WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
         let denied_plugin_market =
             session_request(&app, &admin_cookie, "GET", "/admin/plugins/market", None).await;
         assert_eq!(denied_plugin_market.status(), StatusCode::FORBIDDEN);
