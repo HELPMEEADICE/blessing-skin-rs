@@ -10217,6 +10217,19 @@ fn parse_legacy_input_object(
     Ok(fields)
 }
 
+fn legacy_input_body(
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Bytes {
+    parse_legacy_input_object(query, body, content_type)
+        .map(serde_json::Value::Object)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+        .map(Bytes::from)
+        .unwrap_or_default()
+}
+
 fn parse_player_name_request(
     query: &BTreeMap<String, String>,
     body: &[u8],
@@ -13202,8 +13215,14 @@ macro_rules! define_admin_user_mutation_handlers {
                 State(state): State<AppState>,
                 headers: HeaderMap,
                 LegacyRouteId(uid): LegacyRouteId,
+                Query(query): Query<BTreeMap<String, String>>,
                 body: Bytes,
             ) -> Response {
+                let body = legacy_input_body(
+                    &query,
+                    &body,
+                    headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                );
                 web_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
             }
 
@@ -13211,8 +13230,14 @@ macro_rules! define_admin_user_mutation_handlers {
                 State(state): State<AppState>,
                 headers: HeaderMap,
                 LegacyRouteId(uid): LegacyRouteId,
+                Query(query): Query<BTreeMap<String, String>>,
                 body: Bytes,
             ) -> Response {
+                let body = legacy_input_body(
+                    &query,
+                    &body,
+                    headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                );
                 api_admin_user_mutation(state, headers, uid, body, AdminUserMutation::$kind).await
             }
         )+
@@ -13875,8 +13900,14 @@ macro_rules! define_admin_player_mutation_handlers {
                 State(state): State<AppState>,
                 headers: HeaderMap,
                 LegacyRouteId(pid): LegacyRouteId,
+                Query(query): Query<BTreeMap<String, String>>,
                 body: Bytes,
             ) -> Response {
+                let body = legacy_input_body(
+                    &query,
+                    &body,
+                    headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                );
                 web_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
             }
 
@@ -13884,8 +13915,14 @@ macro_rules! define_admin_player_mutation_handlers {
                 State(state): State<AppState>,
                 headers: HeaderMap,
                 LegacyRouteId(pid): LegacyRouteId,
+                Query(query): Query<BTreeMap<String, String>>,
                 body: Bytes,
             ) -> Response {
+                let body = legacy_input_body(
+                    &query,
+                    &body,
+                    headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                );
                 api_admin_player_mutation(state, headers, pid, body, AdminPlayerMutation::$kind).await
             }
         )+
@@ -23001,10 +23038,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        for (uri, body) in [
-            ("/admin/players/3/name", r#"{"player_name":"AlexRenamed"}"#),
-            ("/admin/players/3/owner", r#"{"uid":8}"#),
-            ("/admin/players/3/textures", r#"{"type":"skin","tid":13}"#),
+        for (uri, body, content_type) in [
+            (
+                "/admin/players/3/name",
+                "player_name=AlexRenamed",
+                "application/x-www-form-urlencoded",
+            ),
+            (
+                "/admin/players/3/owner?uid=8",
+                "",
+                "application/x-www-form-urlencoded",
+            ),
+            (
+                "/admin/players/3/textures",
+                r#"{"type":"skin","tid":13}"#,
+                "application/json",
+            ),
         ] {
             let response = app
                 .clone()
@@ -23017,7 +23066,7 @@ mod tests {
                             format!("{}; {}", cookie.clone(), test_csrf_cookie),
                         )
                         .header("x-csrf-token", test_csrf_token.as_str())
-                        .header("content-type", "application/json")
+                        .header("content-type", content_type)
                         .body(Body::from(body))
                         .unwrap(),
                 )
@@ -23468,20 +23517,23 @@ mod tests {
         let duplicate_body: serde_json::Value = serde_json::from_slice(&duplicate_body).unwrap();
         assert!(duplicate_body["errors"]["email"].is_array());
 
-        for (uri, body, expected) in [
+        for (uri, body, content_type, expected) in [
             (
                 "/admin/users/8/email",
-                r#"{"email":"uploader2@example.test"}"#,
+                "email=uploader2%40example.test",
+                "application/x-www-form-urlencoded",
                 "Email changed successfully.",
             ),
             (
-                "/admin/users/8/nickname",
-                r#"{"nickname":"Target User"}"#,
+                "/admin/users/8/nickname?nickname=Target%20User",
+                "",
+                "application/x-www-form-urlencoded",
                 "Nickname changed successfully.",
             ),
             (
                 "/admin/users/8/score",
                 r#"{"score":17}"#,
+                "application/json",
                 "Score changed successfully.",
             ),
         ] {
@@ -23496,7 +23548,7 @@ mod tests {
                             format!("{}; {}", cookie.clone(), test_csrf_cookie),
                         )
                         .header("x-csrf-token", test_csrf_token.as_str())
-                        .header("content-type", "application/json")
+                        .header("content-type", content_type)
                         .body(Body::from(body))
                         .unwrap(),
                 )
