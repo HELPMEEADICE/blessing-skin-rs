@@ -3344,6 +3344,77 @@ impl DatabasePool {
         }
     }
 
+    pub async fn texture_upload_duplicate_id(
+        &self,
+        prefix: &str,
+        hash: &str,
+        uploader_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = ? AND (public = TRUE OR uploader = ?) LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(tid AS SIGNED) FROM {prefix}textures WHERE hash = ? AND (public = TRUE OR uploader = ?) LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = $1 AND (public = TRUE OR uploader = $2) LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(uploader_id)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(uploader_id)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(uploader_id)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
+
+    pub async fn public_texture_duplicate_id(
+        &self,
+        prefix: &str,
+        hash: &str,
+        except_tid: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = ? AND public = TRUE AND tid <> ? LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(tid AS SIGNED) FROM {prefix}textures WHERE hash = ? AND public = TRUE AND tid <> ? LIMIT 1"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(tid AS BIGINT) FROM {prefix}textures WHERE hash = $1 AND public = TRUE AND tid <> $2 LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(except_tid)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(except_tid)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .bind(hash)
+                .bind(except_tid)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
     pub async fn texture_id_by_hash(
         &self,
         prefix: &str,
@@ -8721,6 +8792,20 @@ mod tests {
         );
         assert_eq!(
             database
+                .public_texture_duplicate_id("bs_", "owner-private-hash", 15)
+                .await
+                .unwrap(),
+            Some(16)
+        );
+        assert_eq!(
+            database
+                .public_texture_duplicate_id("bs_", "private-hash", 14)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            database
                 .toggle_texture_privacy(
                     "bs_",
                     15,
@@ -8796,6 +8881,20 @@ mod tests {
                 .unwrap();
         assert_eq!(rewarded_user_score, 47);
         assert_eq!(refunded_uploader_score, 42);
+        assert_eq!(
+            database
+                .texture_upload_duplicate_id("bs_", "not-in-closet", 8)
+                .await
+                .unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            database
+                .texture_upload_duplicate_id("bs_", "new-hash", 8)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(
             database
                 .upload_texture("bs_", "duplicate", "alex", "not-in-closet", 10, 8, true, 1)

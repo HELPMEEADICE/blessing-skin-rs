@@ -12801,6 +12801,27 @@ async fn upload_texture(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    match database
+        .texture_upload_duplicate_id(&state.config.database.table_prefix, &hash, reporter.uid)
+        .await
+    {
+        Ok(Some(tid)) => {
+            return login_result(
+                2,
+                if request_locale(&state).starts_with("zh") {
+                    "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
+                } else {
+                    "The texture is already uploaded by someone else. You can add it to your closet directly."
+                },
+                Some(serde_json::json!({"tid": tid})),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, hash, "failed to check duplicate texture upload");
+            return unavailable();
+        }
+    }
     let size_kb = ((sanitized.len() as i64).saturating_add(1023) / 1024).max(1);
     let public_cost_per_kb = match database
         .option(&state.config.database.table_prefix, "score_per_storage")
@@ -12868,6 +12889,19 @@ async fn upload_texture(
             None,
         );
     }
+
+    emit_plugin_event(
+        &state,
+        "texture.uploading",
+        serde_json::json!({
+            "user_id": reporter.uid,
+            "hash": hash,
+            "name": name,
+            "type": texture_type,
+            "public": is_public,
+        }),
+    )
+    .await;
     let file_path = state.config.textures_dir.join(&hash);
     let file_was_missing = match tokio::fs::metadata(&file_path).await {
         Ok(_) => false,
@@ -13259,6 +13293,12 @@ async fn rename_texture(
             return texture_name_validation_error(&request_locale(&state));
         }
     }
+    emit_plugin_event(
+        &state,
+        "texture.name.updating",
+        serde_json::json!({"texture_id": tid, "previous_name": texture.name, "name": name}),
+    )
+    .await;
     if let Err(error) = database
         .rename_texture(&state.config.database.table_prefix, tid, name)
         .await
@@ -13402,6 +13442,17 @@ async fn delete_texture(
         public_award,
         take_back_award,
     );
+    emit_plugin_event(
+        &state,
+        "texture.deleting",
+        serde_json::json!({
+            "texture_id": tid,
+            "uploader_id": texture.uploader,
+            "hash": texture.hash,
+            "name": texture.name,
+        }),
+    )
+    .await;
     let remove_texture_file = match database
         .delete_texture(
             &state.config.database.table_prefix,
@@ -13567,6 +13618,57 @@ async fn toggle_texture_privacy(
         take_back_award,
     );
     match database
+        .user_profile(&state.config.database.table_prefix, texture.uploader)
+        .await
+    {
+        Ok(Some(uploader)) if uploader.score.saturating_add(score_diff) >= 0 => {}
+        Ok(Some(_)) | Ok(None) => {
+            return login_result(
+                1,
+                if request_locale(&state).starts_with("zh") {
+                    "积分不足"
+                } else {
+                    "You don't have enough score to upload this texture."
+                },
+                None,
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, uploader_id = texture.uploader, "failed to check texture privacy balance");
+            return unavailable();
+        }
+    };
+    if !texture.is_public {
+        match database
+            .public_texture_duplicate_id(&state.config.database.table_prefix, &texture.hash, tid)
+            .await
+        {
+            Ok(Some(duplicate_tid)) => {
+                let message = if request_locale(&state).starts_with("zh") {
+                    "已经有人上传过这个材质了，直接添加到衣柜使用吧~"
+                } else {
+                    "The texture is already uploaded by someone else. You can add it to your closet directly."
+                };
+                return login_result(2, message, Some(serde_json::json!({"tid": duplicate_tid})));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, hash = texture.hash, "failed to check public texture duplicate");
+                return unavailable();
+            }
+        }
+    }
+    emit_plugin_event(
+        &state,
+        "texture.privacy.updating",
+        serde_json::json!({
+            "texture_id": tid,
+            "previous_public": texture.is_public,
+            "public": !texture.is_public,
+        }),
+    )
+    .await;
+    match database
         .toggle_texture_privacy(
             &state.config.database.table_prefix,
             tid,
@@ -13660,6 +13762,12 @@ async fn update_texture_type(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    emit_plugin_event(
+        &state,
+        "texture.type.updating",
+        serde_json::json!({"texture_id": tid, "previous_type": texture.texture_type, "type": texture_type}),
+    )
+    .await;
     if let Err(error) = database
         .set_texture_type(&state.config.database.table_prefix, tid, texture_type)
         .await
