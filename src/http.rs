@@ -15486,9 +15486,6 @@ async fn raw_texture(
     RoutePath(raw_tid): RoutePath<String>,
     request_headers: HeaderMap,
 ) -> Response {
-    let Some(tid) = raw_tid.parse::<i64>().ok() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -15511,6 +15508,9 @@ async fn raw_texture(
     if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(tid) = raw_tid.parse::<i64>().ok() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
     let hash = match database
         .texture_hash(&state.config.database.table_prefix, tid)
@@ -23143,6 +23143,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(raw_legacy_false.status(), StatusCode::FORBIDDEN);
+        let raw_invalid_id_when_disabled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/not-a-number")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_invalid_id_when_disabled.status(), StatusCode::FORBIDDEN);
         sqlx::query("UPDATE options SET option_value = 'true' WHERE option_name = 'allow_downloading_texture'")
             .execute(&pool)
             .await
