@@ -1960,7 +1960,12 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_forgot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
     if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
         return response;
     }
@@ -1978,9 +1983,15 @@ async fn handle_forgot(State(state): State<AppState>, headers: HeaderMap, body: 
             None,
         );
     }
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => {
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => {
             return login_result(
                 1,
                 &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
@@ -2182,6 +2193,7 @@ async fn reset_page(
 async fn handle_password_reset(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(input_query): Query<BTreeMap<String, String>>,
     RoutePath(uid): RoutePath<String>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
@@ -2204,9 +2216,15 @@ async fn handle_password_reset(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => {
+    let request = match parse_legacy_input_object(
+        &input_query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => {
             return login_result(
                 1,
                 &auth_message(&state, "密码无效。", "Invalid password."),
@@ -2374,6 +2392,8 @@ async fn verify_email_page(
 
 async fn handle_email_verification(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(input_query): Query<BTreeMap<String, String>>,
     RoutePath(uid): RoutePath<String>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
@@ -2411,9 +2431,15 @@ async fn handle_email_verification(
     ) {
         return (StatusCode::FORBIDDEN, "Invalid link.").into_response();
     }
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => {
+    let request = match parse_legacy_input_object(
+        &input_query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => {
             return login_result(
                 1,
                 &auth_message(&state, "邮箱格式无效。", "Invalid email address."),
