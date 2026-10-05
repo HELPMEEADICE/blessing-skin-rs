@@ -7197,7 +7197,7 @@ async fn web_clear_player_textures(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (clear_skin, clear_cape) = web_player_texture_clear_flags(
+    let (clear_skin, clear_cape) = player_texture_clear_flags(
         &query,
         &body,
         headers
@@ -7229,7 +7229,7 @@ async fn web_clear_player_textures(
     }
 }
 
-fn web_player_texture_clear_flags(
+fn player_texture_clear_flags(
     query: &BTreeMap<String, String>,
     body: &[u8],
     content_type: Option<&str>,
@@ -10216,6 +10216,7 @@ async fn api_clear_player_textures(
     State(state): State<AppState>,
     headers: HeaderMap,
     RoutePath(raw_id): RoutePath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -10228,15 +10229,13 @@ async fn api_clear_player_textures(
     let Ok(player_id) = raw_id.parse::<i64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let request =
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
-    let clear_type = |kind: &str| {
-        request.get(kind).is_some()
-            || request
-                .get("type")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some(kind)))
-    };
+    let (clear_skin, clear_cape) = player_texture_clear_flags(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -10245,8 +10244,8 @@ async fn api_clear_player_textures(
             &state.config.database.table_prefix,
             identity.user_id,
             player_id,
-            clear_type("skin"),
-            clear_type("cape"),
+            clear_skin,
+            clear_cape,
         )
         .await;
     match result {
@@ -17242,12 +17241,12 @@ mod tests {
         assert!(!super::legacy_option_bool(None));
     }
     #[test]
-    fn web_player_texture_clear_flags_read_query_json_and_form_inputs() {
+    fn player_texture_clear_flags_read_query_json_and_form_inputs() {
         use std::collections::BTreeMap;
 
         let query = BTreeMap::from([("skin".to_owned(), "true".to_owned())]);
         assert_eq!(
-            super::web_player_texture_clear_flags(
+            super::player_texture_clear_flags(
                 &query,
                 br#"{"type":["cape"]}"#,
                 Some("application/json")
@@ -17255,7 +17254,7 @@ mod tests {
             (true, true)
         );
         assert_eq!(
-            super::web_player_texture_clear_flags(
+            super::player_texture_clear_flags(
                 &BTreeMap::new(),
                 b"type%5B%5D=skin&cape=false",
                 Some("application/x-www-form-urlencoded"),
