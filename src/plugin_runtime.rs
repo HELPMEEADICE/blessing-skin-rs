@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.33.0";
+const HOST_API_VERSION: &str = "1.34.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -839,6 +839,7 @@ fn validate_plugin_filter(
             | "uploaded_texture_file"
             | "client_ip"
             | "can_register"
+            | "user_password"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -892,6 +893,13 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             Ok(())
         }
         "client_ip" if value.as_str().is_some_and(valid_client_ip) => Ok(()),
+        "user_password"
+            if value
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty() && hash.len() <= 255) =>
+        {
+            Ok(())
+        }
         "new_player_name"
         | "uploaded_texture_name"
         | "add_closet_item_name"
@@ -938,6 +946,9 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
+        "user_password" => {
+            Err("user_password must return a non-empty hash up to 255 bytes".to_owned())
+        }
         "new_player_name"
         | "uploaded_texture_name"
         | "add_closet_item_name"
@@ -1598,6 +1609,21 @@ mod tests {
             validate_plugin_filter_value("new_player_name", &serde_json::json!("Steve")).is_ok()
         );
         assert!(validate_plugin_filter_value("new_player_name", &serde_json::json!(7)).is_err());
+        let password_context = serde_json::json!({});
+        assert!(
+            validate_plugin_filter(
+                "user_password",
+                &serde_json::json!("$2y$hash"),
+                &password_context
+            )
+            .is_ok()
+        );
+        assert!(validate_plugin_filter_value("user_password", &serde_json::json!("hash")).is_ok());
+        assert!(validate_plugin_filter_value("user_password", &serde_json::json!("")).is_err());
+        assert!(
+            validate_plugin_filter_value("user_password", &serde_json::json!("h".repeat(256)))
+                .is_err()
+        );
         assert!(
             validate_plugin_filter_value(
                 "can_sign",

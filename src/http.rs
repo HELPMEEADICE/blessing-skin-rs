@@ -825,6 +825,21 @@ async fn apply_plugin_filter_value(
         .await
 }
 
+async fn filter_user_password_hash(state: &AppState, password_hash: &str) -> String {
+    let filtered = apply_plugin_filter_value(
+        state,
+        "user_password",
+        &serde_json::json!(password_hash),
+        &serde_json::json!({}),
+    )
+    .await;
+    filtered
+        .as_str()
+        .filter(|hash| !hash.is_empty() && hash.len() <= 255)
+        .unwrap_or(password_hash)
+        .to_owned()
+}
+
 fn texture_plugin_record(texture: &TextureInfoRecord) -> serde_json::Value {
     serde_json::json!({
         "tid": texture.tid,
@@ -2741,6 +2756,7 @@ async fn handle_password_reset(
         tracing::error!(method = %state.config.password_method, "configured legacy password method cannot hash passwords");
         return unavailable();
     };
+    let password_hash = filter_user_password_hash(&state, &password_hash).await;
     if let Err(error) = database
         .update_user_text(
             &state.config.database.table_prefix,
@@ -3811,6 +3827,7 @@ async fn handle_register(
         tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
         return unavailable();
     };
+    let password_hash = filter_user_password_hash(&state, &password_hash).await;
     let now = shanghai_now();
     let last_sign_at = now - chrono::Duration::days(1);
     let now = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -8780,6 +8797,7 @@ async fn user_profile_update(
                 tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
                 return unavailable();
             };
+            let hash = filter_user_password_hash(&state, &hash).await;
             if let Err(error) = database
                 .update_user_text(prefix, user.uid, "password", &hash)
                 .await
@@ -14732,6 +14750,7 @@ async fn apply_admin_user_mutation(
                 tracing::error!(method = %state.config.password_method, "unsupported configured legacy password method");
                 return unavailable();
             };
+            let hash = filter_user_password_hash(state, &hash).await;
             emit_plugin_event(
                 state,
                 "user.password.updating",
