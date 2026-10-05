@@ -61,6 +61,7 @@ use crate::{
 
 const LEGACY_API_RATE_LIMIT: u64 = 60;
 const LEGACY_API_RATE_WINDOW: Duration = Duration::from_secs(60);
+const LEGACY_REMEMBER_TTL_SECONDS: u64 = 576_000 * 60;
 
 #[derive(Clone, Default)]
 struct ApiRateLimiter {
@@ -3225,7 +3226,7 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
     };
     let now = jsonwebtoken::get_current_timestamp();
     let max_age = if request.keep.unwrap_or(false) {
-        60 * 60 * 24 * 30
+        LEGACY_REMEMBER_TTL_SECONDS
     } else {
         60 * 60 * 12
     };
@@ -20956,7 +20957,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .contains("Max-Age=2592000")
+                .contains("Max-Age=34560000")
         );
         let body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
