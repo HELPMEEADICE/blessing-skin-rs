@@ -63,6 +63,8 @@ cargo build --locked --release
 
 Rust 启动时会幂等创建 `{DB_PREFIX}rust_web_session_revocations`，保存网页登录 session ID 和 cookie 的 SHA-256 指纹，以便滑动续期后登出仍能撤销同一 session，并拒绝重放旧 cookie；受保护网页和网页登录 OAuth 请求会检查共享数据库，因此多实例部署也能立即识别撤销。服务启动时恢复未过期记录，并每 15 分钟清理过期记录。数据库账号需要对该 Rust 专属表拥有建表、查询、插入和删除权限。该表不修改 PHP 核心表，回退到 PHP 不依赖它。
 
+网页表单与同源网页写请求使用签名的 `blessing_skin_csrf` HttpOnly cookie 和 `X-CSRF-TOKEN` 请求头；Rust 会为 HTML 页面注入动态 `csrf-token` meta 标签，并为旧前端的 `fetch` 自动附加请求头。缺少或不匹配时返回 HTTP 419。带每用户令牌的 HTML 响应设置 `Cache-Control: private, no-store`，并移除旧的内容长度、ETag 和 Last-Modified。OAuth token/API 与安装向导按各自协议处理，不使用此网页 CSRF 校验。
+
 Rust 直接读取旧数据库表和纹理文件；新站安装方法见 [rust-install.md](rust-install.md)，不要对已有 PHP 站点运行安装命令。切换前先备份数据库和纹理目录，并确认 `DB_PREFIX`、`TEXTURES_DIR`、`STORAGE_PATH` 与旧站一致。现有 OAuth/Passport 令牌验证依赖旧公钥；签发新令牌还需要旧 Passport 私钥，二者都不要更换。`/oauth/token` 支持 Passport `password`、`authorization_code`、`refresh_token` 与 `client_credentials` 授权，并沿用默认的一年访问令牌期限；密码授权需要旧数据库中有效的 `password_client`。机机令牌使用旧 Passport 表且 `user_id` 为空，不签发 refresh token，也不能访问绑定用户身份的 API 路由。Passport 的 `*` scope 在 password 和 client_credentials grant 中允许所有 scope。Rust 还提供登录态下的 `/oauth/tokens` 列表/撤销、`/oauth/scopes` scope 列表，以及 `/oauth/personal-access-tokens` 个人访问令牌管理；个人访问令牌接口要求有效网页登录 session 和旧的 Passport personal access client。Rust 当前没有 PHP 插件兼容层。WASM 插件市场需要通过 `WASM_PLUGIN_REGISTRY_URL` 显式配置可信注册表，契约见 [plugin-registry-v1.md](plugin-registry-v1.md)；注册表不可用时市场安装会失败关闭。
 
 官方发行包包含 `public/app` 下的旧站前端 bundle 和站点背景图、favicon；从源码部署时，运行 `yarn install --frozen-lockfile` 和 `yarn build` 后，还需将 `resources/assets/src/images/bg.webp` 与 `resources/assets/src/images/favicon.ico` 复制到 `public/app/`。Rust 服务通过 `PUBLIC_PATH/app` 提供这些资源。

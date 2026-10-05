@@ -1893,6 +1893,7 @@ mod integration_tests {
         Engine,
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     };
+    use hmac::{Hmac, Mac};
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -1939,6 +1940,14 @@ mod integration_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn csrf_token(secret: &str) -> String {
+        let nonce = "c".repeat(48);
+        let message = format!("blessing-skin-web-csrf-v1:{nonce}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        format!("{nonce}.{}", hex::encode(mac.finalize().into_bytes()))
+    }
+
     fn session_cookie(user_id: i64, secret: &str) -> String {
         let now = jsonwebtoken::get_current_timestamp();
         let claims = crate::auth::WebSessionClaims {
@@ -1954,7 +1963,10 @@ mod integration_tests {
             &EncodingKey::from_secret(secret.as_bytes()),
         )
         .unwrap();
-        format!("blessing_skin_session={token}")
+        format!(
+            "blessing_skin_session={token}; blessing_skin_csrf={}",
+            csrf_token(secret)
+        )
     }
 
     #[tokio::test]
@@ -2370,10 +2382,22 @@ mod integration_tests {
         )
         .unwrap();
         assert!(login_html.contains("id=\"redirect-to\" type=\"hidden\""));
+        let login_csrf_token = login_html
+            .split("name=\"csrf-token\" content=\"")
+            .nth(1)
+            .unwrap()
+            .split('\"')
+            .next()
+            .unwrap();
         let login_response = app
             .clone()
             .oneshot(
                 Request::post("/auth/login")
+                    .header(
+                        "cookie",
+                        format!("blessing_skin_csrf={login_csrf_token}"),
+                    )
+                    .header("x-csrf-token", login_csrf_token)
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::json!({
                         "identification": "alex@example.test",
@@ -2697,6 +2721,7 @@ mod integration_tests {
             .oneshot(
                 Request::post("/oauth/personal-access-tokens")
                     .header("cookie", session_cookie(7, session_secret))
+                    .header("x-csrf-token", csrf_token(session_secret))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"name":"CLI token","scopes":["*"]}"#))
                     .unwrap(),
@@ -2747,6 +2772,7 @@ mod integration_tests {
                     personal_claims.jti
                 ))
                 .header("cookie", session_cookie(7, session_secret))
+                .header("x-csrf-token", csrf_token(session_secret))
                 .body(Body::empty())
                 .unwrap(),
             )
@@ -2777,6 +2803,7 @@ mod integration_tests {
             .oneshot(
                 Request::delete(&path)
                     .header("cookie", session_cookie(8, session_secret))
+                    .header("x-csrf-token", csrf_token(session_secret))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2797,6 +2824,7 @@ mod integration_tests {
             .oneshot(
                 Request::delete(&path)
                     .header("cookie", session_cookie(7, session_secret))
+                    .header("x-csrf-token", csrf_token(session_secret))
                     .body(Body::empty())
                     .unwrap(),
             )

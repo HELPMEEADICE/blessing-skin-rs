@@ -380,6 +380,144 @@ fn is_user_facing_web_path(path: &str) -> bool {
         || path.starts_with("/texture/")
 }
 
+const WEB_CSRF_COOKIE: &str = "blessing_skin_csrf";
+const WEB_CSRF_COOKIE_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+fn requires_web_csrf(path: &str, method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && path != "/oauth/token"
+        && path != "/oauth/authorize"
+        && path != "/setup"
+        && !path.starts_with("/setup/")
+        && !path.starts_with("/api/")
+        && path != "/api"
+        && (is_user_facing_web_path(path) || path == "/texture" || path.starts_with("/oauth/"))
+}
+
+fn verify_web_csrf_token(key: &str, token: &str) -> bool {
+    let Some((nonce, supplied_signature)) = token.split_once('.') else {
+        return false;
+    };
+    if nonce.len() != 48
+        || !nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || supplied_signature.len() != 64
+    {
+        return false;
+    }
+    let Some(expected_signature) =
+        signature_hex(key, &format!("blessing-skin-web-csrf-v1:{nonce}"))
+    else {
+        return false;
+    };
+    bool::from(
+        expected_signature
+            .as_bytes()
+            .ct_eq(supplied_signature.as_bytes()),
+    )
+}
+
+fn valid_web_csrf_request(state: &AppState, headers: &HeaderMap, submitted: Option<&str>) -> bool {
+    let Some(key) = state.config.app_key.as_deref() else {
+        return false;
+    };
+    let Some(cookie) = cookie_value(headers, WEB_CSRF_COOKIE) else {
+        return false;
+    };
+    let Some(submitted) = submitted else {
+        return false;
+    };
+    cookie.len() == submitted.len()
+        && bool::from(cookie.as_bytes().ct_eq(submitted.as_bytes()))
+        && verify_web_csrf_token(key, cookie)
+}
+
+fn web_csrf_token_for_page(state: &AppState, headers: &HeaderMap) -> Option<(String, bool)> {
+    let key = state.config.app_key.as_deref()?;
+    if let Some(token) = cookie_value(headers, WEB_CSRF_COOKIE)
+        && verify_web_csrf_token(key, token)
+    {
+        return Some((token.to_owned(), false));
+    }
+    let nonce = Alphanumeric.sample_string(&mut rand::thread_rng(), 48);
+    let signature = signature_hex(key, &format!("blessing-skin-web-csrf-v1:{nonce}"))?;
+    Some((format!("{nonce}.{signature}"), true))
+}
+
+fn add_web_csrf_to_html(html: &str, token: &str) -> String {
+    static META_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = META_PATTERN.get_or_init(|| {
+        regex::Regex::new(r#"(?i)<meta\s+name=["']csrf-token["']\s+content=["'][^"']*["']\s*/?>"#)
+            .expect("CSRF meta tag expression is valid")
+    });
+    let meta = format!(r#"<meta name="csrf-token" content="{token}">"#);
+    let mut rendered = if pattern.is_match(html) {
+        pattern.replace_all(html, meta.as_str()).into_owned()
+    } else if let Some(head_end) = html.find("</head>") {
+        let mut rendered = html.to_owned();
+        rendered.insert_str(head_end, &meta);
+        rendered
+    } else {
+        html.to_owned()
+    };
+    const FETCH_CSRF_BRIDGE: &str = r#"<script>(()=>{const originalFetch=window.fetch.bind(window);window.fetch=(input,init)=>{const options=init||{};const method=(options.method||(input instanceof Request?input.method:'GET')).toUpperCase();let url;try{url=new URL(input instanceof Request?input.url:String(input),window.location.href)}catch(_){return originalFetch(input,init)}if(url.origin===window.location.origin&&!['GET','HEAD','OPTIONS'].includes(method)){const headers=new Headers(input instanceof Request?input.headers:undefined);if(options.headers)new Headers(options.headers).forEach((value,key)=>headers.set(key,value));const token=document.querySelector('meta[name="csrf-token"]')?.content;if(token&&!headers.has('X-CSRF-TOKEN'))headers.set('X-CSRF-TOKEN',token);return originalFetch(input,{...options,headers})}return originalFetch(input,init)}})();</script>"#;
+    if let Some(head_end) = rendered.find("</head>") {
+        rendered.insert_str(head_end, FETCH_CSRF_BRIDGE);
+    }
+    rendered
+}
+
+async fn inject_web_csrf_page(
+    state: &AppState,
+    request_headers: &HeaderMap,
+    request_secure: bool,
+    response: Response,
+) -> Response {
+    if !response.status().is_success()
+        || !response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"))
+    {
+        return response;
+    }
+    let Some((token, should_set_cookie)) = web_csrf_token_for_page(state, request_headers) else {
+        return response;
+    };
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "could not buffer HTML response to add CSRF token");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let html = match String::from_utf8(bytes.to_vec()) {
+        Ok(html) => html,
+        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    let html = add_web_csrf_to_html(&html, &token);
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(ETAG);
+    parts.headers.remove(LAST_MODIFIED);
+    parts
+        .headers
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    if should_set_cookie {
+        let secure = if request_secure { "; Secure" } else { "" };
+        let cookie = format!(
+            "{WEB_CSRF_COOKIE}={token}; Path=/; Max-Age={WEB_CSRF_COOKIE_TTL_SECONDS}; HttpOnly; SameSite=Lax{secure}"
+        );
+        match HeaderValue::from_str(&cookie) {
+            Ok(value) => {
+                parts.headers.append(SET_COOKIE, value);
+            }
+            Err(error) => tracing::warn!(%error, "could not create web CSRF cookie"),
+        }
+    }
+    Response::from_parts(parts, Body::from(html))
+}
+
 fn select_request_locale(
     state: &AppState,
     request: &axum::extract::Request,
@@ -511,7 +649,28 @@ async fn detect_locale_preference(
         Err(response) => return response,
     };
     let path = request.uri().path();
+    let method = request.method().clone();
+    let request_headers = request.headers().clone();
     let is_api = path == "/api" || path.starts_with("/api/");
+    if state.session_key.is_some()
+        && requires_web_csrf(path, &method)
+        && !valid_web_csrf_request(
+            &state,
+            &request_headers,
+            request_headers
+                .get("X-CSRF-TOKEN")
+                .and_then(|value| value.to_str().ok()),
+        )
+    {
+        return (
+            StatusCode::from_u16(419).expect("HTTP 419 is a valid status"),
+            Json(serde_json::json!({"message": "CSRF token mismatch."})),
+        )
+            .into_response();
+    }
+    let inject_csrf = state.session_key.is_some()
+        && method == Method::GET
+        && (is_user_facing_web_path(path) || path.starts_with("/oauth/"));
     let should_refresh_web_session = is_user_facing_web_path(path) || path.starts_with("/oauth/");
     if should_refresh_web_session
         && let Err(error) = refresh_web_session_revocation(&state, request.headers()).await
@@ -586,6 +745,9 @@ async fn detect_locale_preference(
         )) {
             response.headers_mut().append(SET_COOKIE, cookie);
         }
+    }
+    if inject_csrf {
+        response = inject_web_csrf_page(&state, &request_headers, request_secure, response).await;
     }
     response
 }
@@ -16101,6 +16263,56 @@ mod tests {
         globals["extra"]["tooManyFails"].as_bool().unwrap()
     }
 
+    async fn test_web_csrf_credentials(app: &axum::Router, cookie: &str) -> (String, String) {
+        use axum::{
+            body::{Body, to_bytes},
+            http::Request,
+        };
+        use tower::ServiceExt;
+
+        let mut request = Request::get("/");
+        if !cookie.is_empty() {
+            request = request.header("cookie", cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let token = html
+            .split("name=\"csrf-token\" content=\"")
+            .nth(1)
+            .and_then(|value| value.split('\"').next())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(html.contains("window.fetch=(input,init)=>"));
+        if !token.is_empty() {
+            assert!(html.contains(&format!("name=\"csrf-token\" content=\"{token}\"")));
+        }
+        let cookie = if cookie
+            .split(';')
+            .any(|part| part.trim().starts_with("blessing_skin_csrf="))
+        {
+            cookie.to_owned()
+        } else if cookie.is_empty() {
+            format!("blessing_skin_csrf={token}")
+        } else {
+            format!("{cookie}; blessing_skin_csrf={token}")
+        };
+        (cookie, token)
+    }
+
     async fn submit_test_registration(
         app: &axum::Router,
         cookie: &str,
@@ -16112,12 +16324,14 @@ mod tests {
         use axum::body::Body;
         use tower::ServiceExt;
 
+        let (cookie, csrf_token) = test_web_csrf_credentials(app, cookie).await;
         app.clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
                     .uri("/auth/register")
                     .header("cookie", cookie)
+                    .header("x-csrf-token", csrf_token)
                     .header("x-real-ip", ip)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -16148,12 +16362,54 @@ mod tests {
         };
         use tower::ServiceExt;
 
+        let (cookie, csrf_token) = test_web_csrf_credentials(app, "").await;
+        if !csrf_token.is_empty() {
+            let rejected = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/login")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"identification":"alex@example.test","password":"correct horse"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::from_u16(419).unwrap());
+
+            let signature_char = csrf_token.as_bytes()[49];
+            let replacement = if signature_char == b'0' { "1" } else { "0" };
+            let forged_csrf_token = format!("{}{replacement}", &csrf_token[..49]);
+            let forged = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/login")
+                        .header("cookie", format!("blessing_skin_csrf={forged_csrf_token}"))
+                        .header("x-csrf-token", forged_csrf_token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"identification":"alex@example.test","password":"correct horse"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(forged.status(), StatusCode::from_u16(419).unwrap());
+        }
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/auth/login")
+                    .header("cookie", cookie)
+                    .header("x-csrf-token", csrf_token)
                     .header("x-real-ip", ip)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -16195,10 +16451,12 @@ mod tests {
         use axum::body::Body;
         use tower::ServiceExt;
 
+        let (cookie, csrf_token) = test_web_csrf_credentials(app, cookie).await;
         let mut builder = axum::http::Request::builder()
             .method(method)
             .uri(uri)
             .header("cookie", cookie)
+            .header("x-csrf-token", csrf_token)
             .header("accept", "application/json");
         let body = if let Some(body) = body {
             builder = builder.header("content-type", "application/json");
@@ -18244,6 +18502,7 @@ mod tests {
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
         });
+        let (test_csrf_cookie, test_csrf_token) = test_web_csrf_credentials(&app, "").await;
         let api_root_response = app
             .clone()
             .oneshot(Request::get("/api").body(Body::empty()).unwrap())
@@ -18354,7 +18613,11 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get("/auth/login")
-                    .header("cookie", "locale=en_US")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", "locale=en_US", test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("accept-language", "ru")
                     .body(Body::empty())
                     .unwrap(),
@@ -18553,7 +18816,11 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get("/user/profile?lang=zh_TW")
-                    .header("cookie", &unbound_cookie)
+                    .header(
+                        "cookie",
+                        format!("{}; {}", &unbound_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -18605,7 +18872,15 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get("/user/profile")
-                    .header("cookie", format!("{unbound_cookie}; locale=en"))
+                    .header(
+                        "cookie",
+                        format!(
+                            "{}; {}",
+                            format!("{unbound_cookie}; locale=en"),
+                            test_csrf_cookie
+                        ),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("accept-language", "en")
                     .body(Body::empty())
                     .unwrap(),
@@ -18946,7 +19221,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user")
-                    .header("cookie", registered_cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", registered_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -19214,7 +19493,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/plugins/upload")
-                    .header("cookie", admin_cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header(
                         "content-type",
                         format!("multipart/form-data; boundary={boundary}"),
@@ -19319,7 +19602,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/plugins/upload")
-                    .header("cookie", admin_cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header(
                         "content-type",
                         format!("multipart/form-data; boundary={boundary}"),
@@ -19449,7 +19736,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/i18n")
-                    .header("cookie", admin_cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(create_body))
                     .unwrap(),
@@ -19742,7 +20033,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/forgot")
-                    .header("cookie", forgot_captcha_cookie)
+                    .header(
+                        "cookie",
+                        format!("{}; {}", forgot_captcha_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("x-real-ip", "203.0.113.41")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -19873,6 +20168,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(&verification_uri)
+                    .header("cookie", test_csrf_cookie.clone())
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"email":"first@example.test"}).to_string(),
@@ -20050,7 +20347,11 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/admin/customize?action=color")
-                    .header("cookie", &registered_cookie)
+                    .header(
+                        "cookie",
+                        format!("{}; {}", &registered_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from(
                         "navbar=orange&sidebar=light-olive&submit_color=Submit",
@@ -20104,7 +20405,11 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/admin/options")
-                    .header("cookie", &registered_cookie)
+                    .header(
+                        "cookie",
+                        format!("{}; {}", &registered_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header(
                         CONTENT_TYPE,
                         "application/x-www-form-urlencoded; charset=UTF-8",
@@ -20349,6 +20654,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(&reset_uri)
+                    .header("cookie", test_csrf_cookie.clone())
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"password":"new secure password"}).to_string(),
@@ -20990,6 +21297,8 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri("/auth/login")
+                        .header("cookie", test_csrf_cookie.clone())
+                        .header("x-csrf-token", test_csrf_token.as_str())
                         .header("x-real-ip", login_ip)
                         .header("content-type", "application/json")
                         .body(Body::from(
@@ -21013,6 +21322,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/login")
+                    .header("cookie", test_csrf_cookie.clone())
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("x-real-ip", login_ip)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -21039,6 +21350,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/login")
+                    .header("cookie", test_csrf_cookie.clone())
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("x-real-ip", "198.51.100.42")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -21064,7 +21377,11 @@ mod tests {
                     .method("POST")
                     .uri("/auth/login?lang=en")
                     .header("x-real-ip", "198.51.100.41")
-                    .header("cookie", captcha_cookie)
+                    .header(
+                        "cookie",
+                        format!("{}; {}", captcha_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -21122,7 +21439,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21142,7 +21463,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user/score-info")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21168,7 +21493,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/user/score-info")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21194,7 +21523,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/sign")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21210,7 +21543,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/sign")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21248,7 +21585,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/sign")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21264,7 +21605,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/sign")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21299,7 +21644,11 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri("/user/profile")
-                        .header("cookie", cookie.clone())
+                        .header(
+                            "cookie",
+                            format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                        )
+                        .header("x-csrf-token", test_csrf_token.as_str())
                         .header("content-type", "application/json")
                         .body(Body::from(format!(
                             r#"{{"action":"nickname","new_nickname":"{nickname}"}}"#
@@ -21320,7 +21669,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile")
-                    .header("cookie", cookie.clone())
+                    .header("cookie", format!("{}; {}", cookie.clone(), test_csrf_cookie))
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"action":"password","current_password":"correct horse","new_password":"new secure password"}"#,
@@ -21357,7 +21707,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile")
-                    .header("cookie", cookie.clone())
+                    .header("cookie", format!("{}; {}", cookie.clone(), test_csrf_cookie))
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"action":"password","current_password":"new secure password","new_password":"correct horse"}"#,
@@ -21393,7 +21744,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile")
-                    .header("cookie", cookie.clone())
+                    .header("cookie", format!("{}; {}", cookie.clone(), test_csrf_cookie))
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"action":"email","email":"changed@example.test","password":"correct horse"}"#,
@@ -21438,7 +21790,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile")
-                    .header("cookie", cookie.clone())
+                    .header("cookie", format!("{}; {}", cookie.clone(), test_csrf_cookie))
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"action":"email","email":"alex@example.test","password":"correct horse"}"#,
@@ -21466,7 +21819,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile/avatar")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"tid":2}"#))
                     .unwrap(),
@@ -21488,7 +21845,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile/avatar")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"tid":0}"#))
                     .unwrap(),
@@ -21504,7 +21865,11 @@ mod tests {
                     Request::builder()
                         .method("PUT")
                         .uri("/user/dark-mode")
-                        .header("cookie", cookie.clone())
+                        .header(
+                            "cookie",
+                            format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                        )
+                        .header("x-csrf-token", test_csrf_token.as_str())
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -21524,7 +21889,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/user/profile")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"action":"delete","password":"correct horse"}"#,
@@ -21546,7 +21915,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/oauth/clients")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21567,7 +21940,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/oauth/clients")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"name":"Desktop app","redirect":"https://client.test/callback"}"#,
@@ -21596,7 +21973,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/oauth/clients/{client_id}"))
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"name":"Updated app","redirect":"https://client.test/return"}"#,
@@ -21636,7 +22017,11 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/oauth/clients/{client_id}"))
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21665,7 +22050,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/oauth/clients")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21685,7 +22074,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/players/list?q=name%3AAlex&page=1")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21731,7 +22124,11 @@ mod tests {
                     Request::builder()
                         .method("PUT")
                         .uri(uri)
-                        .header("cookie", cookie.clone())
+                        .header(
+                            "cookie",
+                            format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                        )
+                        .header("x-csrf-token", test_csrf_token.as_str())
                         .header("content-type", "application/json")
                         .body(Body::from(body))
                         .unwrap(),
@@ -21756,7 +22153,11 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/admin/players/3")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21775,7 +22176,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/closet/8")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"tid":2}"#))
                     .unwrap(),
@@ -21817,7 +22222,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/closet/8")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"tid":2}"#))
                     .unwrap(),
@@ -21838,7 +22247,11 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/admin/closet/8")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"tid":2}"#))
                     .unwrap(),
@@ -21868,7 +22281,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/users/list?q=alex&page=1")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21905,7 +22322,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/users/list?q=email%3Aalex%40example.test%20or%20uid%3A8&page=1")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21933,7 +22354,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/reports/list?q=status%3A0%20sort%3A-report_at")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -21969,7 +22394,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/reports/1")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"action":"reject"}"#))
                     .unwrap(),
@@ -21998,7 +22427,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/reports/2")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"action":"ban"}"#))
                     .unwrap(),
@@ -22028,7 +22461,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/reports/3")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"action":"delete"}"#))
                     .unwrap(),
@@ -22063,7 +22500,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/reports/4")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"action":"delete"}"#))
                     .unwrap(),
@@ -22093,7 +22534,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/8/email")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"email":"alex@example.test"}"#))
                     .unwrap(),
@@ -22130,7 +22575,11 @@ mod tests {
                     Request::builder()
                         .method("PUT")
                         .uri(uri)
-                        .header("cookie", cookie.clone())
+                        .header(
+                            "cookie",
+                            format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                        )
+                        .header("x-csrf-token", test_csrf_token.as_str())
                         .header("content-type", "application/json")
                         .body(Body::from(body))
                         .unwrap(),
@@ -22151,7 +22600,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/8/permission")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"permission":1}"#))
                     .unwrap(),
@@ -22165,7 +22618,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/7/permission")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"permission":0}"#))
                     .unwrap(),
@@ -22184,7 +22641,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/8/verification")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -22203,7 +22664,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/8/password")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"password":"NewPass123"}"#))
                     .unwrap(),
@@ -22228,7 +22693,11 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/admin/users/8/permission")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"permission":0}"#))
                     .unwrap(),
@@ -22246,7 +22715,11 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/admin/users/8")
-                    .header("cookie", cookie.clone())
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -22652,6 +23125,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/auth/logout")
+                    .header("cookie", test_csrf_cookie.clone())
+                    .header("x-csrf-token", test_csrf_token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
