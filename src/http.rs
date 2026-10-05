@@ -1029,6 +1029,15 @@ async fn filter_player_page_widgets(state: &AppState) -> Vec<String> {
     .await
 }
 
+async fn filter_skinlib_show_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(
+        state,
+        "grid:skinlib.show",
+        &["texture_preview", "texture_details"],
+    )
+    .await
+}
+
 async fn filter_closet_page_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -5135,6 +5144,8 @@ struct SkinLibraryShowPage {
     likes: i64,
     logged_in: bool,
     can_manage: bool,
+    page_widgets: Vec<String>,
+    has_texture_details: bool,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -12796,6 +12807,10 @@ async fn skinlib_show_page(
             return unavailable();
         }
     };
+    let page_widgets = filter_skinlib_show_widgets(&state).await;
+    let has_texture_details = page_widgets
+        .iter()
+        .any(|widget| widget == "texture_details");
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -12832,6 +12847,8 @@ async fn skinlib_show_page(
         likes: texture.likes,
         logged_in: viewer_uid.is_some(),
         can_manage: viewer_uid == Some(texture.uploader) || is_admin,
+        page_widgets,
+        has_texture_details,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),

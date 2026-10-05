@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.41.0";
+const HOST_API_VERSION: &str = "1.42.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -848,6 +848,7 @@ fn validate_plugin_filter(
             | "user_menu"
             | "grid:user.player"
             | "grid:user.closet"
+            | "grid:skinlib.show"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -1058,6 +1059,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "user_menu" if valid_plugin_user_menu(value) => Ok(()),
         "grid:user.player" if valid_plugin_grid(value, &["player_management", "previewer"]) => Ok(()),
         "grid:user.closet" if valid_plugin_grid(value, &["closet_management", "previewer"]) => Ok(()),
+        "grid:skinlib.show" if valid_plugin_grid(value, &["texture_preview", "texture_details"]) => Ok(()),
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
@@ -1180,6 +1182,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "grid:user.closet" => Err(
             "grid:user.closet must return a unique subset of closet_management and previewer"
+                .to_owned(),
+        ),
+        "grid:skinlib.show" => Err(
+            "grid:skinlib.show must return a unique subset of texture_preview and texture_details"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1819,6 +1825,20 @@ mod tests {
             validate_plugin_filter_value(
                 "grid:user.closet",
                 &serde_json::json!(["user.widgets.closet.list"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:skinlib.show",
+                &serde_json::json!(["texture_details", "texture_preview"])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:skinlib.show",
+                &serde_json::json!(["skinlib.widgets.show.side"])
             )
             .is_err()
         );
