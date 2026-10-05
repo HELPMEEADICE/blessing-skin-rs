@@ -7778,6 +7778,7 @@ fn shanghai_now() -> NaiveDateTime {
 async fn user_profile_update(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -7790,9 +7791,15 @@ async fn user_profile_update(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => {
+    let request = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => {
             return login_result(1, illegal_parameters_message(&request_locale(&state)), None);
         }
     };
@@ -8092,6 +8099,7 @@ async fn user_profile_update(
 async fn user_set_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -8101,7 +8109,15 @@ async fn user_set_avatar(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let request = parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .ok()
+    .map(serde_json::Value::Object);
     let Some(tid) = request
         .as_ref()
         .and_then(|value| value.get("tid"))
@@ -22232,6 +22248,7 @@ mod tests {
             .unwrap();
 
         for nickname in ["Changed nickname", "Alex User"] {
+            let encoded_nickname = nickname.replace(' ', "+");
             let response = app
                 .clone()
                 .oneshot(
@@ -22243,9 +22260,9 @@ mod tests {
                             format!("{}; {}", cookie.clone(), test_csrf_cookie),
                         )
                         .header("x-csrf-token", test_csrf_token.as_str())
-                        .header("content-type", "application/json")
+                        .header("content-type", "application/x-www-form-urlencoded")
                         .body(Body::from(format!(
-                            r#"{{"action":"nickname","new_nickname":"{nickname}"}}"#
+                            "action=nickname&new_nickname={encoded_nickname}"
                         )))
                         .unwrap(),
                 )
@@ -22256,7 +22273,6 @@ mod tests {
                     .unwrap();
             assert_eq!(body["code"], 0);
         }
-
         let changed_password = app
             .clone()
             .oneshot(
@@ -22412,14 +22428,13 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/user/profile/avatar")
+                    .uri("/user/profile/avatar?tid=2")
                     .header(
                         "cookie",
                         format!("{}; {}", cookie.clone(), test_csrf_cookie),
                     )
                     .header("x-csrf-token", test_csrf_token.as_str())
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"tid":2}"#))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
