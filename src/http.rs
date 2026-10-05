@@ -14493,6 +14493,23 @@ async fn apply_admin_player_mutation(
             else {
                 return admin_player_validation_error("type", &request_locale(&state));
             };
+            let previous_tid = if texture_type == "skin" {
+                player.tid_skin
+            } else {
+                player.tid_cape
+            };
+            emit_plugin_event(
+                state,
+                "player.texture.updating",
+                serde_json::json!({
+                    "user_id": player.uid,
+                    "player_id": pid,
+                    "name": player.name,
+                    "type": texture_type,
+                    "texture_id": tid,
+                }),
+            )
+            .await;
             if tid != 0 {
                 match database.texture_info(prefix, tid).await {
                     Ok(Some(_)) => {}
@@ -14518,6 +14535,19 @@ async fn apply_admin_player_mutation(
                 tracing::error!(%error, pid, "failed to update managed player texture");
                 return unavailable();
             }
+            emit_plugin_event(
+                state,
+                "player.texture.updated",
+                serde_json::json!({
+                    "user_id": player.uid,
+                    "player_id": pid,
+                    "name": player.name,
+                    "type": texture_type,
+                    "previous_texture_id": previous_tid,
+                    "texture_id": tid,
+                }),
+            )
+            .await;
             emit_plugin_event(
                 state,
                 "player.textures.updated",

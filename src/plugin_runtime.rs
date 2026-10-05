@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.12.0";
+const HOST_API_VERSION: &str = "1.13.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -56,6 +56,8 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "player.deleted",
     "player.owner.updated",
     "player.textures.updated",
+    "player.texture.updating",
+    "player.texture.updated",
     "texture.uploaded",
     "texture.renamed",
     "texture.deleted",
@@ -1195,6 +1197,20 @@ mod tests {
             validate_plugin_event(
                 "player.deleting",
                 br#"{"user_id":7,"player_id":3,"name":"Alex"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "player.texture.updating",
+                br#"{"user_id":7,"player_id":3,"name":"Alex","type":"skin","texture_id":11}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "player.texture.updated",
+                br#"{"user_id":7,"player_id":3,"name":"Alex","type":"skin","previous_texture_id":0,"texture_id":11}"#
             )
             .is_ok()
         );
