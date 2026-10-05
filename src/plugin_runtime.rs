@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.31.0";
+const HOST_API_VERSION: &str = "1.32.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -837,6 +837,7 @@ fn validate_plugin_filter(
             | "uploaded_texture_name"
             | "uploaded_texture_hash"
             | "uploaded_texture_file"
+            | "client_ip"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -856,6 +857,10 @@ fn validate_plugin_filter(
         }
     }
     Ok(())
+}
+
+fn valid_client_ip(value: &str) -> bool {
+    value == "unknown" || (value.len() <= 45 && value.parse::<std::net::IpAddr>().is_ok())
 }
 
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
@@ -884,6 +889,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         {
             Ok(())
         }
+        "client_ip" if value.as_str().is_some_and(valid_client_ip) => Ok(()),
         "new_player_name"
         | "uploaded_texture_name"
         | "add_closet_item_name"
@@ -934,6 +940,9 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "uploaded_texture_name"
         | "add_closet_item_name"
         | "rename_closet_item_name" => Err("name filters must return a string".to_owned()),
+        "client_ip" => {
+            Err("client_ip filters must return a valid IP address or unknown".to_owned())
+        }
         "uploaded_texture_hash" => {
             Err("uploaded_texture_hash must return 64 hexadecimal characters".to_owned())
         }
@@ -1661,6 +1670,17 @@ mod tests {
             validate_plugin_filter_value("uploaded_texture_hash", &serde_json::json!("../outside"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn client_ip_filter_only_accepts_bounded_ip_addresses() {
+        let context = serde_json::json!({"ip": "203.0.113.10"});
+        for ip in ["203.0.113.10", "2001:db8::1", "unknown"] {
+            assert!(validate_plugin_filter("client_ip", &serde_json::json!(ip), &context).is_ok());
+        }
+        for ip in ["forged-host.example", "203.0.113.10, 192.0.2.1"] {
+            assert!(validate_plugin_filter_value("client_ip", &serde_json::json!(ip)).is_err());
+        }
     }
 
     #[test]

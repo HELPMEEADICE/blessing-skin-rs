@@ -2111,7 +2111,7 @@ async fn login_page(
     let stylesheet = stylesheet.unwrap_or_default();
     let frontend_script = frontend_script.unwrap_or_default();
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
-    let client_ip = registration_client_ip(&headers);
+    let client_ip = filtered_client_ip(&state, &headers).await;
     let failures = login_failure_count(&state, &client_ip) > 3;
     let (recaptcha_sitekey, recaptcha_invisible) = match &state.database {
         Some(database) => {
@@ -2472,7 +2472,7 @@ async fn handle_forgot(
         Err(response) => return response,
     }
     emit_plugin_event(&state, "auth.forgot.attempt", serde_json::json!({})).await;
-    let ip = registration_client_ip(&headers);
+    let ip = filtered_client_ip(&state, &headers).await;
     let key = format!("forgot:{ip}");
     if reserve_mail_limit(&state, &key, Duration::from_secs(180)).is_err() {
         return login_result(
@@ -3518,6 +3518,18 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 
+async fn filtered_client_ip(state: &AppState, headers: &HeaderMap) -> String {
+    let ip = registration_client_ip(headers);
+    let filtered = apply_plugin_filter_value(
+        state,
+        "client_ip",
+        &serde_json::json!(ip),
+        &serde_json::json!({"ip": ip}),
+    )
+    .await;
+    filtered.as_str().unwrap_or(&ip).to_owned()
+}
+
 fn registration_client_ip(headers: &HeaderMap) -> String {
     for name in ["x-real-ip", "x-forwarded-for"] {
         let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
@@ -3738,7 +3750,7 @@ async fn handle_register(
             }
         }
     }
-    let client_ip = registration_client_ip(&headers);
+    let client_ip = filtered_client_ip(&state, &headers).await;
     let max_registrations_per_ip = match database.option(prefix, "regs_per_ip").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 3),
         Err(error) => {
@@ -3982,29 +3994,6 @@ async fn handle_login(
     let Some(password) = request.password.filter(|value| !value.is_empty()) else {
         return validation_error("password", &locale);
     };
-    let failure_key = registration_client_ip(&headers);
-    let failures = login_failure_count(&state, &failure_key);
-    if failures > 3 {
-        let captcha_valid = if let Some(captcha) = request.captcha.as_deref() {
-            match verify_registration_captcha(&state, &headers, captcha).await {
-                Ok(valid) => valid,
-                Err(response) => return response,
-            }
-        } else {
-            false
-        };
-        if !captcha_valid {
-            return login_result(
-                1,
-                if locale.starts_with("zh") {
-                    "验证码无效。"
-                } else {
-                    "The CAPTCHA is invalid."
-                },
-                Some(serde_json::json!({ "login_fails": failures })),
-            );
-        }
-    }
     if !(6..=32).contains(&password.chars().count()) {
         return validation_error("password", &locale);
     }
@@ -4032,19 +4021,42 @@ async fn handle_login(
             .await
     };
     let credential = match credential {
-        Ok(Some(credential)) => credential,
-        Ok(None) => {
-            let message = if locale.starts_with("zh") {
-                "用户不存在"
-            } else {
-                "No such user."
-            };
-            return login_result(2, message, None);
-        }
+        Ok(credential) => credential,
         Err(error) => {
             tracing::error!(%error, "failed to look up login account");
             return unavailable();
         }
+    };
+    let failure_key = filtered_client_ip(&state, &headers).await;
+    let failures = login_failure_count(&state, &failure_key);
+    if failures > 3 {
+        let captcha_valid = if let Some(captcha) = request.captcha.as_deref() {
+            match verify_registration_captcha(&state, &headers, captcha).await {
+                Ok(valid) => valid,
+                Err(response) => return response,
+            }
+        } else {
+            false
+        };
+        if !captcha_valid {
+            return login_result(
+                1,
+                if locale.starts_with("zh") {
+                    "验证码无效。"
+                } else {
+                    "The CAPTCHA is invalid."
+                },
+                Some(serde_json::json!({ "login_fails": failures })),
+            );
+        }
+    }
+    let Some(credential) = credential else {
+        let message = if locale.starts_with("zh") {
+            "用户不存在"
+        } else {
+            "No such user."
+        };
+        return login_result(2, message, None);
     };
     emit_plugin_event(
         &state,
