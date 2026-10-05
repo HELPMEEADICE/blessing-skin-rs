@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.34.0";
+const HOST_API_VERSION: &str = "1.35.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -840,6 +840,7 @@ fn validate_plugin_filter(
             | "client_ip"
             | "can_register"
             | "user_password"
+            | "head_links"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -865,9 +866,73 @@ fn valid_client_ip(value: &str) -> bool {
     value == "unknown" || (value.len() <= 45 && value.parse::<std::net::IpAddr>().is_ok())
 }
 
+fn valid_plugin_head_link(value: &serde_json::Value) -> bool {
+    let Some(link) = value.as_object() else {
+        return false;
+    };
+    let Some(rel) = link.get("rel").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(href) = link.get("href").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if rel.trim().is_empty()
+        || rel.len() > 64
+        || rel.split_ascii_whitespace().any(|token| {
+            token.is_empty()
+                || !token
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+        || href.is_empty()
+        || href.len() > 2048
+        || href.trim() != href
+        || href.chars().any(char::is_control)
+        || href.contains('\\')
+    {
+        return false;
+    }
+    let safe_href = if href.starts_with('/') {
+        !href.starts_with("//")
+    } else {
+        url::Url::parse(href).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    };
+    if !safe_href {
+        return false;
+    }
+    for (name, value) in link {
+        match name.as_str() {
+            "rel" | "href" => {}
+            "crossorigin"
+                if value
+                    .as_str()
+                    .is_some_and(|value| matches!(value, "" | "anonymous" | "use-credentials")) => {
+            }
+            "as" | "integrity" | "media" | "referrerpolicy" | "sizes" | "type"
+                if value.as_str().is_some_and(|value| {
+                    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+                }) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
         "can_register" => Ok(()),
+        "head_links"
+            if value.as_array().is_some_and(|links| {
+                links.len() <= 128 && links.iter().all(valid_plugin_head_link)
+            }) =>
+        {
+            Ok(())
+        }
         "can_sign"
         | "can_add_player"
         | "can_rename_player"
@@ -949,6 +1014,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "user_password" => {
             Err("user_password must return a non-empty hash up to 255 bytes".to_owned())
         }
+        "head_links" => Err(
+            "head_links must return up to 128 safe link objects with rel and href strings"
+                .to_owned(),
+        ),
         "new_player_name"
         | "uploaded_texture_name"
         | "add_closet_item_name"
@@ -1514,7 +1583,31 @@ mod tests {
             validate_plugin_filter("can_add_player", &serde_json::json!(true), &context).is_ok()
         );
         assert!(validate_plugin_filter("can_register", &serde_json::Value::Null, &context).is_ok());
+        assert!(validate_plugin_filter("head_links", &serde_json::json!([]), &context).is_ok());
         assert!(validate_plugin_filter_value("can_register", &serde_json::json!(false)).is_ok());
+        assert!(
+            validate_plugin_filter_value(
+                "head_links",
+                &serde_json::json!([{
+                    "rel": "stylesheet",
+                    "href": "https://cdn.example.test/plugin.css",
+                    "crossorigin": "anonymous"
+                }])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "head_links",
+                &serde_json::json!([{"rel": "stylesheet", "href": "javascript:alert(1)"}])
+            )
+            .is_err()
+        );
+        assert!(validate_plugin_filter_value(
+            "head_links",
+            &serde_json::json!([{"rel": "stylesheet", "href": "/plugin.css", "onload": "alert(1)"}])
+        )
+        .is_err());
         assert!(
             validate_plugin_filter_value(
                 "can_register",

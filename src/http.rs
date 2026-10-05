@@ -481,6 +481,65 @@ fn web_csrf_token_for_page(state: &AppState, headers: &HeaderMap) -> Option<(Str
     Some((format!("{nonce}.{signature}"), true))
 }
 
+fn add_plugin_head_links_to_html(html: &str, links: &serde_json::Value) -> String {
+    let Some(links) = links.as_array() else {
+        return html.to_owned();
+    };
+    let mut tags = String::new();
+    for link in links {
+        let Some(link) = link.as_object() else {
+            continue;
+        };
+        let (Some(rel), Some(href)) = (
+            link.get("rel").and_then(serde_json::Value::as_str),
+            link.get("href").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        tags.push_str("<link rel=\"");
+        tags.push_str(&escape_html_attribute(rel));
+        tags.push_str("\" href=\"");
+        tags.push_str(&escape_html_attribute(href));
+        tags.push('"');
+        for name in [
+            "as",
+            "crossorigin",
+            "integrity",
+            "media",
+            "referrerpolicy",
+            "sizes",
+            "type",
+        ] {
+            if let Some(value) = link.get(name).and_then(serde_json::Value::as_str) {
+                tags.push(' ');
+                tags.push_str(name);
+                tags.push_str("=\"");
+                tags.push_str(&escape_html_attribute(value));
+                tags.push('"');
+            }
+        }
+        tags.push_str(" />");
+    }
+    if tags.is_empty() {
+        return html.to_owned();
+    }
+    let Some(head_end) = html.find("</head>") else {
+        return html.to_owned();
+    };
+    let mut rendered = html.to_owned();
+    rendered.insert_str(head_end, &tags);
+    rendered
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&#39;")
+}
+
 fn add_web_csrf_to_html(html: &str, token: &str) -> String {
     static META_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let pattern = META_PATTERN.get_or_init(|| {
@@ -532,6 +591,7 @@ async fn inject_web_csrf_page(
     state: &AppState,
     request_headers: &HeaderMap,
     request_secure: bool,
+    request_path: &str,
     response: Response,
 ) -> Response {
     if !response.status().is_success()
@@ -559,6 +619,14 @@ async fn inject_web_csrf_page(
         Err(_) => return Response::from_parts(parts, Body::from(bytes)),
     };
     let html = add_web_csrf_to_html(&html, &token);
+    let head_links = apply_plugin_filter_value(
+        state,
+        "head_links",
+        &serde_json::json!([]),
+        &serde_json::json!({"path": request_path}),
+    )
+    .await;
+    let html = add_plugin_head_links_to_html(&html, &head_links);
     parts.headers.remove(CONTENT_LENGTH);
     parts.headers.remove(ETAG);
     parts.headers.remove(LAST_MODIFIED);
@@ -780,6 +848,7 @@ async fn detect_locale_preference(
         }
     }
     let should_set_cookie = !is_api;
+    let request_path = path.trim_start_matches('/').to_owned();
     let request_secure = request_is_secure(&request);
     let detected_root = detected_request_root(&request, request_secure);
     let app_url = select_request_app_url(&state, detected_root, request_secure).await;
@@ -807,7 +876,14 @@ async fn detect_locale_preference(
         }
     }
     if inject_csrf {
-        response = inject_web_csrf_page(&state, &request_headers, request_secure, response).await;
+        response = inject_web_csrf_page(
+            &state,
+            &request_headers,
+            request_secure,
+            &request_path,
+            response,
+        )
+        .await;
     }
     response
 }
@@ -18713,6 +18789,20 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn plugin_head_links_are_rendered_with_attribute_escaping() {
+        let html = super::add_plugin_head_links_to_html(
+            "<html><head></head><body></body></html>",
+            &serde_json::json!([{
+                "rel": "stylesheet",
+                "href": "https://cdn.example.test/a&b.css?x=\"quoted\"",
+                "crossorigin": "anonymous"
+            }]),
+        );
+        assert!(html.contains("<link rel=\"stylesheet\" href=\"https://cdn.example.test/a&amp;b.css?x=&quot;quoted&quot;\" crossorigin=\"anonymous\" />"));
+        assert!(html.contains("</head>"));
     }
 
     #[test]
