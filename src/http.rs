@@ -3395,11 +3395,30 @@ struct LoginRequest {
     lang: Option<String>,
 }
 
-async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
     if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
         return response;
     }
-    let request: LoginRequest = match serde_json::from_slice(&body) {
+    let mut fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return validation_error("identification", &request_locale(&state)),
+    };
+    if let Some(serde_json::Value::String(keep)) = fields.get("keep") {
+        let keep = !keep.is_empty() && keep != "0";
+        fields.insert("keep".to_owned(), serde_json::Value::Bool(keep));
+    }
+    let request: LoginRequest = match serde_json::from_value(serde_json::Value::Object(fields)) {
         Ok(request) => request,
         Err(_) => return validation_error("identification", &request_locale(&state)),
     };
@@ -16792,38 +16811,35 @@ mod tests {
                 .unwrap();
             assert_eq!(forged.status(), StatusCode::from_u16(419).unwrap());
         }
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("identification", email)
+            .append_pair("password", password)
+            .append_pair("keep", "on")
+            .finish();
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/auth/login")
+                    .uri("/auth/login?lang=en")
                     .header("cookie", cookie)
                     .header("x-csrf-token", csrf_token)
                     .header("x-real-ip", ip)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "identification": email,
-                            "password": password,
-                        })
-                        .to_string(),
-                    ))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
+        let set_cookie = response
             .headers()
             .get(SET_COOKIE)
             .unwrap()
             .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
+            .unwrap();
+        assert!(set_cookie.contains(&format!("Max-Age={}", super::LEGACY_REMEMBER_TTL_SECONDS)));
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
