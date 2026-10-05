@@ -827,7 +827,7 @@ fn plugin_filter_rejection(value: &serde_json::Value) -> Option<&str> {
     value.get("rejection").and_then(serde_json::Value::as_str)
 }
 
-async fn load_player_for_rename(
+async fn load_owned_player(
     database: &crate::database::DatabasePool,
     prefix: &str,
     user_id: i64,
@@ -838,7 +838,7 @@ async fn load_player_for_rename(
         Ok(Some(player)) => player,
         Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            tracing::error!(%error, player_id, "failed to load player before rename filters");
+            tracing::error!(%error, player_id, "failed to load player before plugin filters");
             return Err(unavailable());
         }
     };
@@ -846,6 +846,37 @@ async fn load_player_for_rename(
         return Err(player_forbidden_response(locale));
     }
     Ok(player)
+}
+
+async fn filter_player_delete(
+    state: &AppState,
+    user_id: i64,
+    player: &crate::database::PlayerRecord,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "player_id": player.pid,
+        "name": player.name,
+    });
+    emit_plugin_event(state, "player.delete.attempt", payload.clone()).await;
+    let can_delete = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "can_delete_player",
+            &serde_json::json!(true),
+            &serde_json::json!({
+                "user_id": user_id,
+                "player": player,
+            }),
+        )
+        .await;
+    if let Some(reason) = plugin_filter_rejection(&can_delete) {
+        return Err(reason.to_owned());
+    }
+    emit_plugin_event(state, "player.deleting", payload).await;
+    Ok(())
 }
 
 async fn filter_player_rename_name(
@@ -7389,7 +7420,7 @@ async fn web_rename_player(
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
         return validation_error("name", &request_locale(&state));
     }
-    let player = match load_player_for_rename(
+    let player = match load_owned_player(
         database,
         prefix,
         user.uid,
@@ -7622,6 +7653,21 @@ async fn web_delete_player(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    let player = match load_owned_player(
+        database,
+        prefix,
+        user.uid,
+        player_id,
+        &request_locale(&state),
+    )
+    .await
+    {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    if let Err(reason) = filter_player_delete(&state, user.uid, &player).await {
+        return login_result(1, &reason, None);
+    }
     let return_score = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
@@ -10559,7 +10605,7 @@ async fn api_rename_player(
     if !valid_player_name(&name, &name_rule, &custom_rule, min_length, max_length) {
         return validation_error("name", &request_locale(&state));
     }
-    let player = match load_player_for_rename(
+    let player = match load_owned_player(
         database,
         options,
         identity.user_id,
@@ -11122,6 +11168,21 @@ async fn api_delete_player(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    let player = match load_owned_player(
+        database,
+        prefix,
+        identity.user_id,
+        player_id,
+        &request_locale(&state),
+    )
+    .await
+    {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    if let Err(reason) = filter_player_delete(&state, identity.user_id, &player).await {
+        return login_result(1, &reason, None);
+    }
     let return_score = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
