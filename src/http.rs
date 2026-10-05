@@ -13318,6 +13318,12 @@ async fn rename_texture(
         serde_json::json!({"texture_id": tid, "previous_name": texture.name, "name": name}),
     )
     .await;
+    emit_plugin_event(
+        &state,
+        "texture.name.updated",
+        serde_json::json!({"texture_id": tid, "previous_name": texture.name, "name": name}),
+    )
+    .await;
     let message = if request_locale(&state).starts_with("zh") {
         format!("材质名称已被成功设置为 {name}")
     } else {
@@ -13692,6 +13698,12 @@ async fn toggle_texture_privacy(
             emit_plugin_event(
                 &state,
                 "texture.visibility.updated",
+                serde_json::json!({"texture_id": tid, "public": is_public}),
+            )
+            .await;
+            emit_plugin_event(
+                &state,
+                "texture.privacy.updated",
                 serde_json::json!({"texture_id": tid, "public": is_public}),
             )
             .await;

@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.25.0";
+const HOST_API_VERSION: &str = "1.26.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -96,11 +96,13 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "texture.uploaded",
     "texture.deleting",
     "texture.renamed",
+    "texture.name.updated",
     "texture.name.updating",
     "texture.privacy.updating",
     "texture.type.updating",
     "texture.deleted",
     "texture.visibility.updated",
+    "texture.privacy.updated",
     "texture.type.updated",
     "notification.sent",
     "notification.read",
@@ -1226,6 +1228,8 @@ mod tests {
             "closet.renaming",
             "closet.removing",
             "texture.uploading",
+            "texture.name.updated",
+            "texture.privacy.updated",
             "texture.deleting",
             "texture.name.updating",
             "texture.privacy.updating",
