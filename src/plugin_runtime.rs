@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.19.0";
+const HOST_API_VERSION: &str = "1.20.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -34,6 +34,12 @@ const PLUGIN_README_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.logged-in",
     "user.logged-out",
+    "auth.login.attempt",
+    "auth.login.ready",
+    "auth.login.succeeded",
+    "auth.login.failed",
+    "auth.logout.before",
+    "auth.logout.after",
     "user.registered",
     "user.profile.updated",
     "user.profile.updating",
@@ -1180,6 +1186,12 @@ mod tests {
         );
         assert!(validate_plugin_event("user.deleting", br#"{"user_id":7}"#).is_ok());
         for name in [
+            "auth.login.attempt",
+            "auth.login.ready",
+            "auth.login.succeeded",
+            "auth.login.failed",
+            "auth.logout.before",
+            "auth.logout.after",
             "user.email.updating",
             "user.email.updated",
             "user.nickname.updating",

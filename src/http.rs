@@ -3804,6 +3804,17 @@ async fn handle_login(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let auth_type = if looks_like_email(&identification) {
+        "email"
+    } else {
+        "username"
+    };
+    emit_plugin_event(
+        &state,
+        "auth.login.attempt",
+        serde_json::json!({"auth_type": auth_type}),
+    )
+    .await;
     let credential = if looks_like_email(&identification) {
         database
             .credentials_by_email(&state.config.database.table_prefix, &identification)
@@ -3828,6 +3839,12 @@ async fn handle_login(
             return unavailable();
         }
     };
+    emit_plugin_event(
+        &state,
+        "auth.login.ready",
+        serde_json::json!({"user_id": credential.uid}),
+    )
+    .await;
     if !crate::auth::verify_legacy_password(
         &password,
         &credential.password,
@@ -3853,6 +3870,12 @@ async fn handle_login(
             entry.1 = now;
             entry.0
         };
+        emit_plugin_event(
+            &state,
+            "auth.login.failed",
+            serde_json::json!({"user_id": credential.uid, "login_fails": failures}),
+        )
+        .await;
         let message = if locale.starts_with("zh") {
             "密码错误"
         } else {
@@ -3930,6 +3953,12 @@ async fn handle_login(
     match HeaderValue::from_str(&cookie) {
         Ok(value) => {
             response.headers_mut().insert(SET_COOKIE, value);
+            emit_plugin_event(
+                &state,
+                "auth.login.succeeded",
+                serde_json::json!({"user_id": credential.uid}),
+            )
+            .await;
             emit_plugin_event(
                 &state,
                 "user.logged-in",
@@ -8939,6 +8968,12 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
             return unavailable();
         }
     }
+    emit_plugin_event(
+        &state,
+        "auth.logout.before",
+        serde_json::json!({"user_id": user_id}),
+    )
+    .await;
     if let Err(error) = persist_web_session_revocation(&state, database, &token, &claims).await {
         tracing::error!(%error, user_id, "failed to revoke web session during logout");
         return unavailable();
@@ -8953,6 +8988,12 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         None,
     );
     let response = expire_web_session(&state, response);
+    emit_plugin_event(
+        &state,
+        "auth.logout.after",
+        serde_json::json!({"user_id": user_id}),
+    )
+    .await;
     emit_plugin_event(
         &state,
         "user.logged-out",
