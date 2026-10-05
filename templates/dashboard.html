@@ -39,6 +39,15 @@
         vertical-align: middle;
         margin-right: 0.45rem;
       }
+      .account-badge {
+        display: inline-block;
+        margin-right: 0.35rem;
+        padding: 0.2rem 0.45rem;
+        border-radius: 10px;
+        background: #6c757d;
+        color: white;
+        font-size: 0.8rem;
+      }
     </style>
     <meta name="csrf-token" content="" />
     {% if frontend_style_available %}
@@ -77,6 +86,14 @@
         >{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else
         %}Welcome, {{ user.nickname }}{% endif %}
       </h2>
+      {% if badges.len() > 0 %}
+      <p>
+        {% for badge in badges %}<span
+          class="account-badge bg-{{ badge.color }}"
+          >{{ badge.text }}</span
+        >{% endfor %}
+      </p>
+      {% endif %}
       <p>{{ user.email }}</p>
       {% if frontend_script_available %}
       <section id="usage-box" aria-label="Account usage and score"></section>

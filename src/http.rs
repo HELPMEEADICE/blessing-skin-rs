@@ -926,6 +926,34 @@ async fn filter_user_avatar_url(state: &AppState, user: &UserProfile, png: bool)
     filtered.as_str().unwrap_or(&default_url).to_owned()
 }
 
+fn user_badge_plugin_context(user: &UserProfile) -> serde_json::Value {
+    serde_json::json!({
+        "user": {
+            "uid": user.uid,
+            "nickname": user.nickname,
+            "score": user.score,
+            "avatar": user.avatar,
+            "permission": user.permission,
+            "verified": user.verified,
+        }
+    })
+}
+
+async fn filter_user_badges(state: &AppState, user: &UserProfile) -> serde_json::Value {
+    let initial_badges = if user.permission >= 1 {
+        serde_json::json!([{ "text": "STAFF", "color": "primary" }])
+    } else {
+        serde_json::json!([])
+    };
+    apply_plugin_filter_value(
+        state,
+        "user_badges",
+        &initial_badges,
+        &user_badge_plugin_context(user),
+    )
+    .await
+}
+
 async fn filter_user_password_hash(state: &AppState, password_hash: &str) -> String {
     let filtered = apply_plugin_filter_value(
         state,
@@ -4619,6 +4647,7 @@ struct DashboardPage {
     site_name: String,
     avatar_url: String,
     avatar_png_url: String,
+    badges: Vec<DashboardBadge>,
     user: UserProfile,
     players: Vec<PlayerRecord>,
     notifications: Vec<DashboardNotification>,
@@ -4629,6 +4658,12 @@ struct DashboardPage {
     frontend_script_available: bool,
     frontend_script: String,
     frontend_globals_b64: String,
+}
+
+#[derive(Deserialize)]
+struct DashboardBadge {
+    text: String,
+    color: String,
 }
 
 struct DashboardNotification {
@@ -5254,6 +5289,9 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     };
     let avatar_url = filter_user_avatar_url(&state, &user, false).await;
     let avatar_png_url = filter_user_avatar_url(&state, &user, true).await;
+    let badges =
+        serde_json::from_value::<Vec<DashboardBadge>>(filter_user_badges(&state, &user).await)
+            .unwrap_or_default();
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5271,6 +5309,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         site_name,
         avatar_url,
         avatar_png_url,
+        badges,
         user,
         players,
         notifications,
@@ -12554,27 +12593,7 @@ async fn skinlib_show_page(
             }
         });
     let badges = if let Some(uploader) = uploader_profile.as_ref() {
-        let initial_badges = if uploader.permission >= 1 {
-            serde_json::json!([{ "text": "STAFF", "color": "primary" }])
-        } else {
-            serde_json::json!([])
-        };
-        apply_plugin_filter_value(
-            &state,
-            "user_badges",
-            &initial_badges,
-            &serde_json::json!({
-                "user": {
-                    "uid": uploader.uid,
-                    "nickname": uploader.nickname,
-                    "score": uploader.score,
-                    "avatar": uploader.avatar,
-                    "permission": uploader.permission,
-                    "verified": uploader.verified,
-                }
-            }),
-        )
-        .await
+        filter_user_badges(&state, uploader).await
     } else {
         serde_json::json!([])
     };
@@ -22448,6 +22467,7 @@ mod tests {
         assert!(admin_user_dashboard.contains(r#"id="usage-box""#));
         assert!(admin_user_dashboard.contains(r#"srcset="/avatar/0?size=36" type="image/webp""#));
         assert!(admin_user_dashboard.contains(r#"src="/avatar/0?size=36&#38;png""#));
+        assert!(admin_user_dashboard.contains(r#"class="account-badge bg-primary">STAFF</span>"#));
         assert!(admin_user_dashboard.contains("http://localhost/app/style.012abcd.css"));
         assert!(admin_user_dashboard.contains("http://localhost/app/app.012abcd.js"));
         let encoded_dashboard_globals = admin_user_dashboard
@@ -22604,7 +22624,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(verification_dashboard.contains("Send verification email"));
+        assert!(verification_dashboard.contains("id=\"send-verification\""));
         let sent_verification = session_request(
             &app,
             &registered_cookie,
