@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.39.0";
+const HOST_API_VERSION: &str = "1.40.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -846,6 +846,7 @@ fn validate_plugin_filter(
             | "auth_page_rows:login"
             | "auth_page_rows:register"
             | "user_menu"
+            | "grid:user.player"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -1001,6 +1002,23 @@ fn valid_auth_page_rows(name: &str, value: &serde_json::Value) -> bool {
     true
 }
 
+fn valid_plugin_player_grid(value: &serde_json::Value) -> bool {
+    let allowed = ["player_management", "previewer"];
+    let Some(widgets) = value.as_array() else {
+        return false;
+    };
+    widgets.len() <= allowed.len()
+        && widgets.iter().all(|widget| {
+            widget
+                .as_str()
+                .is_some_and(|widget| allowed.contains(&widget))
+        })
+        && widgets
+            .iter()
+            .enumerate()
+            .all(|(index, widget)| !widgets[..index].iter().any(|previous| previous == widget))
+}
+
 fn valid_plugin_user_menu_item(value: &serde_json::Value) -> bool {
     let Some(item) = value.as_object() else {
         return false;
@@ -1038,6 +1056,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             Ok(())
         }
         "user_menu" if valid_plugin_user_menu(value) => Ok(()),
+        "grid:user.player" if valid_plugin_player_grid(value) => Ok(()),
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
@@ -1152,6 +1171,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "user_menu" => Err(
             "user_menu must return up to 64 safe label/link objects"
+                .to_owned(),
+        ),
+        "grid:user.player" => Err(
+            "grid:user.player must return a unique subset of player_management and previewer"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1749,6 +1772,34 @@ mod tests {
             validate_plugin_filter_value(
                 "auth_page_rows:register",
                 &serde_json::json!(["plugin.custom.twig"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:user.player",
+                &serde_json::json!(["previewer", "player_management"])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:user.player",
+                &serde_json::json!(["player_management"])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:user.player",
+                &serde_json::json!(["player_management", "player_management"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:user.player",
+                &serde_json::json!(["user.widgets.players.list"])
             )
             .is_err()
         );

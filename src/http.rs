@@ -1020,6 +1020,16 @@ async fn filter_user_menu(
     serde_json::from_value(filtered).unwrap_or(items)
 }
 
+async fn filter_player_page_widgets(state: &AppState) -> Vec<String> {
+    const DEFAULTS: &[&str] = &["player_management", "previewer"];
+    let initial = serde_json::json!(DEFAULTS);
+    let filtered =
+        apply_plugin_filter_value(state, "grid:user.player", &initial, &serde_json::json!({}))
+            .await;
+    serde_json::from_value(filtered)
+        .unwrap_or_else(|_| DEFAULTS.iter().map(|widget| (*widget).to_owned()).collect())
+}
+
 async fn filter_auth_page_rows(state: &AppState, page: &str, defaults: &[&str]) -> Vec<String> {
     let name = format!("auth_page_rows:{page}");
     let default_value = serde_json::json!(defaults);
@@ -5052,6 +5062,8 @@ struct PlayerManagementPage {
     site_name: String,
     locale: String,
     user: UserProfile,
+    page_widgets: Vec<String>,
+    has_player_management: bool,
     score_per_player: i64,
     rule_label: String,
     min_length: usize,
@@ -7913,6 +7925,7 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
             "The player name should be at least {min_length} characters and not greater than {max_length} characters."
         )
     };
+    let page_widgets = filter_player_page_widgets(&state).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -7932,10 +7945,15 @@ async fn web_player_page(State(state): State<AppState>, headers: HeaderMap) -> R
         }),
         i18n,
     );
+    let has_player_management = page_widgets
+        .iter()
+        .any(|widget| widget == "player_management");
     let page = PlayerManagementPage {
         site_name,
         locale: request_locale(&state),
         user,
+        page_widgets,
+        has_player_management,
         score_per_player,
         rule_label,
         min_length,

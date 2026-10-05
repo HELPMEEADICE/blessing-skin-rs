@@ -29,10 +29,14 @@
     </header>
     {% if frontend_script_available %}
     <div class="row">
-      <div class="col-md-7"><div id="players-list"></div></div>
-      <div class="col-md-5"><div id="previewer"></div></div>
+      {% for widget in page_widgets %}
+      {% if widget == "player_management" %}<div class="{% if page_widgets.len() == 1 %}col-md-12{% else %}col-md-7{% endif %}"><div id="players-list"></div></div>{% endif %}
+      {% if widget == "previewer" %}<div class="{% if page_widgets.len() == 1 %}col-md-12{% else %}col-md-5{% endif %}"><div id="previewer"></div></div>{% endif %}
+      {% endfor %}
     </div>
     {% else %}
+    {% for widget in page_widgets %}
+    {% if widget == "player_management" %}
     <p class="muted">{{ rule_label }} · {% if locale.starts_with("zh") %}长度{% else %}Length{% endif %}: {{ min_length }}–{{ max_length }} · {% if locale.starts_with("zh") %}添加角色消耗{% else %}Cost per player{% endif %}: {{ score_per_player }}</p>
     <form id="add-player">
       <input id="new-player-name" name="name" type="text" minlength="{{ min_length }}" maxlength="{{ max_length }}" placeholder="{% if locale.starts_with("zh") %}新角色名{% else %}New player name{% endif %}" required>
@@ -41,8 +45,11 @@
     <div id="message" role="status"></div>
     <ul id="players" aria-live="polite"></ul>
     {% endif %}
+    {% endfor %}
+    {% endif %}
   </main>
   {% if frontend_script_available %}{% else %}
+  {% if has_player_management %}
   <script>
     const list = document.getElementById('players');
     const message = document.getElementById('message');
@@ -130,11 +137,14 @@
         await load();
       } catch (error) { show(error.message, true); }
     });
+    load();
+  </script>
+  {% endif %}
+  <script>
     document.getElementById('logout').addEventListener('click', async () => {
       await fetch('/auth/logout', { method: 'POST', headers: { 'Accept': 'application/json' } });
       window.location.href = '/auth/login';
     });
-    load();
   </script>{% endif %}
   {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
