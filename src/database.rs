@@ -7515,7 +7515,7 @@ impl DatabasePool {
         }
     }
 
-    async fn user_has_texture(
+    pub async fn user_has_texture(
         &self,
         prefix: &str,
         user_id: i64,

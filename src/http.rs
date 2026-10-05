@@ -972,6 +972,225 @@ async fn emit_player_textures_updated(state: &AppState, player: &PlayerRecord) {
     .await;
 }
 
+async fn apply_player_permission_filter(
+    state: &AppState,
+    name: &str,
+    context: serde_json::Value,
+) -> Result<(), String> {
+    let result = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(name, &serde_json::json!(true), &context)
+        .await;
+    plugin_filter_rejection(&result)
+        .map(str::to_owned)
+        .map_or(Ok(()), Err)
+}
+
+async fn set_player_textures_with_plugins(
+    state: &AppState,
+    user_id: i64,
+    player_id: i64,
+    skin: Option<i64>,
+    cape: Option<i64>,
+    locale: &str,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let mut player = match load_owned_player(database, prefix, user_id, player_id, locale).await {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    for (texture_type, texture_id) in [("skin", skin), ("cape", cape)] {
+        if let Err(reason) = apply_player_permission_filter(
+            state,
+            "can_set_texture",
+            serde_json::json!({
+                "user_id": user_id,
+                "player": player,
+                "type": texture_type,
+                "texture_id": texture_id,
+            }),
+        )
+        .await
+        {
+            return login_result(1, &reason, None);
+        }
+        let Some(texture_id) = texture_id.filter(|texture_id| *texture_id != 0) else {
+            continue;
+        };
+        match database.texture_info(prefix, texture_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return player_texture_response(
+                    Ok(crate::database::PlayerTextureOutcome::TextureNotFound),
+                    locale,
+                    false,
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, texture_id, "failed to load player texture before plugin event");
+                return unavailable();
+            }
+        }
+        match database.user_has_texture(prefix, user_id, texture_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return player_texture_response(
+                    Ok(crate::database::PlayerTextureOutcome::TextureNotInCloset),
+                    locale,
+                    false,
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, user_id, texture_id, "failed to check player texture closet membership");
+                return unavailable();
+            }
+        }
+        let previous_texture_id = if texture_type == "skin" {
+            player.tid_skin
+        } else {
+            player.tid_cape
+        };
+        emit_plugin_event(
+            state,
+            "player.texture.updating",
+            serde_json::json!({
+                "user_id": user_id,
+                "player_id": player_id,
+                "name": player.name,
+                "type": texture_type,
+                "texture_id": texture_id,
+            }),
+        )
+        .await;
+        match database
+            .set_player_textures(
+                prefix,
+                user_id,
+                player_id,
+                (texture_type == "skin").then_some(texture_id),
+                (texture_type == "cape").then_some(texture_id),
+            )
+            .await
+        {
+            Ok(crate::database::PlayerTextureOutcome::Updated(updated)) => {
+                emit_plugin_event(
+                    state,
+                    "player.texture.updated",
+                    serde_json::json!({
+                        "user_id": user_id,
+                        "player_id": player_id,
+                        "name": updated.name,
+                        "type": texture_type,
+                        "previous_texture_id": previous_texture_id,
+                        "texture_id": texture_id,
+                    }),
+                )
+                .await;
+                player = updated;
+            }
+            result => return player_texture_response(result, locale, false),
+        }
+    }
+    emit_player_textures_updated(state, &player).await;
+    player_texture_response(
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+        locale,
+        false,
+    )
+}
+
+async fn clear_player_textures_with_plugins(
+    state: &AppState,
+    user_id: i64,
+    player_id: i64,
+    clear_skin: bool,
+    clear_cape: bool,
+    locale: &str,
+) -> Response {
+    let Some(database) = &state.database else {
+        return unavailable();
+    };
+    let prefix = &state.config.database.table_prefix;
+    let mut player = match load_owned_player(database, prefix, user_id, player_id, locale).await {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    for (texture_type, should_clear) in [("skin", clear_skin), ("cape", clear_cape)] {
+        if let Err(reason) = apply_player_permission_filter(
+            state,
+            "can_clear_texture",
+            serde_json::json!({
+                "user_id": user_id,
+                "player": player,
+                "type": texture_type,
+            }),
+        )
+        .await
+        {
+            return login_result(1, &reason, None);
+        }
+        if !should_clear {
+            continue;
+        }
+        let previous_texture_id = if texture_type == "skin" {
+            player.tid_skin
+        } else {
+            player.tid_cape
+        };
+        emit_plugin_event(
+            state,
+            "player.texture.resetting",
+            serde_json::json!({
+                "user_id": user_id,
+                "player_id": player_id,
+                "name": player.name,
+                "type": texture_type,
+                "texture_id": previous_texture_id,
+            }),
+        )
+        .await;
+        match database
+            .clear_player_textures(
+                prefix,
+                user_id,
+                player_id,
+                texture_type == "skin",
+                texture_type == "cape",
+            )
+            .await
+        {
+            Ok(crate::database::PlayerTextureOutcome::Updated(updated)) => {
+                emit_plugin_event(
+                    state,
+                    "player.texture.reset",
+                    serde_json::json!({
+                        "user_id": user_id,
+                        "player_id": player_id,
+                        "name": updated.name,
+                        "type": texture_type,
+                        "previous_texture_id": previous_texture_id,
+                        "texture_id": 0,
+                    }),
+                )
+                .await;
+                player = updated;
+            }
+            result => return player_texture_response(result, locale, true),
+        }
+    }
+    emit_player_textures_updated(state, &player).await;
+    player_texture_response(
+        Ok(crate::database::PlayerTextureOutcome::Updated(player)),
+        locale,
+        true,
+    )
+}
+
 pub fn router(state: AppState) -> Router {
     let app = Router::new()
         .route("/health/live", any(live))
@@ -7503,29 +7722,15 @@ async fn web_set_player_textures(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let Some(database) = &state.database else {
-        return unavailable();
-    };
-    let result = database
-        .set_player_textures(
-            &state.config.database.table_prefix,
-            user.uid,
-            player_id,
-            skin,
-            cape,
-        )
-        .await;
-    match result {
-        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
-            emit_player_textures_updated(&state, &player).await;
-            player_texture_response(
-                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &request_locale(&state),
-                false,
-            )
-        }
-        result => player_texture_response(result, &request_locale(&state), false),
-    }
+    return set_player_textures_with_plugins(
+        &state,
+        user.uid,
+        player_id,
+        skin,
+        cape,
+        &request_locale(&state),
+    )
+    .await;
 }
 
 async fn web_clear_player_textures(
@@ -7549,29 +7754,15 @@ async fn web_clear_player_textures(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let Some(database) = &state.database else {
-        return unavailable();
-    };
-    let result = database
-        .clear_player_textures(
-            &state.config.database.table_prefix,
-            user.uid,
-            player_id,
-            clear_skin,
-            clear_cape,
-        )
-        .await;
-    match result {
-        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
-            emit_player_textures_updated(&state, &player).await;
-            player_texture_response(
-                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &request_locale(&state),
-                true,
-            )
-        }
-        result => player_texture_response(result, &request_locale(&state), true),
-    }
+    return clear_player_textures_with_plugins(
+        &state,
+        user.uid,
+        player_id,
+        clear_skin,
+        clear_cape,
+        &request_locale(&state),
+    )
+    .await;
 }
 
 fn player_texture_clear_flags(
@@ -10700,29 +10891,15 @@ async fn api_set_player_textures(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let Some(database) = &state.database else {
-        return unavailable();
-    };
-    let result = database
-        .set_player_textures(
-            &state.config.database.table_prefix,
-            identity.user_id,
-            player_id,
-            skin,
-            cape,
-        )
-        .await;
-    match result {
-        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
-            emit_player_textures_updated(&state, &player).await;
-            player_texture_response(
-                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &request_locale(&state),
-                false,
-            )
-        }
-        result => player_texture_response(result, &request_locale(&state), false),
-    }
+    return set_player_textures_with_plugins(
+        &state,
+        identity.user_id,
+        player_id,
+        skin,
+        cape,
+        &request_locale(&state),
+    )
+    .await;
 }
 
 async fn api_clear_player_textures(
@@ -10749,29 +10926,15 @@ async fn api_clear_player_textures(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let Some(database) = &state.database else {
-        return unavailable();
-    };
-    let result = database
-        .clear_player_textures(
-            &state.config.database.table_prefix,
-            identity.user_id,
-            player_id,
-            clear_skin,
-            clear_cape,
-        )
-        .await;
-    match result {
-        Ok(crate::database::PlayerTextureOutcome::Updated(player)) => {
-            emit_player_textures_updated(&state, &player).await;
-            player_texture_response(
-                Ok(crate::database::PlayerTextureOutcome::Updated(player)),
-                &request_locale(&state),
-                true,
-            )
-        }
-        result => player_texture_response(result, &request_locale(&state), true),
-    }
+    return clear_player_textures_with_plugins(
+        &state,
+        identity.user_id,
+        player_id,
+        clear_skin,
+        clear_cape,
+        &request_locale(&state),
+    )
+    .await;
 }
 
 fn player_texture_input_ids(

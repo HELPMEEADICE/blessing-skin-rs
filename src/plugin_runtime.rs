@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.14.0";
+const HOST_API_VERSION: &str = "1.15.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -59,6 +59,8 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "player.textures.updated",
     "player.texture.updating",
     "player.texture.updated",
+    "player.texture.resetting",
+    "player.texture.reset",
     "texture.uploaded",
     "texture.renamed",
     "texture.deleted",
@@ -770,6 +772,8 @@ fn validate_plugin_filter(
             | "can_add_player"
             | "can_rename_player"
             | "can_delete_player"
+            | "can_set_texture"
+            | "can_clear_texture"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -791,6 +795,7 @@ fn validate_plugin_filter(
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
         "can_sign" | "can_add_player" | "can_rename_player" | "can_delete_player"
+        | "can_set_texture" | "can_clear_texture"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -800,7 +805,8 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         }
         "new_player_name" if value.is_string() => Ok(()),
         "sign_score" if value.as_i64().is_some() => Ok(()),
-        "can_sign" | "can_add_player" | "can_rename_player" | "can_delete_player" => Err(
+        "can_sign" | "can_add_player" | "can_rename_player" | "can_delete_player"
+        | "can_set_texture" | "can_clear_texture" => Err(
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
@@ -1217,6 +1223,20 @@ mod tests {
         );
         assert!(
             validate_plugin_event(
+                "player.texture.resetting",
+                br#"{"user_id":7,"player_id":3,"name":"Alex","type":"skin","texture_id":11}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "player.texture.reset",
+                br#"{"user_id":7,"player_id":3,"name":"Alex","type":"skin","previous_texture_id":11,"texture_id":0}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
                 "player.owner.updating",
                 br#"{"player_id":3,"previous_user_id":7,"user_id":9}"#
             )
@@ -1252,6 +1272,12 @@ mod tests {
             validate_plugin_filter("can_delete_player", &serde_json::json!(true), &context).is_ok()
         );
         assert!(
+            validate_plugin_filter("can_set_texture", &serde_json::json!(true), &context).is_ok()
+        );
+        assert!(
+            validate_plugin_filter("can_clear_texture", &serde_json::json!(true), &context).is_ok()
+        );
+        assert!(
             validate_plugin_filter_value(
                 "can_rename_player",
                 &serde_json::json!({ "rejection": "disabled" })
@@ -1262,6 +1288,20 @@ mod tests {
             validate_plugin_filter_value(
                 "can_delete_player",
                 &serde_json::json!({ "rejection": "deletion disabled" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "can_set_texture",
+                &serde_json::json!({ "rejection": "texture setting disabled" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "can_clear_texture",
+                &serde_json::json!({ "rejection": "texture clearing disabled" })
             )
             .is_ok()
         );
