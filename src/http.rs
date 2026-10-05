@@ -14536,31 +14536,30 @@ async fn apply_admin_player_mutation(
                 None,
             )
         }
-        AdminPlayerMutation::Delete => match database.delete_admin_player(prefix, pid).await {
-            Ok(true) => {
-                emit_plugin_event(
-                    state,
-                    "player.deleted",
-                    serde_json::json!({
-                        "user_id": player.uid,
-                        "player_id": pid,
-                        "name": player.name,
-                    }),
-                )
-                .await;
-                admin_player_success(
-                    AdminPlayerMutation::Delete,
-                    &request_locale(&state),
-                    &player.name,
-                    None,
-                )
+        AdminPlayerMutation::Delete => {
+            let event = serde_json::json!({
+                "user_id": player.uid,
+                "player_id": pid,
+                "name": player.name,
+            });
+            emit_plugin_event(state, "player.deleting", event.clone()).await;
+            match database.delete_admin_player(prefix, pid).await {
+                Ok(true) => {
+                    emit_plugin_event(state, "player.deleted", event).await;
+                    admin_player_success(
+                        AdminPlayerMutation::Delete,
+                        &request_locale(&state),
+                        &player.name,
+                        None,
+                    )
+                }
+                Ok(false) => StatusCode::NOT_FOUND.into_response(),
+                Err(error) => {
+                    tracing::error!(%error, pid, "failed to delete managed player");
+                    unavailable()
+                }
             }
-            Ok(false) => StatusCode::NOT_FOUND.into_response(),
-            Err(error) => {
-                tracing::error!(%error, pid, "failed to delete managed player");
-                unavailable()
-            }
-        },
+        }
     }
 }
 
