@@ -12522,11 +12522,31 @@ async fn skinlib_show_page(
                 "No such user.".to_owned()
             }
         });
-    let badges = uploader_profile
-        .as_ref()
-        .filter(|user| user.permission >= 1)
-        .map(|_| serde_json::json!([{ "text": "STAFF", "color": "primary" }]))
-        .unwrap_or_else(|| serde_json::json!([]));
+    let badges = if let Some(uploader) = uploader_profile.as_ref() {
+        let initial_badges = if uploader.permission >= 1 {
+            serde_json::json!([{ "text": "STAFF", "color": "primary" }])
+        } else {
+            serde_json::json!([])
+        };
+        apply_plugin_filter_value(
+            &state,
+            "user_badges",
+            &initial_badges,
+            &serde_json::json!({
+                "user": {
+                    "uid": uploader.uid,
+                    "nickname": uploader.nickname,
+                    "score": uploader.score,
+                    "avatar": uploader.avatar,
+                    "permission": uploader.permission,
+                    "verified": uploader.verified,
+                }
+            }),
+        )
+        .await
+    } else {
+        serde_json::json!([])
+    };
     let in_closet = if let Some(viewer_uid) = viewer_uid {
         match database
             .closet_item_ids(&state.config.database.table_prefix, viewer_uid)

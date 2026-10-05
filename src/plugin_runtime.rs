@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.35.0";
+const HOST_API_VERSION: &str = "1.36.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -841,6 +841,7 @@ fn validate_plugin_filter(
             | "can_register"
             | "user_password"
             | "head_links"
+            | "user_badges"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -864,6 +865,29 @@ fn validate_plugin_filter(
 
 fn valid_client_ip(value: &str) -> bool {
     value == "unknown" || (value.len() <= 45 && value.parse::<std::net::IpAddr>().is_ok())
+}
+
+fn valid_plugin_badge(value: &serde_json::Value) -> bool {
+    let Some(badge) = value.as_object() else {
+        return false;
+    };
+    let Some(text) = badge.get("text").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(color) = badge.get("color").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    !text.trim().is_empty()
+        && text.len() <= 128
+        && !text.chars().any(char::is_control)
+        && !color.is_empty()
+        && color.len() <= 32
+        && color
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        && badge.len() == 2
+        && badge.contains_key("text")
+        && badge.contains_key("color")
 }
 
 fn valid_plugin_head_link(value: &serde_json::Value) -> bool {
@@ -929,6 +953,13 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
+            }) =>
+        {
+            Ok(())
+        }
+        "user_badges"
+            if value.as_array().is_some_and(|badges| {
+                badges.len() <= 64 && badges.iter().all(valid_plugin_badge)
             }) =>
         {
             Ok(())
@@ -1016,6 +1047,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         }
         "head_links" => Err(
             "head_links must return up to 128 safe link objects with rel and href strings"
+                .to_owned(),
+        ),
+        "user_badges" => Err(
+            "user_badges must return up to 64 objects with bounded text and CSS-safe color fields"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1584,6 +1619,28 @@ mod tests {
         );
         assert!(validate_plugin_filter("can_register", &serde_json::Value::Null, &context).is_ok());
         assert!(validate_plugin_filter("head_links", &serde_json::json!([]), &context).is_ok());
+        assert!(
+            validate_plugin_filter(
+                "user_badges",
+                &serde_json::json!([{"text": "STAFF", "color": "primary"}]),
+                &serde_json::json!({"user": {"uid": 7}})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_badges",
+                &serde_json::json!([{"text": "Trusted", "color": "success-2"}])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_badges",
+                &serde_json::json!([{"text": "Unsafe", "color": "primary\" onclick=\"x"}])
+            )
+            .is_err()
+        );
         assert!(validate_plugin_filter_value("can_register", &serde_json::json!(false)).is_ok());
         assert!(
             validate_plugin_filter_value(
