@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.38.0";
+const HOST_API_VERSION: &str = "1.39.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -845,6 +845,7 @@ fn validate_plugin_filter(
             | "user_avatar"
             | "auth_page_rows:login"
             | "auth_page_rows:register"
+            | "user_menu"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -1000,6 +1001,34 @@ fn valid_auth_page_rows(name: &str, value: &serde_json::Value) -> bool {
     true
 }
 
+fn valid_plugin_user_menu_item(value: &serde_json::Value) -> bool {
+    let Some(item) = value.as_object() else {
+        return false;
+    };
+    let Some(label) = item.get("label").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(link) = item.get("link").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let safe_link = matches!(link, "#divider" | "#launch-cli") || valid_plugin_avatar_url(link);
+    let valid_label = label.len() <= 128 && !label.chars().any(char::is_control);
+    let divider_label = link == "#divider" && label.is_empty();
+    let normal_label = link != "#divider" && !label.trim().is_empty();
+    item.len() == 2
+        && item.contains_key("label")
+        && item.contains_key("link")
+        && safe_link
+        && valid_label
+        && (divider_label || normal_label)
+}
+
+fn valid_plugin_user_menu(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.len() <= 64 && items.iter().all(valid_plugin_user_menu_item))
+}
+
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
         "can_register" => Ok(()),
@@ -1008,6 +1037,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         {
             Ok(())
         }
+        "user_menu" if valid_plugin_user_menu(value) => Ok(()),
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
@@ -1118,6 +1148,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "auth_page_rows:login" | "auth_page_rows:register" => Err(
             "auth_page_rows must return a unique subset of the built-in page row identifiers"
+                .to_owned(),
+        ),
+        "user_menu" => Err(
+            "user_menu must return up to 64 safe label/link objects"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1715,6 +1749,32 @@ mod tests {
             validate_plugin_filter_value(
                 "auth_page_rows:register",
                 &serde_json::json!(["plugin.custom.twig"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter(
+                "user_menu",
+                &serde_json::json!([
+                    {"label": "User Center", "link": "/user"},
+                    {"label": "", "link": "#divider"},
+                    {"label": "Admin", "link": "https://skin.example.test/admin"}
+                ]),
+                &serde_json::json!({"user": {"uid": 7}})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_menu",
+                &serde_json::json!([{"label": "External", "link": "javascript:alert(1)"}])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_menu",
+                &serde_json::json!([{"label": "", "link": "/user"}])
             )
             .is_err()
         );

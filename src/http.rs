@@ -926,7 +926,7 @@ async fn filter_user_avatar_url(state: &AppState, user: &UserProfile, png: bool)
     filtered.as_str().unwrap_or(&default_url).to_owned()
 }
 
-fn user_badge_plugin_context(user: &UserProfile) -> serde_json::Value {
+fn public_user_plugin_context(user: &UserProfile) -> serde_json::Value {
     serde_json::json!({
         "user": {
             "uid": user.uid,
@@ -949,9 +949,75 @@ async fn filter_user_badges(state: &AppState, user: &UserProfile) -> serde_json:
         state,
         "user_badges",
         &initial_badges,
-        &user_badge_plugin_context(user),
+        &public_user_plugin_context(user),
     )
     .await
+}
+
+async fn filter_user_menu(
+    state: &AppState,
+    user: &UserProfile,
+    locale: &str,
+) -> Vec<DashboardMenuItem> {
+    let chinese = locale.starts_with("zh");
+    let mut items = vec![
+        DashboardMenuItem {
+            label: if chinese {
+                "用户中心"
+            } else {
+                "User Center"
+            }
+            .to_owned(),
+            link: "/user".to_owned(),
+        },
+        DashboardMenuItem {
+            label: if chinese {
+                "个人资料"
+            } else {
+                "User Profile"
+            }
+            .to_owned(),
+            link: "/user/profile".to_owned(),
+        },
+    ];
+    if user.permission >= 1 {
+        items.extend([
+            DashboardMenuItem {
+                label: String::new(),
+                link: "#divider".to_owned(),
+            },
+            DashboardMenuItem {
+                label: if chinese {
+                    "管理面板"
+                } else {
+                    "Admin Panel"
+                }
+                .to_owned(),
+                link: "/admin".to_owned(),
+            },
+            DashboardMenuItem {
+                label: if chinese { "用户管理" } else { "Users" }.to_owned(),
+                link: "/admin/users".to_owned(),
+            },
+            DashboardMenuItem {
+                label: if chinese { "举报管理" } else { "Reports" }.to_owned(),
+                link: "/admin/reports".to_owned(),
+            },
+            DashboardMenuItem {
+                label: "Web CLI".to_owned(),
+                link: "#launch-cli".to_owned(),
+            },
+        ]);
+    }
+    let initial = serde_json::to_value(&items).unwrap_or_else(|_| serde_json::json!([]));
+    let filtered = apply_plugin_filter_value(
+        state,
+        "user_menu",
+        &initial,
+        &public_user_plugin_context(user),
+    )
+    .await;
+    serde_json::from_value(filtered).unwrap_or(items)
 }
 
 async fn filter_auth_page_rows(state: &AppState, page: &str, defaults: &[&str]) -> Vec<String> {
@@ -4687,6 +4753,7 @@ struct DashboardPage {
     avatar_url: String,
     avatar_png_url: String,
     badges: Vec<DashboardBadge>,
+    menu: Vec<DashboardMenuItem>,
     user: UserProfile,
     players: Vec<PlayerRecord>,
     notifications: Vec<DashboardNotification>,
@@ -4703,6 +4770,12 @@ struct DashboardPage {
 struct DashboardBadge {
     text: String,
     color: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DashboardMenuItem {
+    label: String,
+    link: String,
 }
 
 struct DashboardNotification {
@@ -5331,6 +5404,8 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     let badges =
         serde_json::from_value::<Vec<DashboardBadge>>(filter_user_badges(&state, &user).await)
             .unwrap_or_default();
+    let locale = request_locale(&state);
+    let menu = filter_user_menu(&state, &user, &locale).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5349,11 +5424,12 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         avatar_url,
         avatar_png_url,
         badges,
+        menu,
         user,
         players,
         notifications,
         show_email_verification,
-        locale: request_locale(&state),
+        locale,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -20658,6 +20734,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_user_plugin_context_excludes_private_account_fields() {
+        let user = super::UserProfile {
+            uid: 7,
+            email: "private@example.test".to_owned(),
+            nickname: "Alex".to_owned(),
+            locale: Some("en".to_owned()),
+            score: 12,
+            avatar: 9,
+            permission: 1,
+            last_sign_at: String::new(),
+            register_at: String::new(),
+            verified: true,
+            is_dark_mode: false,
+        };
+        let context = super::public_user_plugin_context(&user);
+        assert_eq!(
+            context["user"],
+            serde_json::json!({
+                "uid": 7,
+                "nickname": "Alex",
+                "score": 12,
+                "avatar": 9,
+                "permission": 1,
+                "verified": true
+            })
+        );
+        assert_eq!(context["user"].as_object().unwrap().len(), 6);
+    }
+
     #[tokio::test]
     async fn login_issues_a_session_that_opens_the_user_dashboard() {
         use axum::{
@@ -22526,6 +22632,9 @@ mod tests {
         .unwrap();
         assert!(admin_user_dashboard.contains(r#"href="/admin""#));
         assert!(admin_user_dashboard.contains(r#"id="usage-box""#));
+        assert!(admin_user_dashboard.contains(r#"class="account-menu""#));
+        assert!(admin_user_dashboard.contains("User Center"));
+        assert!(admin_user_dashboard.contains("Web CLI"));
         assert!(admin_user_dashboard.contains(r#"srcset="/avatar/0?size=36" type="image/webp""#));
         assert!(admin_user_dashboard.contains(r#"src="/avatar/0?size=36&#38;png""#));
         assert!(admin_user_dashboard.contains(r#"class="account-badge bg-primary""#));
