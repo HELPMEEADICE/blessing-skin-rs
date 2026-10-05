@@ -19,6 +19,10 @@ interface events {
     handle: func(name: string, payload: list<u8>) -> result<_, string>;
 }
 
+interface filters {
+    apply: func(name: string, value: string, context: string) -> result<option<string>, string>;
+}
+
 interface documentation {
     readme: func() -> result<option<string>, string>;
 }
@@ -33,6 +37,7 @@ world plugin {
     import state;
     export lifecycle;
     export events;
+    export filters;
     export documentation;
     export configuration;
 }

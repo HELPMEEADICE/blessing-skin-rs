@@ -74,4 +74,14 @@ impl bindings::exports::blessing_skin::plugin::configuration::Guest for PlayerCo
     }
 }
 
+impl bindings::exports::blessing_skin::plugin::filters::Guest for PlayerCounter {
+    fn apply(
+        _name: String,
+        _value: String,
+        _context: String,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
 bindings::export!(PlayerCounter with_types_in bindings);

@@ -823,6 +823,10 @@ fn legacy_sign_is_eligible(last_sign_at: &str, eligible_before: &str) -> bool {
     last_sign_at <= eligible_before
 }
 
+fn user_sign_filter_rejection(value: &serde_json::Value) -> Option<&str> {
+    value.get("rejection").and_then(serde_json::Value::as_str)
+}
+
 fn user_sign_plugin_event(user_id: i64, score: i64) -> serde_json::Value {
     serde_json::json!({
         "user_id": user_id,
@@ -6891,6 +6895,19 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let can_sign = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "can_sign",
+            &serde_json::json!(true),
+            &serde_json::json!({ "user_id": user.uid }),
+        )
+        .await;
+    if let Some(reason) = user_sign_filter_rejection(&can_sign) {
+        return login_result(2, reason, None);
+    }
     let prefix = &state.config.database.table_prefix;
     let sign_after_zero = match database.option(prefix, "sign_after_zero").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
@@ -6934,7 +6951,18 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
     if !legacy_sign_is_eligible(&user.last_sign_at, &eligible_before) {
         return login_result(1, "", None);
     }
-    let reward = rand::thread_rng().gen_range(minimum..=maximum);
+    let base_reward = rand::thread_rng().gen_range(minimum..=maximum);
+    let filtered_reward = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "sign_score",
+            &serde_json::json!(base_reward),
+            &serde_json::json!({ "user_id": user.uid }),
+        )
+        .await;
+    let reward = filtered_reward.as_i64().unwrap_or(base_reward);
     emit_plugin_event(
         &state,
         "user.sign.before",
@@ -17848,6 +17876,24 @@ mod tests {
             "2026-10-05 00:00:01",
             "2026-10-05 00:00:00"
         ));
+    }
+
+    #[test]
+    fn user_sign_filter_only_rejects_the_rejection_object() {
+        assert_eq!(
+            super::user_sign_filter_rejection(&serde_json::json!(true)),
+            None
+        );
+        assert_eq!(
+            super::user_sign_filter_rejection(&serde_json::json!(false)),
+            None
+        );
+        assert_eq!(
+            super::user_sign_filter_rejection(&serde_json::json!({
+                "rejection": "sign-in is disabled"
+            })),
+            Some("sign-in is disabled")
+        );
     }
 
     #[test]

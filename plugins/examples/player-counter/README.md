@@ -6,6 +6,6 @@ Install the Rust WebAssembly component toolchain using the Bytecode Alliance com
 
     cargo component build --release
 
-Copy target/wasm32-wasip1/release/blessing_skin_player_counter.wasm into the configured PLUGINS_DIR, then restart the Rust service. The host provides only the documented logging and plugin state imports; this guest does not use filesystem, network, WASI, or raw database access.
+Copy target/wasm32-wasip1/release/blessing_skin_player_counter.wasm into the configured PLUGINS_DIR, then restart the Rust service. The host provides only the documented logging and plugin state imports; this guest does not use filesystem, network, WASI, or raw database access. Its optional filter export is a pass-through example; the SDK documents supported filter names and JSON values.
 
 The WIT source here is kept byte-for-byte aligned with plugins/sdk/wit/world.wit. A repository test checks this and the legacy-plugin migration scaffold against the same contract.

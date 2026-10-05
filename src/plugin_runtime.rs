@@ -12,11 +12,12 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.8.0";
+const HOST_API_VERSION: &str = "1.9.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
 const PLUGIN_EVENTS_INTERFACE: &str = "blessing-skin:plugin/events@1.0.0";
+const PLUGIN_FILTERS_INTERFACE: &str = "blessing-skin:plugin/filters@1.0.0";
 const PLUGIN_DOCUMENTATION_INTERFACE: &str = "blessing-skin:plugin/documentation@1.0.0";
 const PLUGIN_CONFIGURATION_INTERFACE: &str = "blessing-skin:plugin/configuration@1.0.0";
 const COMPONENT_FUEL: u64 = 5_000_000;
@@ -27,6 +28,7 @@ const PLUGIN_STATE_VALUE_LIMIT: usize = 64 * 1024;
 const PLUGIN_STATE_ENTRY_LIMIT: usize = 256;
 const PLUGIN_STATE_TOTAL_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
+const PLUGIN_FILTER_VALUE_LIMIT: usize = 64 * 1024;
 const PLUGIN_CONFIGURATION_LIMIT: usize = 64 * 1024;
 const PLUGIN_README_LIMIT: usize = 1024 * 1024;
 const PLUGIN_EVENT_NAMES: &[&str] = &[
@@ -73,6 +75,7 @@ struct LoadedPlugin {
     instance: Instance,
     lifecycle: ComponentExportIndex,
     events: Option<ComponentExportIndex>,
+    filters: Option<ComponentExportIndex>,
     documentation: Option<ComponentExportIndex>,
     configuration: Option<ComponentExportIndex>,
 }
@@ -381,6 +384,22 @@ impl PluginRuntime {
                 &handle_export,
             )?;
         }
+        let filters = instance.get_export_index(&mut store, None, PLUGIN_FILTERS_INTERFACE);
+        if let Some(filters_export) = &filters {
+            let apply_export = instance
+                .get_export_index(&mut store, Some(filters_export), "apply")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin filters interface is missing apply",
+                    )
+                })?;
+            instance
+                .get_typed_func::<(String, String, String), (Result<Option<String>, String>,)>(
+                    &mut store,
+                    &apply_export,
+                )?;
+        }
         let documentation =
             instance.get_export_index(&mut store, None, PLUGIN_DOCUMENTATION_INTERFACE);
         if let Some(export) = &documentation {
@@ -423,6 +442,7 @@ impl PluginRuntime {
             instance,
             lifecycle,
             events,
+            filters,
             documentation,
             configuration,
         });
@@ -476,6 +496,53 @@ impl PluginRuntime {
                 }
             }
         }
+    }
+
+    pub async fn apply_filter(
+        &mut self,
+        name: &str,
+        value: &serde_json::Value,
+        context: &serde_json::Value,
+    ) -> serde_json::Value {
+        if let Err(error) = validate_plugin_filter(name, value, context) {
+            tracing::warn!(%error, filter = name, "ignored invalid WASM plugin filter input");
+            return value.clone();
+        }
+        let database = self.database.clone();
+        let table_prefix = self.table_prefix.clone();
+        let mut current = value.clone();
+        for plugin in &mut self.plugins {
+            if plugin.filters.is_none() {
+                continue;
+            }
+            let previous_state = plugin.store.data().state.clone();
+            match invoke_plugin_filter(plugin, name, &current, context) {
+                Ok(filtered) => {
+                    if plugin.store.data().state != previous_state {
+                        let Some(database) = &database else {
+                            plugin.store.data_mut().state = previous_state;
+                            tracing::warn!(plugin = %plugin.path.display(), filter = name, "WASM plugin filter state was rolled back because storage is unavailable");
+                            continue;
+                        };
+                        if let Err(error) =
+                            persist_plugin_state(database, &table_prefix, plugin).await
+                        {
+                            plugin.store.data_mut().state = previous_state;
+                            tracing::warn!(%error, plugin = %plugin.path.display(), filter = name, "WASM plugin filter checkpoint failed; guest state and result were rolled back");
+                            continue;
+                        }
+                    }
+                    if let Some(filtered) = filtered {
+                        current = filtered;
+                    }
+                }
+                Err(error) => {
+                    plugin.store.data_mut().state = previous_state;
+                    tracing::warn!(%error, plugin = %plugin.path.display(), filter = name, "WASM plugin filter failed; continuing with the previous value");
+                }
+            }
+        }
+        current
     }
 
     pub async fn read_plugin_readme(&mut self, name: &str) -> Result<Option<String>, String> {
@@ -682,6 +749,93 @@ fn invoke_plugin_event(
     Ok(plugin.store.data().state != previous_state)
 }
 
+fn validate_plugin_filter(
+    name: &str,
+    value: &serde_json::Value,
+    context: &serde_json::Value,
+) -> Result<(), String> {
+    if !matches!(name, "can_sign" | "sign_score") {
+        return Err("unsupported plugin filter name".to_owned());
+    }
+    if !context.is_object() {
+        return Err("plugin filter context must be a JSON object".to_owned());
+    }
+    validate_plugin_filter_value(name, value)?;
+    for (label, value) in [("value", value), ("context", context)] {
+        let encoded = serde_json::to_vec(value).map_err(|_| "plugin filter input is not JSON")?;
+        if encoded.len() > PLUGIN_FILTER_VALUE_LIMIT {
+            return Err(format!(
+                "plugin filter {label} exceeds {PLUGIN_FILTER_VALUE_LIMIT} bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
+    match name {
+        "can_sign"
+            if value.is_boolean()
+                || value
+                    .get("rejection")
+                    .is_some_and(serde_json::Value::is_string) =>
+        {
+            Ok(())
+        }
+        "sign_score" if value.as_i64().is_some() => Ok(()),
+        "can_sign" => Err(
+            "can_sign filters must return a boolean or an object with a string rejection"
+                .to_owned(),
+        ),
+        "sign_score" => Err("sign_score filters must return a signed integer".to_owned()),
+        _ => Err("unsupported plugin filter name".to_owned()),
+    }
+}
+
+fn invoke_plugin_filter(
+    plugin: &mut LoadedPlugin,
+    name: &str,
+    value: &serde_json::Value,
+    context: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(filters) = plugin.filters.as_ref() else {
+        return Ok(None);
+    };
+    let apply_export = plugin
+        .instance
+        .get_export_index(&mut plugin.store, Some(filters), "apply")
+        .ok_or_else(|| "missing plugin filter apply export".to_owned())?;
+    let apply = plugin
+        .instance
+        .get_typed_func::<(String, String, String), (Result<Option<String>, String>,)>(
+            &mut plugin.store,
+            &apply_export,
+        )
+        .map_err(|error| error.to_string())?;
+    plugin
+        .store
+        .set_fuel(COMPONENT_FUEL)
+        .map_err(|error| error.to_string())?;
+    let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    let context = serde_json::to_string(context).map_err(|error| error.to_string())?;
+    let (result,) = apply
+        .call(&mut plugin.store, (name.to_owned(), value, context))
+        .map_err(|error| error.to_string())?;
+    let Some(filtered) = result.map_err(|message| format!("plugin rejected filter: {message}"))?
+    else {
+        return Ok(None);
+    };
+    if filtered.len() > PLUGIN_FILTER_VALUE_LIMIT {
+        return Err(format!(
+            "plugin filter result exceeds {PLUGIN_FILTER_VALUE_LIMIT} bytes"
+        ));
+    }
+    let filtered: serde_json::Value = serde_json::from_str(&filtered)
+        .map_err(|_| "plugin filter result must be UTF-8 JSON".to_owned())?;
+    validate_plugin_filter_value(name, &filtered)?;
+    Ok(Some(filtered))
+}
+
 fn validate_plugin_state_key(key: &str) -> Result<(), String> {
     if key.is_empty() || key.len() > PLUGIN_STATE_KEY_LIMIT || key.chars().any(char::is_control) {
         return Err(format!(
@@ -866,11 +1020,11 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT,
-        PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore, StoreLimitsBuilder,
-        checkpoint_plugin_state, log_plugin_message, plugin_state_delete, plugin_state_get,
-        plugin_state_set, validate_plugin_configuration, validate_plugin_event,
-        validated_plugin_state,
+        PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_FILTER_VALUE_LIMIT,
+        PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT, PluginRuntime, PluginStore,
+        StoreLimitsBuilder, checkpoint_plugin_state, log_plugin_message, plugin_state_delete,
+        plugin_state_get, plugin_state_set, validate_plugin_configuration, validate_plugin_event,
+        validate_plugin_filter, validate_plugin_filter_value, validated_plugin_state,
     };
     use std::{
         collections::HashMap,
@@ -1016,6 +1170,36 @@ mod tests {
         assert!(
             validate_plugin_event("player.added", &vec![b' '; PLUGIN_EVENT_PAYLOAD_LIMIT + 1])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_filters_validate_supported_values_and_bound_context() {
+        let context = serde_json::json!({ "user_id": 7 });
+        assert!(validate_plugin_filter("can_sign", &serde_json::json!(true), &context).is_ok());
+        assert!(validate_plugin_filter_value("can_sign", &serde_json::json!(false)).is_ok());
+        assert!(
+            validate_plugin_filter_value(
+                "can_sign",
+                &serde_json::json!({ "rejection": "sign-in disabled" })
+            )
+            .is_ok()
+        );
+        assert!(validate_plugin_filter("sign_score", &serde_json::json!(-4), &context).is_ok());
+        assert!(validate_plugin_filter_value("sign_score", &serde_json::json!(1.5)).is_err());
+        assert!(validate_plugin_filter_value("can_sign", &serde_json::json!("false")).is_err());
+        assert!(
+            validate_plugin_filter_value("can_sign", &serde_json::json!({ "rejection": false }))
+                .is_err()
+        );
+        assert!(validate_plugin_filter("unknown", &serde_json::json!(true), &context).is_err());
+        assert!(
+            validate_plugin_filter(
+                "can_sign",
+                &serde_json::json!(true),
+                &serde_json::json!({ "data": "x".repeat(PLUGIN_FILTER_VALUE_LIMIT) })
+            )
+            .is_err()
         );
     }
 
