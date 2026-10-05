@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.26.0";
+const HOST_API_VERSION: &str = "1.27.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -818,6 +818,10 @@ fn validate_plugin_filter(
             | "can_clear_texture"
             | "user_can_update_avatar"
             | "user_can_edit_profile"
+            | "can_delete_texture"
+            | "can_update_texture_name"
+            | "can_update_texture_privacy"
+            | "can_update_texture_type"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -846,6 +850,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_clear_texture"
         | "user_can_update_avatar"
         | "user_can_edit_profile"
+        | "can_delete_texture"
+        | "can_update_texture_name"
+        | "can_update_texture_privacy"
+        | "can_update_texture_type"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -862,7 +870,11 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_set_texture"
         | "can_clear_texture"
         | "user_can_update_avatar"
-        | "user_can_edit_profile" => Err(
+        | "user_can_edit_profile"
+        | "can_delete_texture"
+        | "can_update_texture_name"
+        | "can_update_texture_privacy"
+        | "can_update_texture_type" => Err(
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
@@ -1507,6 +1519,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_texture_permission_filters_validate_supported_results() {
+        let context = serde_json::json!({"texture": {"tid": 7}, "name": "Renamed", "type": "cape"});
+        for name in [
+            "can_delete_texture",
+            "can_update_texture_name",
+            "can_update_texture_privacy",
+            "can_update_texture_type",
+        ] {
+            assert!(validate_plugin_filter(name, &serde_json::json!(true), &context).is_ok());
+            assert!(validate_plugin_filter_value(name, &serde_json::json!(false)).is_ok());
+            assert!(
+                validate_plugin_filter_value(name, &serde_json::json!({"rejection": "disabled"}))
+                    .is_ok()
+            );
+            assert!(validate_plugin_filter_value(name, &serde_json::json!("false")).is_err());
+        }
     }
 
     #[test]

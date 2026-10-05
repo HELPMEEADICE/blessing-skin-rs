@@ -811,6 +811,48 @@ async fn detect_locale_preference(
     }
     response
 }
+fn texture_plugin_record(texture: &TextureInfoRecord) -> serde_json::Value {
+    serde_json::json!({
+        "tid": texture.tid,
+        "name": texture.name,
+        "type": texture.texture_type,
+        "hash": texture.hash,
+        "size": texture.size,
+        "uploader": texture.uploader,
+        "public": texture.is_public,
+        "upload_at": texture.upload_at,
+        "likes": texture.likes,
+    })
+}
+
+async fn texture_permission_filter(
+    state: &AppState,
+    filter_name: &str,
+    texture: &TextureInfoRecord,
+    additional_context: serde_json::Value,
+) -> Option<String> {
+    let mut context =
+        serde_json::Map::from_iter([("texture".to_owned(), texture_plugin_record(texture))]);
+    if let Some(fields) = additional_context.as_object() {
+        context.extend(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    let result = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            filter_name,
+            &serde_json::json!(true),
+            &serde_json::Value::Object(context),
+        )
+        .await;
+    plugin_filter_rejection(&result).map(str::to_owned)
+}
+
 fn user_score_updated_event(user_id: i64, previous_score: i64, score: i64) -> serde_json::Value {
     serde_json::json!({
         "user_id": user_id,
@@ -13299,6 +13341,16 @@ async fn rename_texture(
             return texture_name_validation_error(&request_locale(&state));
         }
     }
+    if let Some(reason) = texture_permission_filter(
+        &state,
+        "can_update_texture_name",
+        &texture,
+        serde_json::json!({"name": name}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     emit_plugin_event(
         &state,
         "texture.name.updating",
@@ -13364,6 +13416,16 @@ async fn delete_texture(
         Ok(context) => context,
         Err(response) => return response,
     };
+    if let Some(reason) = texture_permission_filter(
+        &state,
+        "can_delete_texture",
+        &texture,
+        serde_json::json!({}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -13535,6 +13597,16 @@ async fn toggle_texture_privacy(
         Ok(context) => context,
         Err(response) => return response,
     };
+    if let Some(reason) = texture_permission_filter(
+        &state,
+        "can_update_texture_privacy",
+        &texture,
+        serde_json::json!({}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -13780,6 +13852,16 @@ async fn update_texture_type(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    if let Some(reason) = texture_permission_filter(
+        &state,
+        "can_update_texture_type",
+        &texture,
+        serde_json::json!({"type": texture_type}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     emit_plugin_event(
         &state,
         "texture.type.updating",
