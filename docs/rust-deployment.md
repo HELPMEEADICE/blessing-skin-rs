@@ -163,19 +163,30 @@ Rust 会继续读取旧站的 `auto_detect_asset_url`、`site_url` 和 `force_ss
 - 只对明确列入只读白名单的请求做影子调用。认证挑战、OAuth 授权/令牌、任何写请求，以及可能更新 session、计数或状态的路由不得复制。
 - 影子请求发到隔离的数据副本或只读凭据；不把 Rust 响应返回给访客，也不向 Rust 镜像写请求。比较 PHP 与 Rust 的状态码、内容类型、协议字段、错误语义、ETag/缓存头和纹理哈希。忽略预先标记的动态值（例如时间戳和随机 ID），但不能忽略业务字段差异。
 - 记录每个样本的结果、差异和 Rust/PHP 错误率基线。存在未解释的数据或响应差异时，修复并重新开始本阶段的 24 小时观察。
-  维护者可使用仓库内的只读探针比较器重放这些 GET 样本。它只接受显式白名单路由，拒绝 session、认证挑战、安装和写入路由，也不跟随重定向；头像/预览缓存等可能写文件的路由需在隔离副本上单独验证。比较器要求 Python 3.10+ 标准库：
+  维护者可使用仓库内的只读探针比较器重放这些 GET 样本。它只接受显式白名单路由，拒绝 session、认证挑战、安装和写入路由，也不跟随重定向；比较器默认拒绝头像和预览等可能写入服务端缓存的路由；这些端点需对隔离副本显式开启。比较器要求 Python 3.10+ 标准库：
 
 ```sh
-export BS_SHADOW_OAUTH_TOKEN='只读 User.Read 测试令牌'
+export BS_SHADOW_OAUTH_TOKEN='仅含 User.Read Player.Read Closet.Read Notification.Read 的测试令牌'
+export BS_SHADOW_ADMIN_TOKEN='管理员的只读 UsersManagement.Read PlayersManagement.Read ReportsManagement.Read ClosetManagement.Read 测试令牌'
 python3 tools/compat_compare.py \
   --php-url http://127.0.0.1:8080 \
   --rust-url http://127.0.0.1:3000 \
   --fixtures docs/compat-shadow.example.json
 ```
 
+隔离副本中的缓存图像比对：
+
+```sh
+python3 tools/compat_compare.py \
+  --php-url http://127.0.0.1:8080 \
+  --rust-url http://127.0.0.1:3000 \
+  --fixtures docs/compat-images-isolated.example.json \
+  --allow-image-cache-in-isolated-clones
+```
+
 可在本机复制并修改 [示例探针](compat-shadow.example.json)，令牌应从环境变量传入，不要写入 fixture。动态 JSON 字段可用 `ignore_json_pointers` 标注；响应体中的其他字段、状态码和缓存相关头仍会比较。工具只打印差异类别、JSON 字段路径或非 JSON 响应的 SHA-256，不打印响应内容。
 
-示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_USER_ID`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理、不同来源的头像，以及按 ID/哈希生成的皮肤预览响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
+示例中的 `BS_SHADOW_ADMIN_TOKEN` 应属于有管理权限且只包含所需只读 scope 的测试账号；`BS_SHADOW_OAUTH_TOKEN` 需包含用户、玩家、衣柜和通知只读 scope。示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_USER_ID`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。默认探针覆盖用户与管理只读 API、皮肤库页面和列表，以及 Yggdrasil/CustomSkin 资料和原始纹理读取；不请求写路由、登录 session 页面或会生成缓存的图片路由。需要比较头像与预览的响应体、ETag 和缓存头时，只能对隔离副本使用 [图像探针样例](compat-images-isolated.example.json)，并额外传入 `--allow-image-cache-in-isolated-clones`；比较器会打印缓存写入警告。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理，以及在隔离副本中比较不同来源的头像和按 ID/哈希生成的皮肤预览响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
 
 ### 单业务域灰度（每个域至少 24 小时）
 

@@ -46,14 +46,25 @@ SAFE_PATH_PATTERNS = tuple(
         r"/textures/[A-Za-z0-9_-]{1,128}",
         r"/csl/textures/[A-Za-z0-9_-]{1,128}",
         r"/raw/[1-9][0-9]*",
+        r"/skinlib",
+        r"/skinlib/list",
+        r"/skinlib/info/[1-9][0-9]*",
+        r"/texture/[1-9][0-9]*",
+        r"/[^/]+\.json",
+        r"/csl/[^/]+\.json",
+    )
+)
+
+
+IMAGE_CACHE_PATH_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
         r"/avatar/player/[A-Za-z0-9_]{1,16}",
         r"/avatar/user/(?:0|[1-9][0-9]*)",
         r"/avatar/hash/[A-Fa-f0-9]{64}",
         r"/avatar/(?:0|[1-9][0-9]*)",
         r"/preview/(?:0|[1-9][0-9]*)",
         r"/preview/hash/[A-Fa-f0-9]{64}",
-        r"/[^/]+\.json",
-        r"/csl/[^/]+\.json",
     )
 )
 
@@ -71,8 +82,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def is_safe_path(value: str) -> bool:
-    """Allow only known stateless GET routes; exclude session and write routes."""
+def _matches_path(value: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
     if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
         return False
     parsed = urllib.parse.urlsplit(value)
@@ -81,20 +91,31 @@ def is_safe_path(value: str) -> bool:
     path = urllib.parse.unquote(parsed.path)
     if "\\" in path or ".." in path.split("/"):
         return False
-    return any(pattern.fullmatch(path) for pattern in SAFE_PATH_PATTERNS)
+    return any(pattern.fullmatch(path) for pattern in patterns)
 
 
-def is_safe_fixture_path(value: str) -> bool:
-    """Validate a path template with representative safe values for placeholders."""
+def is_safe_path(value: str) -> bool:
+    """Allow only read-only routes that do not generate server-side image caches."""
+    return _matches_path(value, SAFE_PATH_PATTERNS)
+
+
+def is_image_cache_path(value: str) -> bool:
+    """Match avatar and preview routes whose requests can populate image caches."""
+    return _matches_path(value, IMAGE_CACHE_PATH_PATTERNS)
+
+
+def is_safe_fixture_path(value: str, allow_image_cache: bool = False) -> bool:
+    """Validate a safe route template, optionally allowing cache-generating images."""
     if not ENV_TOKEN.search(value):
-        return is_safe_path(value)
-    return any(
-        is_safe_path(ENV_TOKEN.sub(replacement, value))
-        for replacement in ("1", "ExamplePlayer", "a" * 64)
-    )
+        return is_safe_path(value) or (allow_image_cache and is_image_cache_path(value))
+    for replacement in ("1", "ExamplePlayer", "a" * 64):
+        path = ENV_TOKEN.sub(replacement, value)
+        if is_safe_path(path) or (allow_image_cache and is_image_cache_path(path)):
+            return True
+    return False
 
 
-def validate_fixture(document: Any) -> list[dict[str, Any]]:
+def validate_fixture(document: Any, allow_image_cache: bool = False) -> list[dict[str, Any]]:
     if not isinstance(document, dict) or type(document.get("format_version")) is not int or document["format_version"] != 1:
         raise ValueError("fixture format_version must be 1")
     requests = document.get("requests")
@@ -115,7 +136,7 @@ def validate_fixture(document: Any) -> list[dict[str, Any]]:
             or name in names
         ):
             raise ValueError(f"{where}.name must be a unique printable non-empty string")
-        if not isinstance(path, str) or not is_safe_fixture_path(path):
+        if not isinstance(path, str) or not is_safe_fixture_path(path, allow_image_cache):
             raise ValueError(f"{where}.path is not on the read-only GET allowlist")
         names.add(name)
         headers = item.get("headers", {})
@@ -167,7 +188,7 @@ def substitute_environment(value: str) -> str:
     return ENV_TOKEN.sub(replace, value)
 
 
-def resolve_probe_path(value: str) -> str:
+def resolve_probe_path(value: str, allow_image_cache: bool = False) -> str:
     """Expand fixture path variables, then enforce the GET allowlist again."""
     path = substitute_environment(value)
     if any(
@@ -175,7 +196,7 @@ def resolve_probe_path(value: str) -> str:
         for character in path
     ):
         raise ValueError("path variables must not contain control characters")
-    if not is_safe_path(path):
+    if not is_safe_path(path) and not (allow_image_cache and is_image_cache_path(path)):
         raise ValueError("resolved path is not on the read-only GET allowlist")
     return path
 
@@ -313,11 +334,11 @@ def compare_responses(
     return differences
 
 
-def run(php_url: str, rust_url: str, fixtures: Path, timeout: float) -> int:
+def run(php_url: str, rust_url: str, fixtures: Path, timeout: float, allow_image_cache: bool = False) -> int:
     try:
-        probes = validate_fixture(json.loads(fixtures.read_text(encoding="utf-8")))
+        probes = validate_fixture(json.loads(fixtures.read_text(encoding="utf-8")), allow_image_cache)
         for probe in probes:
-            probe["path"] = resolve_probe_path(probe["path"])
+            probe["path"] = resolve_probe_path(probe["path"], allow_image_cache)
             for value in probe["headers"].values():
                 substitute_environment(value)
         build_url(php_url, "/")
@@ -327,7 +348,9 @@ def run(php_url: str, rust_url: str, fixtures: Path, timeout: float) -> int:
         return 2
 
     failed = 0
-    print(f"Comparing {len(probes)} read-only GET probes.")
+    if allow_image_cache:
+        print("WARNING: image probes may write to PHP cache storage; use isolated PHP and Rust copies only.")
+    print(f"Comparing {len(probes)} GET probes.")
     for probe in probes:
         php = fetch(php_url, probe, timeout)
         rust = fetch(rust_url, probe, timeout)
@@ -348,10 +371,15 @@ def main() -> int:
     parser.add_argument("--rust-url", required=True, help="Rust base URL")
     parser.add_argument("--fixtures", required=True, type=Path, help="version 1 JSON probe file")
     parser.add_argument("--timeout", type=float, default=10.0, help="per-request timeout in seconds")
+    parser.add_argument(
+        "--allow-image-cache-in-isolated-clones",
+        action="store_true",
+        help="allow avatar and preview requests that may populate server caches; use isolated copies only",
+    )
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
-    return run(args.php_url, args.rust_url, args.fixtures, args.timeout)
+    return run(args.php_url, args.rust_url, args.fixtures, args.timeout, args.allow_image_cache_in_isolated_clones)
 
 
 if __name__ == "__main__":

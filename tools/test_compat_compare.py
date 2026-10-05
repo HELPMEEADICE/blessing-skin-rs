@@ -21,13 +21,15 @@ class CompatCompareTests(unittest.TestCase):
             "/api/user",
             "/api/players?page=1",
             "/api/admin/closet/42",
+            "/api/admin/users",
+            "/api/admin/players",
+            "/api/admin/reports",
+            "/api/user/notifications",
             "/raw/42",
-            "/avatar/player/Notch",
-            "/avatar/user/42",
-            "/avatar/hash/" + "a" * 64,
-            "/avatar/0?png",
-            "/preview/42?height=128",
-            "/preview/hash/" + "b" * 64 + "?png",
+            "/skinlib",
+            "/skinlib/list?page=1",
+            "/skinlib/info/42",
+            "/texture/42",
             "/Alex.json",
             "/csl/Alex.json",
             "/textures/0123456789abcdef0123456789abcdef",
@@ -43,14 +45,15 @@ class CompatCompareTests(unittest.TestCase):
             "/user/profile",
             "/admin/options",
             "/api/players/3",
-            "/avatar/user/-1",
-            "/avatar/hash/not-a-hash",
+            "/avatar/user/42",
+            "/preview/42?height=128",
+            "/skinlib/show/3",
             "/preview/3/extra",
             "/preview/hash/../api/user",
             "/api/user/notifications/3",
-            "/skinlib/show/3",
+            "/skinlib/upload",
             "/texture",
-            "/texture/3",
+            "/texture/3/name",
             "/api/%2e%2e/auth/login",
             "//other.example/api/user",
         ):
@@ -63,6 +66,7 @@ class CompatCompareTests(unittest.TestCase):
             compat.os.environ,
             {
                 "BS_SHADOW_OAUTH_TOKEN": "read-only-test-token",
+                "BS_SHADOW_ADMIN_TOKEN": "read-only-admin-test-token",
                 "BS_SHADOW_PLAYER": "ExamplePlayer",
                 "BS_SHADOW_USER_ID": "7",
                 "BS_SHADOW_TEXTURE_HASH": "a" * 64,
@@ -73,8 +77,26 @@ class CompatCompareTests(unittest.TestCase):
             probes = compat.validate_fixture(fixture)
             for probe in probes:
                 probe["path"] = compat.resolve_probe_path(probe["path"])
-        self.assertEqual(len(probes), 11)
+        self.assertEqual(len(probes), 16)
         self.assertTrue(all(compat.is_safe_path(probe["path"]) for probe in probes))
+
+    def test_image_cache_routes_require_explicit_isolated_clone_opt_in(self):
+        fixture_path = MODULE_PATH.parents[1] / "docs" / "compat-images-isolated.example.json"
+        environment = {
+            "BS_SHADOW_PLAYER": "ExamplePlayer",
+            "BS_SHADOW_USER_ID": "7",
+            "BS_SHADOW_TEXTURE_HASH": "a" * 64,
+            "BS_SHADOW_TEXTURE_ID": "42",
+        }
+        with patch.dict(compat.os.environ, environment):
+            fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(ValueError, "read-only GET allowlist"):
+                compat.validate_fixture(fixture)
+            probes = compat.validate_fixture(fixture, allow_image_cache=True)
+            for probe in probes:
+                probe["path"] = compat.resolve_probe_path(probe["path"], allow_image_cache=True)
+        self.assertEqual(len(probes), 7)
+        self.assertTrue(all(compat.is_image_cache_path(probe["path"]) for probe in probes))
 
     def test_path_variables_expand_only_to_allowlisted_read_routes(self):
         with patch.dict(

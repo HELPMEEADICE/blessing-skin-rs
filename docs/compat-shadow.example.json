@@ -38,45 +38,87 @@
       }
     },
     {
-      "name": "Avatar by player",
-      "path": "/avatar/player/${BS_SHADOW_PLAYER}?png&size=100",
+      "name": "OAuth player list",
+      "path": "/api/players",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_OAUTH_TOKEN}"
       }
     },
     {
-      "name": "Avatar by user",
-      "path": "/avatar/user/${BS_SHADOW_USER_ID}?png&size=100",
+      "name": "OAuth closet list",
+      "path": "/api/closet",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_OAUTH_TOKEN}"
       }
     },
     {
-      "name": "Avatar by texture hash",
-      "path": "/avatar/hash/${BS_SHADOW_TEXTURE_HASH}?png&size=100",
+      "name": "OAuth notifications",
+      "path": "/api/user/notifications",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_OAUTH_TOKEN}"
       }
     },
     {
-      "name": "Skin preview by texture ID",
-      "path": "/preview/${BS_SHADOW_TEXTURE_ID}?png&height=200",
+      "name": "Admin user list",
+      "path": "/api/admin/users",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_ADMIN_TOKEN}"
       }
     },
     {
-      "name": "Skin preview by texture hash",
-      "path": "/preview/hash/${BS_SHADOW_TEXTURE_HASH}?png&height=200",
+      "name": "Admin player list",
+      "path": "/api/admin/players",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_ADMIN_TOKEN}"
       }
     },
     {
-      "name": "Default avatar",
-      "path": "/avatar/0?png&size=100",
+      "name": "Admin report list",
+      "path": "/api/admin/reports",
       "headers": {
-        "Accept": "image/png"
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_ADMIN_TOKEN}"
+      }
+    },
+    {
+      "name": "Admin target user closet",
+      "path": "/api/admin/closet/${BS_SHADOW_USER_ID}",
+      "headers": {
+        "Accept": "application/json",
+        "Authorization": "Bearer ${BS_SHADOW_ADMIN_TOKEN}"
+      }
+    },
+    {
+      "name": "Skin library page",
+      "path": "/skinlib",
+      "headers": {
+        "Accept": "text/html"
+      }
+    },
+    {
+      "name": "Skin library list",
+      "path": "/skinlib/list?page=1",
+      "headers": {
+        "Accept": "application/json"
+      }
+    },
+    {
+      "name": "Skin metadata page data",
+      "path": "/skinlib/info/${BS_SHADOW_TEXTURE_ID}",
+      "headers": {
+        "Accept": "application/json"
+      }
+    },
+    {
+      "name": "Texture metadata",
+      "path": "/texture/${BS_SHADOW_TEXTURE_ID}",
+      "headers": {
+        "Accept": "application/json"
       }
     }
   ]
