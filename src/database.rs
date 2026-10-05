@@ -6917,6 +6917,63 @@ impl DatabasePool {
         }
     }
 
+    pub async fn closet_item(
+        &self,
+        prefix: &str,
+        user_id: i64,
+        texture_id: i64,
+    ) -> Result<Option<ClosetTextureRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS BIGINT) AS size, CAST(t.uploader AS BIGINT) AS uploader, t.public AS is_public, \
+                 CAST(t.upload_at AS TEXT) AS upload_at, CAST(t.likes AS BIGINT) AS likes, \
+                 CAST(c.user_uid AS BIGINT) AS user_uid, CAST(c.texture_tid AS BIGINT) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = ? AND c.texture_tid = ?"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(t.tid AS SIGNED) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS SIGNED) AS size, CAST(t.uploader AS SIGNED) AS uploader, t.public AS is_public, \
+                 DATE_FORMAT(t.upload_at, '%Y-%m-%d %H:%i:%s') AS upload_at, CAST(t.likes AS SIGNED) AS likes, \
+                 CAST(c.user_uid AS SIGNED) AS user_uid, CAST(c.texture_tid AS SIGNED) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = ? AND c.texture_tid = ?"
+            ),
+            Self::Postgres(_) => format!(
+                "SELECT CAST(t.tid AS BIGINT) AS tid, t.name, t.type AS texture_type, t.hash, \
+                 CAST(t.size AS BIGINT) AS size, CAST(t.uploader AS BIGINT) AS uploader, t.public AS is_public, \
+                 to_char(t.upload_at, 'YYYY-MM-DD HH24:MI:SS') AS upload_at, CAST(t.likes AS BIGINT) AS likes, \
+                 CAST(c.user_uid AS BIGINT) AS user_uid, CAST(c.texture_tid AS BIGINT) AS texture_tid, c.item_name \
+                 FROM {prefix}textures t INNER JOIN {prefix}user_closet c ON c.texture_tid = t.tid \
+                 WHERE c.user_uid = $1 AND c.texture_tid = $2"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, ClosetTextureRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .bind(texture_id)
+            .fetch_optional(pool)
+            .await?),
+            Self::MySql(pool) => Ok(
+                sqlx::query_as::<_, ClosetTextureRecord>(sqlx::AssertSqlSafe(sql))
+                    .bind(user_id)
+                    .bind(texture_id)
+                    .fetch_optional(pool)
+                    .await?,
+            ),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, ClosetTextureRecord>(
+                sqlx::AssertSqlSafe(sql),
+            )
+            .bind(user_id)
+            .bind(texture_id)
+            .fetch_optional(pool)
+            .await?),
+        }
+    }
+
     pub async fn add_admin_closet_item(
         &self,
         prefix: &str,
@@ -8515,6 +8572,14 @@ mod tests {
             searched_items[0].item_name.as_deref(),
             Some("Second skin renamed")
         );
+        let searched_item = database.closet_item("bs_", 7, 13).await.unwrap().unwrap();
+        assert_eq!(searched_item.user_uid, 7);
+        assert_eq!(searched_item.texture_tid, 13);
+        assert_eq!(
+            searched_item.item_name.as_deref(),
+            Some("Second skin renamed")
+        );
+        assert!(database.closet_item("bs_", 7, 99).await.unwrap().is_none());
         assert!(matches!(
             database
                 .remove_closet_item("bs_", 7, 13, true, 2, 0)

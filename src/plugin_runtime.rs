@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.29.0";
+const HOST_API_VERSION: &str = "1.31.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -822,6 +822,11 @@ fn validate_plugin_filter(
             | "can_set_texture"
             | "can_clear_texture"
             | "user_can_report"
+            | "add_closet_item_name"
+            | "can_add_closet_item"
+            | "rename_closet_item_name"
+            | "can_rename_closet_item"
+            | "can_remove_closet_item"
             | "user_can_update_avatar"
             | "user_can_edit_profile"
             | "can_delete_texture"
@@ -861,6 +866,9 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_player"
         | "can_set_texture"
         | "can_clear_texture"
+        | "can_add_closet_item"
+        | "can_rename_closet_item"
+        | "can_remove_closet_item"
         | "user_can_report"
         | "user_can_update_avatar"
         | "user_can_edit_profile"
@@ -876,7 +884,14 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         {
             Ok(())
         }
-        "new_player_name" | "uploaded_texture_name" if value.is_string() => Ok(()),
+        "new_player_name"
+        | "uploaded_texture_name"
+        | "add_closet_item_name"
+        | "rename_closet_item_name"
+            if value.is_string() =>
+        {
+            Ok(())
+        }
         "uploaded_texture_file"
             if value.as_str().is_some_and(|encoded| {
                 encoded.len() <= PLUGIN_FILTER_FILE_VALUE_LIMIT
@@ -901,6 +916,9 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_player"
         | "can_set_texture"
         | "can_clear_texture"
+        | "can_add_closet_item"
+        | "can_rename_closet_item"
+        | "can_remove_closet_item"
         | "user_can_report"
         | "user_can_update_avatar"
         | "user_can_edit_profile"
@@ -912,9 +930,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
-        "new_player_name" | "uploaded_texture_name" => {
-            Err("name filters must return a string".to_owned())
-        }
+        "new_player_name"
+        | "uploaded_texture_name"
+        | "add_closet_item_name"
+        | "rename_closet_item_name" => Err("name filters must return a string".to_owned()),
         "uploaded_texture_hash" => {
             Err("uploaded_texture_hash must return 64 hexadecimal characters".to_owned())
         }
@@ -1642,6 +1661,33 @@ mod tests {
             validate_plugin_filter_value("uploaded_texture_hash", &serde_json::json!("../outside"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_closet_filters_validate_names_and_permissions() {
+        let context = serde_json::json!({"texture_id": 12});
+        for filter in [
+            "can_add_closet_item",
+            "can_rename_closet_item",
+            "can_remove_closet_item",
+        ] {
+            assert!(validate_plugin_filter(filter, &serde_json::json!(true), &context).is_ok());
+            assert!(
+                validate_plugin_filter_value(
+                    filter,
+                    &serde_json::json!({"rejection": "closet change disabled"})
+                )
+                .is_ok()
+            );
+            assert!(validate_plugin_filter_value(filter, &serde_json::json!("false")).is_err());
+        }
+        for filter in ["add_closet_item_name", "rename_closet_item_name"] {
+            assert!(
+                validate_plugin_filter(filter, &serde_json::json!("display name"), &context)
+                    .is_ok()
+            );
+            assert!(validate_plugin_filter_value(filter, &serde_json::json!(false)).is_err());
+        }
     }
 
     #[test]

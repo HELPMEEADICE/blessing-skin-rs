@@ -839,6 +839,57 @@ fn texture_plugin_record(texture: &TextureInfoRecord) -> serde_json::Value {
     })
 }
 
+fn closet_item_plugin_record(item: &ClosetTextureRecord) -> serde_json::Value {
+    let mut record = texture_plugin_record(&TextureInfoRecord {
+        tid: item.tid,
+        name: item.name.clone(),
+        texture_type: item.texture_type.clone(),
+        hash: item.hash.clone(),
+        size: item.size,
+        uploader: item.uploader,
+        is_public: item.is_public,
+        upload_at: item.upload_at.clone(),
+        likes: item.likes,
+    });
+    if let Some(record) = record.as_object_mut() {
+        record.insert(
+            "pivot".to_owned(),
+            serde_json::json!({
+                "user_uid": item.user_uid,
+                "texture_tid": item.texture_tid,
+                "item_name": item.item_name,
+            }),
+        );
+    }
+    record
+}
+
+async fn closet_name_filter(
+    state: &AppState,
+    filter_name: &str,
+    texture_id: i64,
+    name: &str,
+) -> String {
+    let result = apply_plugin_filter_value(
+        state,
+        filter_name,
+        &serde_json::json!(name),
+        &serde_json::json!({"texture_id": texture_id}),
+    )
+    .await;
+    result.as_str().unwrap_or(name).to_owned()
+}
+
+async fn closet_permission_filter(
+    state: &AppState,
+    filter_name: &str,
+    context: serde_json::Value,
+) -> Option<String> {
+    let result =
+        apply_plugin_filter_value(state, filter_name, &serde_json::json!(true), &context).await;
+    plugin_filter_rejection(&result).map(str::to_owned)
+}
+
 async fn texture_permission_filter(
     state: &AppState,
     filter_name: &str,
@@ -8252,12 +8303,22 @@ async fn web_add_closet_item(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    let filtered_name = closet_name_filter(&state, "add_closet_item_name", tid, name).await;
     emit_plugin_event(
         &state,
         "closet.adding",
-        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": name}),
+        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": filtered_name}),
     )
     .await;
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_add_closet_item",
+        serde_json::json!({"texture_id": tid, "name": filtered_name}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
@@ -8291,7 +8352,7 @@ async fn web_add_closet_item(
                 serde_json::json!({
                     "user_id": user.uid,
                     "texture_id": tid,
-                    "item_name": name,
+                    "item_name": filtered_name,
                 }),
             )
             .await;
@@ -8383,14 +8444,40 @@ async fn web_rename_closet_item(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let filtered_name = closet_name_filter(&state, "rename_closet_item_name", tid, name).await;
     emit_plugin_event(
         &state,
         "closet.renaming",
-        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": name}),
+        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": filtered_name}),
     )
     .await;
+    let closet_item = match database
+        .closet_item(&state.config.database.table_prefix, user.uid, tid)
+        .await
+    {
+        Ok(Some(item)) => item,
+        Ok(None) => return closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, tid, "failed to load closet item for rename filter");
+            return unavailable();
+        }
+    };
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_rename_closet_item",
+        serde_json::json!({"item": closet_item_plugin_record(&closet_item), "name": filtered_name}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     match database
-        .rename_closet_item(&state.config.database.table_prefix, user.uid, tid, name)
+        .rename_closet_item(
+            &state.config.database.table_prefix,
+            user.uid,
+            tid,
+            &filtered_name,
+        )
         .await
     {
         Ok(crate::database::ClosetRenameOutcome::Renamed) => {
@@ -8400,16 +8487,16 @@ async fn web_rename_closet_item(
                 serde_json::json!({
                     "user_id": user.uid,
                     "texture_id": tid,
-                    "item_name": name,
+                    "item_name": filtered_name,
                 }),
             )
             .await;
             login_result(
                 0,
                 &if request_locale(&state).starts_with("zh") {
-                    format!("衣柜物品成功重命名至 {name}")
+                    format!("衣柜物品成功重命名至 {filtered_name}")
                 } else {
-                    format!("The item is successfully renamed to {name}")
+                    format!("The item is successfully renamed to {filtered_name}")
                 },
                 None,
             )
@@ -8444,6 +8531,23 @@ async fn web_remove_closet_item(
         serde_json::json!({"user_id": user.uid, "texture_id": tid}),
     )
     .await;
+    let closet_item = match database.closet_item(prefix, user.uid, tid).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=user.uid, tid, "failed to load closet item for remove filter");
+            return unavailable();
+        }
+    };
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_remove_closet_item",
+        serde_json::json!({"item": closet_item_plugin_record(&closet_item)}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let refund = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
@@ -11858,12 +11962,22 @@ async fn api_add_closet_item(
             return unavailable();
         }
     };
+    let filtered_name = closet_name_filter(&state, "add_closet_item_name", tid, name).await;
     emit_plugin_event(
         &state,
         "closet.adding",
-        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": name}),
+        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": filtered_name}),
     )
     .await;
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_add_closet_item",
+        serde_json::json!({"texture_id": tid, "name": filtered_name}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
@@ -11897,7 +12011,7 @@ async fn api_add_closet_item(
                 serde_json::json!({
                     "user_id": identity.user_id,
                     "texture_id": tid,
-                    "item_name": name,
+                    "item_name": filtered_name,
                 }),
             )
             .await;
@@ -11991,18 +12105,39 @@ async fn api_rename_closet_item(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let filtered_name = closet_name_filter(&state, "rename_closet_item_name", tid, name).await;
     emit_plugin_event(
         &state,
         "closet.renaming",
-        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": name}),
+        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": filtered_name}),
     )
     .await;
+    let closet_item = match database
+        .closet_item(&state.config.database.table_prefix, identity.user_id, tid)
+        .await
+    {
+        Ok(Some(item)) => item,
+        Ok(None) => return closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=identity.user_id, tid, "failed to load closet item for rename filter");
+            return unavailable();
+        }
+    };
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_rename_closet_item",
+        serde_json::json!({"item": closet_item_plugin_record(&closet_item), "name": filtered_name}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     match database
         .rename_closet_item(
             &state.config.database.table_prefix,
             identity.user_id,
             tid,
-            name,
+            &filtered_name,
         )
         .await
     {
@@ -12013,16 +12148,16 @@ async fn api_rename_closet_item(
                 serde_json::json!({
                     "user_id": identity.user_id,
                     "texture_id": tid,
-                    "item_name": name,
+                    "item_name": filtered_name,
                 }),
             )
             .await;
             login_result(
                 0,
                 &if request_locale(&state).starts_with("zh") {
-                    format!("衣柜物品成功重命名至 {name}")
+                    format!("衣柜物品成功重命名至 {filtered_name}")
                 } else {
-                    format!("The item is successfully renamed to {name}")
+                    format!("The item is successfully renamed to {filtered_name}")
                 },
                 None,
             )
@@ -12060,6 +12195,23 @@ async fn api_remove_closet_item(
         serde_json::json!({"user_id": identity.user_id, "texture_id": tid}),
     )
     .await;
+    let closet_item = match database.closet_item(prefix, identity.user_id, tid).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return closet_item_missing(&state),
+        Err(error) => {
+            tracing::error!(%error, user_id=identity.user_id, tid, "failed to load closet item for remove filter");
+            return unavailable();
+        }
+    };
+    if let Some(reason) = closet_permission_filter(
+        &state,
+        "can_remove_closet_item",
+        serde_json::json!({"item": closet_item_plugin_record(&closet_item)}),
+    )
+    .await
+    {
+        return login_result(1, &reason, None);
+    }
     let return_score = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
