@@ -823,7 +823,7 @@ fn legacy_sign_is_eligible(last_sign_at: &str, eligible_before: &str) -> bool {
     last_sign_at <= eligible_before
 }
 
-fn user_sign_filter_rejection(value: &serde_json::Value) -> Option<&str> {
+fn plugin_filter_rejection(value: &serde_json::Value) -> Option<&str> {
     value.get("rejection").and_then(serde_json::Value::as_str)
 }
 
@@ -6905,7 +6905,7 @@ async fn user_sign(State(state): State<AppState>, headers: HeaderMap) -> Respons
             &serde_json::json!({ "user_id": user.uid }),
         )
         .await;
-    if let Some(reason) = user_sign_filter_rejection(&can_sign) {
+    if let Some(reason) = plugin_filter_rejection(&can_sign) {
         return login_result(2, reason, None);
     }
     let prefix = &state.config.database.table_prefix;
@@ -7179,6 +7179,36 @@ async fn web_add_player(
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
         return validation_error("name", &request_locale(&state));
     }
+    let filtered_name = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "new_player_name",
+            &serde_json::json!(name),
+            &serde_json::json!({ "user_id": user.uid, "action": "add" }),
+        )
+        .await;
+    let name = filtered_name.as_str().unwrap_or(&name).to_owned();
+    emit_plugin_event(
+        &state,
+        "player.add.attempt",
+        serde_json::json!({ "user_id": user.uid, "name": name.as_str() }),
+    )
+    .await;
+    let can_add = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "can_add_player",
+            &serde_json::json!(true),
+            &serde_json::json!({ "user_id": user.uid, "name": name.as_str() }),
+        )
+        .await;
+    if let Some(reason) = plugin_filter_rejection(&can_add) {
+        return login_result(1, reason, None);
+    }
     let score_cost = match database.option(prefix, "score_per_player").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 100),
         Err(error) => {
@@ -7186,6 +7216,23 @@ async fn web_add_player(
             return unavailable();
         }
     };
+    if user.score < score_cost {
+        return login_result(
+            7,
+            if request_locale(&state).starts_with("zh") {
+                "添加角色失败，积分不足"
+            } else {
+                "You don't have enough score to add a player."
+            },
+            None,
+        );
+    }
+    emit_plugin_event(
+        &state,
+        "player.adding",
+        serde_json::json!({ "user_id": user.uid, "name": name.as_str() }),
+    )
+    .await;
     match database
         .add_player(prefix, user.uid, &name, score_cost)
         .await
@@ -17881,15 +17928,15 @@ mod tests {
     #[test]
     fn user_sign_filter_only_rejects_the_rejection_object() {
         assert_eq!(
-            super::user_sign_filter_rejection(&serde_json::json!(true)),
+            super::plugin_filter_rejection(&serde_json::json!(true)),
             None
         );
         assert_eq!(
-            super::user_sign_filter_rejection(&serde_json::json!(false)),
+            super::plugin_filter_rejection(&serde_json::json!(false)),
             None
         );
         assert_eq!(
-            super::user_sign_filter_rejection(&serde_json::json!({
+            super::plugin_filter_rejection(&serde_json::json!({
                 "rejection": "sign-in is disabled"
             })),
             Some("sign-in is disabled")

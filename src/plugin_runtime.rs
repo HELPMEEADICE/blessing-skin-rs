@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.9.0";
+const HOST_API_VERSION: &str = "1.10.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -46,6 +46,8 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "closet.added",
     "closet.renamed",
     "closet.removed",
+    "player.add.attempt",
+    "player.adding",
     "player.added",
     "player.renamed",
     "player.deleted",
@@ -754,7 +756,10 @@ fn validate_plugin_filter(
     value: &serde_json::Value,
     context: &serde_json::Value,
 ) -> Result<(), String> {
-    if !matches!(name, "can_sign" | "sign_score") {
+    if !matches!(
+        name,
+        "can_sign" | "sign_score" | "new_player_name" | "can_add_player"
+    ) {
         return Err("unsupported plugin filter name".to_owned());
     }
     if !context.is_object() {
@@ -774,7 +779,7 @@ fn validate_plugin_filter(
 
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
-        "can_sign"
+        "can_sign" | "can_add_player"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -782,11 +787,13 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         {
             Ok(())
         }
+        "new_player_name" if value.is_string() => Ok(()),
         "sign_score" if value.as_i64().is_some() => Ok(()),
-        "can_sign" => Err(
-            "can_sign filters must return a boolean or an object with a string rejection"
+        "can_sign" | "can_add_player" => Err(
+            "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
+        "new_player_name" => Err("new_player_name filters must return a string".to_owned()),
         "sign_score" => Err("sign_score filters must return a signed integer".to_owned()),
         _ => Err("unsupported plugin filter name".to_owned()),
     }
@@ -1165,6 +1172,10 @@ mod tests {
             validate_plugin_event("closet.removed", br#"{"user_id":7,"texture_id":11}"#).is_ok()
         );
         assert!(validate_plugin_event("unsupported", b"{}").is_err());
+        assert!(
+            validate_plugin_event("player.add.attempt", br#"{"user_id":7,"name":"Alex"}"#).is_ok()
+        );
+        assert!(validate_plugin_event("player.adding", br#"{"user_id":7,"name":"Alex"}"#).is_ok());
         assert!(validate_plugin_event("player.added", b"[]").is_err());
         assert!(validate_plugin_event("player.deleted", b"not json").is_err());
         assert!(
@@ -1177,7 +1188,21 @@ mod tests {
     fn plugin_filters_validate_supported_values_and_bound_context() {
         let context = serde_json::json!({ "user_id": 7 });
         assert!(validate_plugin_filter("can_sign", &serde_json::json!(true), &context).is_ok());
+        assert!(
+            validate_plugin_filter("can_add_player", &serde_json::json!(true), &context).is_ok()
+        );
         assert!(validate_plugin_filter_value("can_sign", &serde_json::json!(false)).is_ok());
+        assert!(
+            validate_plugin_filter_value(
+                "can_add_player",
+                &serde_json::json!({ "rejection": "disabled" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value("new_player_name", &serde_json::json!("Steve")).is_ok()
+        );
+        assert!(validate_plugin_filter_value("new_player_name", &serde_json::json!(7)).is_err());
         assert!(
             validate_plugin_filter_value(
                 "can_sign",
