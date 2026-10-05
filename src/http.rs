@@ -12265,7 +12265,8 @@ async fn texture_mutation_context(
 async fn submit_skinlib_report(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<serde_json::Value>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
@@ -12274,6 +12275,17 @@ async fn submit_skinlib_report(
         Ok(user) => user,
         Err(response) => return response,
     };
+    let fields = match parse_legacy_input_object(
+        &query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return report_validation_error("tid", &request_locale(&state)),
+    };
+    let request = serde_json::Value::Object(fields);
     let Some(tid) = texture_id_from_request(request.get("tid")) else {
         return report_validation_error("tid", &request_locale(&state));
     };
@@ -20025,6 +20037,34 @@ mod tests {
         assert_eq!(plugins_globals["route"], "admin/plugins/manage");
         assert_eq!(plugins_globals["extra"]["wasm_plugins"], true);
         assert_eq!(plugins_globals["extra"]["can_upload"], false);
+        let invalid_form_report = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/skinlib/report?tid=not-an-id")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("reason=source+form"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_form_report.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let invalid_form_report: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_form_report.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(invalid_form_report["errors"]["tid"].is_array());
         let plugin_manage = app
             .clone()
             .oneshot(
