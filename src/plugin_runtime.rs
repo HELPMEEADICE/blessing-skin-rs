@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.43.0";
+const HOST_API_VERSION: &str = "1.44.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -850,6 +850,7 @@ fn validate_plugin_filter(
             | "grid:user.closet"
             | "grid:skinlib.show"
             | "grid:skinlib.upload"
+            | "grid:admin.status"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -1062,6 +1063,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "grid:user.closet" if valid_plugin_grid(value, &["closet_management", "previewer"]) => Ok(()),
         "grid:skinlib.show" if valid_plugin_grid(value, &["texture_preview", "texture_details"]) => Ok(()),
         "grid:skinlib.upload" if valid_plugin_grid(value, &["upload_form", "previewer"]) => Ok(()),
+        "grid:admin.status" if valid_plugin_grid(value, &["system_info", "plugins"]) => Ok(()),
         "head_links"
             if value.as_array().is_some_and(|links| {
                 links.len() <= 128 && links.iter().all(valid_plugin_head_link)
@@ -1192,6 +1194,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "grid:skinlib.upload" => Err(
             "grid:skinlib.upload must return a unique subset of upload_form and previewer"
+                .to_owned(),
+        ),
+        "grid:admin.status" => Err(
+            "grid:admin.status must return a unique subset of system_info and plugins"
                 .to_owned(),
         ),
         "new_player_name"
@@ -1859,6 +1865,21 @@ mod tests {
             validate_plugin_filter_value(
                 "grid:skinlib.upload",
                 &serde_json::json!(["skinlib.widgets.upload.input"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter(
+                "grid:admin.status",
+                &serde_json::json!(["plugins", "system_info"]),
+                &serde_json::json!({})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "grid:admin.status",
+                &serde_json::json!(["admin.widgets.status.info"])
             )
             .is_err()
         );

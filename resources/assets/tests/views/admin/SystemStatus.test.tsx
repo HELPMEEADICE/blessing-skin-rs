@@ -14,6 +14,7 @@ beforeEach(() => {
         },
       ],
       wasm_plugins: ['sample-plugin'],
+      page_widgets: ['system_info', 'plugins'],
     },
   }
 })
@@ -28,5 +29,15 @@ test('renders system status fields and loaded WASM plugins', () => {
   expect(getByRole('link', { name: 'Admin dashboard' })).toHaveAttribute(
     'href',
     '/admin',
+  )
+})
+
+test('renders status regions in the configured order', () => {
+  blessing.extra.admin_status.page_widgets = ['plugins', 'system_info']
+
+  const { getAllByRole } = render(<SystemStatus />)
+
+  expect(getAllByRole('heading').map((heading) => heading.textContent)).toEqual(
+    ['System status - Example Skin', 'Loaded WASM plugins (1)', 'Database'],
   )
 })

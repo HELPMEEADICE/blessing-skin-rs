@@ -1033,6 +1033,10 @@ async fn filter_skinlib_upload_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(state, "grid:skinlib.upload", &["upload_form", "previewer"]).await
 }
 
+async fn filter_admin_status_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(state, "grid:admin.status", &["system_info", "plugins"]).await
+}
+
 async fn filter_skinlib_show_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -4841,6 +4845,7 @@ struct AdminStatusPage {
     locale: String,
     groups: Vec<AdminStatusGroup>,
     wasm_plugins: Vec<String>,
+    page_widgets: Vec<String>,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -5964,6 +5969,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             ],
         },
     ];
+    let page_widgets = filter_admin_status_widgets(&state).await;
     let site_name = site_name(&state).await;
     let wasm_plugins = state.wasm_plugins.clone();
     let app_dir = state.public_dir.join("app");
@@ -5979,6 +5985,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             "admin_status": {
                 "groups": &groups,
                 "wasm_plugins": &wasm_plugins,
+                "page_widgets": &page_widgets,
             }
         }),
         i18n,
@@ -5988,6 +5995,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
         locale: request_locale(&state),
         groups,
         wasm_plugins,
+        page_widgets,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -22476,6 +22484,10 @@ mod tests {
         assert_eq!(
             status_globals["extra"]["admin_status"]["wasm_plugins"],
             serde_json::json!([])
+        );
+        assert_eq!(
+            status_globals["extra"]["admin_status"]["page_widgets"],
+            serde_json::json!(["system_info", "plugins"])
         );
 
         let translation_page =

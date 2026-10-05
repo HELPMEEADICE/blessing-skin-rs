@@ -23,6 +23,8 @@
     <h1>{% if locale.starts_with("zh") %}系统状态{% else %}System status{% endif %} - {{ site_name }}</h1>
     <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a>
   </header>
+  {% for widget in page_widgets %}
+  {% if widget == "system_info" %}
   {% for group in groups %}
   <section>
     <h2>{{ group.title }}</h2>
@@ -33,6 +35,8 @@
     </tbody></table>
   </section>
   {% endfor %}
+  {% endif %}
+  {% if widget == "plugins" %}
   <section>
     <h2>{% if locale.starts_with("zh") %}已加载 WASM 插件（{{ wasm_plugins.len() }}）{% else %}Loaded WASM plugins ({{ wasm_plugins.len() }}){% endif %}</h2>
     {% if wasm_plugins.is_empty() %}
@@ -43,6 +47,8 @@
       </tbody></table>
     {% endif %}
   </section>
+  {% endif %}
+  {% endfor %}
 </main>
 {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
 </body>
