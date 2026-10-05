@@ -577,6 +577,11 @@ fn user_score_updated_event(user_id: i64, previous_score: i64, score: i64) -> se
         "score": score,
     })
 }
+
+fn password_reset_plugin_event(user_id: i64) -> serde_json::Value {
+    serde_json::json!({"user_id": user_id, "action": "password"})
+}
+
 async fn emit_plugin_event(state: &AppState, name: &str, payload: serde_json::Value) {
     let payload = match serde_json::to_vec(&payload) {
         Ok(payload) => payload,
@@ -2023,6 +2028,12 @@ async fn handle_password_reset(
         tracing::error!(%error, uid, "failed to update password through reset link");
         return unavailable();
     }
+    emit_plugin_event(
+        &state,
+        "user.profile.updated",
+        password_reset_plugin_event(uid),
+    )
+    .await;
     login_result(
         0,
         &auth_message(&state, "密码已重设。", "Password resetted successfully."),
@@ -16711,6 +16722,14 @@ mod tests {
                 "previous_score": 5,
                 "score": 15,
             })
+        );
+    }
+
+    #[test]
+    fn password_reset_plugin_event_matches_profile_update_contract() {
+        assert_eq!(
+            super::password_reset_plugin_event(7),
+            serde_json::json!({"user_id": 7, "action": "password"})
         );
     }
     #[test]
