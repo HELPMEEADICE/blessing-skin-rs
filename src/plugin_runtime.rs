@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.16.0";
+const HOST_API_VERSION: &str = "1.18.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -36,9 +36,11 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "user.logged-out",
     "user.registered",
     "user.profile.updated",
+    "user.profile.updating",
     "user.avatar.updated",
     "user.avatar.updating",
     "user.deleted",
+    "user.deleting",
     "user.verification.updated",
     "user.permission.updated",
     "user.score.updated",
@@ -776,6 +778,7 @@ fn validate_plugin_filter(
             | "can_set_texture"
             | "can_clear_texture"
             | "user_can_update_avatar"
+            | "user_can_edit_profile"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -803,6 +806,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_set_texture"
         | "can_clear_texture"
         | "user_can_update_avatar"
+        | "user_can_edit_profile"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -818,7 +822,8 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_player"
         | "can_set_texture"
         | "can_clear_texture"
-        | "user_can_update_avatar" => Err(
+        | "user_can_update_avatar"
+        | "user_can_edit_profile" => Err(
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
@@ -1158,6 +1163,14 @@ mod tests {
         );
         assert!(
             validate_plugin_event(
+                "user.profile.updating",
+                br#"{"user_id":7,"action":"nickname"}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_plugin_event("user.deleting", br#"{"user_id":7}"#).is_ok());
+        assert!(
+            validate_plugin_event(
                 "player.renamed",
                 br#"{"user_id":7,"player_id":3,"previous_name":"Alex","name":"Steve"}"#
             )
@@ -1302,6 +1315,10 @@ mod tests {
                 .is_ok()
         );
         assert!(
+            validate_plugin_filter("user_can_edit_profile", &serde_json::json!(true), &context)
+                .is_ok()
+        );
+        assert!(
             validate_plugin_filter_value(
                 "can_rename_player",
                 &serde_json::json!({ "rejection": "disabled" })
@@ -1333,6 +1350,13 @@ mod tests {
             validate_plugin_filter_value(
                 "user_can_update_avatar",
                 &serde_json::json!({ "rejection": "avatar update disabled" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_can_edit_profile",
+                &serde_json::json!({ "rejection": "profile editing disabled" })
             )
             .is_ok()
         );

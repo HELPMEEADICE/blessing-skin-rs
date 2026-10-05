@@ -8334,11 +8334,34 @@ async fn user_profile_update(
             return login_result(1, illegal_parameters_message(&request_locale(&state)), None);
         }
     };
-    let Some(action) = request.get("action").and_then(serde_json::Value::as_str) else {
-        return login_result(1, illegal_parameters_message(&request_locale(&state)), None);
-    };
+    let action = request
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     let prefix = &state.config.database.table_prefix;
     let chinese = request_locale(&state).starts_with("zh");
+    let can_edit = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "user_can_edit_profile",
+            &serde_json::json!(true),
+            &serde_json::json!({
+                "user_id": user.uid,
+                "action": action,
+            }),
+        )
+        .await;
+    if let Some(reason) = plugin_filter_rejection(&can_edit) {
+        return login_result(1, reason, None);
+    }
+    emit_plugin_event(
+        &state,
+        "user.profile.updating",
+        serde_json::json!({"user_id": user.uid, "action": action}),
+    )
+    .await;
     match action {
         "nickname" => {
             let Some(nickname) = request
@@ -8597,6 +8620,12 @@ async fn user_profile_update(
                 tracing::error!(%error, user_id = user.uid, "failed to revoke session before account deletion");
                 return unavailable();
             }
+            emit_plugin_event(
+                &state,
+                "user.deleting",
+                serde_json::json!({"user_id": user.uid}),
+            )
+            .await;
             match database.delete_user(prefix, user.uid).await {
                 Ok(true) => {
                     emit_plugin_event(
