@@ -1,54 +1,232 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ locale }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ site_name }} - {{ user.nickname }}</title>
-  <style>body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}main{max-width:760px;margin:4rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}header{display:flex;justify-content:space-between;align-items:center}button{cursor:pointer;padding:.55rem .9rem}li{padding:.45rem 0}</style>
-  <meta name="csrf-token" content="">
-  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
-</head>
-<body><main>
-  <header><h1>{{ site_name }}</h1><button id="logout">{% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}</button></header>
-  <h2>{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else %}Welcome, {{ user.nickname }}{% endif %}</h2>
-  <p>{{ user.email }}</p>
-  {% if frontend_script_available %}<section id="usage-box" aria-label="Account usage and score"></section>{% endif %}
-  {% if show_email_verification %}<p><button id="send-verification">{% if locale.starts_with("zh") %}发送验证邮件{% else %}Send verification email{% endif %}</button> <span id="verification-status" role="status"></span></p>{% endif %}
-  <section aria-labelledby="notifications-title">
-    <h3 id="notifications-title">{% if locale.starts_with("zh") %}站内通知{% else %}Notifications{% endif %} <span id="notification-count">{{ notifications.len() }}</span></h3>
-    <ul id="notifications">{% for notification in notifications %}<li><button type="button" data-notification-id="{{ notification.id }}">{{ notification.title }}</button></li>{% else %}<li>{% if locale.starts_with("zh") %}没有未读通知{% else %}No unread notifications{% endif %}</li>{% endfor %}</ul>
-  </section>
-  <dialog id="notification-detail"><h2 id="notification-title"></h2><div id="notification-content"></div><small id="notification-time"></small><form method="dialog"><button>{% if locale.starts_with("zh") %}关闭{% else %}Close{% endif %}</button></form></dialog>
-  <p><a href="/user/player">{% if locale.starts_with("zh") %}管理角色{% else %}Manage players{% endif %}</a> · <a href="/user/closet">{% if locale.starts_with("zh") %}管理衣柜{% else %}Manage closet{% endif %}</a> · <a href="/user/reports">{% if locale.starts_with("zh") %}我的举报{% else %}My reports{% endif %}</a> · <a href="/user/profile">{% if locale.starts_with("zh") %}账户设置{% else %}Account settings{% endif %}</a> · <a href="/user/oauth/manage">{% if locale.starts_with("zh") %}OAuth 应用{% else %}OAuth apps{% endif %}</a>{% if user.permission >= 1 %} · <a href="/admin">{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{% endif %}</a>{% endif %}</p>
-  <h3>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h3>
-  <ul>{% for player in players %}<li>{{ player.name }}</li>{% else %}<li>{% if locale.starts_with("zh") %}还没有角色{% else %}No players yet{% endif %}</li>{% endfor %}</ul>
-</main><script>
-const notificationList=document.getElementById('notifications');
-notificationList.addEventListener('click',async(event)=>{
-  const button=event.target.closest('button[data-notification-id]');
-  if(!button)return;
-  try{
-    const response=await fetch('/user/notifications/'+encodeURIComponent(button.dataset.notificationId),{method:'POST',headers:{'Accept':'application/json'}});
-    const detail=await response.json();
-    if(!response.ok)throw new Error(detail.message||'Unable to read notification.');
-    document.getElementById('notification-title').textContent=detail.title;
-    document.getElementById('notification-content').innerHTML=detail.content;
-    document.getElementById('notification-time').textContent=detail.time;
-    document.getElementById('notification-detail').showModal();
-    button.parentElement.remove();
-    document.getElementById('notification-count').textContent=String(notificationList.querySelectorAll('button[data-notification-id]').length);
-    if(!notificationList.querySelector('button[data-notification-id]')){
-      const empty=document.createElement('li');empty.textContent=document.documentElement.lang.startsWith('zh')?'没有未读通知':'No unread notifications';notificationList.replaceChildren(empty);
-    }
-  }catch(error){window.alert(error.message)}
-});
-const verificationButton=document.getElementById('send-verification');
-if(verificationButton)verificationButton.addEventListener('click',async()=>{
-  const status=document.getElementById('verification-status');verificationButton.disabled=true;
-  try{const response=await fetch('/user/email-verification',{method:'POST',headers:{'Accept':'application/json'}});const result=await response.json();status.textContent=result.message||'Unable to send email.';if(!response.ok||result.code!==0)verificationButton.disabled=false;}
-  catch(_){status.textContent='Unable to connect to the server.';verificationButton.disabled=false;}
-});
-document.getElementById('logout').addEventListener('click',async()=>{await fetch('/auth/logout',{method:'POST',headers:{'Accept':'application/json'}});window.location.href='/auth/login';});
-</script>{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ site_name }} - {{ user.nickname }}</title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      main {
+        max-width: 760px;
+        margin: 4rem auto;
+        padding: 2rem;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 8px 28px #0002;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      button {
+        cursor: pointer;
+        padding: 0.55rem 0.9rem;
+      }
+      li {
+        padding: 0.45rem 0;
+      }
+      .account-avatar {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        object-fit: cover;
+        vertical-align: middle;
+        margin-right: 0.45rem;
+      }
+    </style>
+    <meta name="csrf-token" content="" />
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>{{ site_name }}</h1>
+        <button id="logout">
+          {% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif %}
+        </button>
+      </header>
+      <h2>
+        <picture
+          ><source srcset="{{ avatar_url }}" type="image/webp" />
+          <img
+            class="account-avatar"
+            src="{{ avatar_png_url }}"
+            alt="{{ user.nickname }}" /></picture
+        >{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else
+        %}Welcome, {{ user.nickname }}{% endif %}
+      </h2>
+      <p>{{ user.email }}</p>
+      {% if frontend_script_available %}
+      <section id="usage-box" aria-label="Account usage and score"></section>
+      {% endif %} {% if show_email_verification %}
+      <p>
+        <button id="send-verification">
+          {% if locale.starts_with("zh") %}发送验证邮件{% else %}Send
+          verification email{% endif %}
+        </button>
+        <span id="verification-status" role="status"></span>
+      </p>
+      {% endif %}
+      <section aria-labelledby="notifications-title">
+        <h3 id="notifications-title">
+          {% if locale.starts_with("zh") %}站内通知{% else %}Notifications{%
+          endif %}
+          <span id="notification-count">{{ notifications.len() }}</span>
+        </h3>
+        <ul id="notifications">
+          {% for notification in notifications %}
+          <li>
+            <button type="button" data-notification-id="{{ notification.id }}">
+              {{ notification.title }}
+            </button>
+          </li>
+          {% else %}
+          <li>
+            {% if locale.starts_with("zh") %}没有未读通知{% else %}No unread
+            notifications{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </section>
+      <dialog id="notification-detail">
+        <h2 id="notification-title"></h2>
+        <div id="notification-content"></div>
+        <small id="notification-time"></small>
+        <form method="dialog">
+          <button>
+            {% if locale.starts_with("zh") %}关闭{% else %}Close{% endif %}
+          </button>
+        </form>
+      </dialog>
+      <p>
+        <a href="/user/player"
+          >{% if locale.starts_with("zh") %}管理角色{% else %}Manage players{%
+          endif %}</a
+        >
+        ·
+        <a href="/user/closet"
+          >{% if locale.starts_with("zh") %}管理衣柜{% else %}Manage closet{%
+          endif %}</a
+        >
+        ·
+        <a href="/user/reports"
+          >{% if locale.starts_with("zh") %}我的举报{% else %}My reports{% endif
+          %}</a
+        >
+        ·
+        <a href="/user/profile"
+          >{% if locale.starts_with("zh") %}账户设置{% else %}Account settings{%
+          endif %}</a
+        >
+        ·
+        <a href="/user/oauth/manage"
+          >{% if locale.starts_with("zh") %}OAuth 应用{% else %}OAuth apps{%
+          endif %}</a
+        >{% if user.permission >= 1 %} ·
+        <a href="/admin"
+          >{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{%
+          endif %}</a
+        >{% endif %}
+      </p>
+      <h3>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h3>
+      <ul>
+        {% for player in players %}
+        <li>{{ player.name }}</li>
+        {% else %}
+        <li>
+          {% if locale.starts_with("zh") %}还没有角色{% else %}No players yet{%
+          endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </main>
+    <script>
+      const notificationList = document.getElementById('notifications')
+      notificationList.addEventListener('click', async (event) => {
+        const button = event.target.closest('button[data-notification-id]')
+        if (!button) return
+        try {
+          const response = await fetch(
+            '/user/notifications/' +
+              encodeURIComponent(button.dataset.notificationId),
+            { method: 'POST', headers: { Accept: 'application/json' } },
+          )
+          const detail = await response.json()
+          if (!response.ok)
+            throw new Error(detail.message || 'Unable to read notification.')
+          document.getElementById('notification-title').textContent =
+            detail.title
+          document.getElementById('notification-content').innerHTML =
+            detail.content
+          document.getElementById('notification-time').textContent = detail.time
+          document.getElementById('notification-detail').showModal()
+          button.parentElement.remove()
+          document.getElementById('notification-count').textContent = String(
+            notificationList.querySelectorAll('button[data-notification-id]')
+              .length,
+          )
+          if (!notificationList.querySelector('button[data-notification-id]')) {
+            const empty = document.createElement('li')
+            empty.textContent = document.documentElement.lang.startsWith('zh')
+              ? '没有未读通知'
+              : 'No unread notifications'
+            notificationList.replaceChildren(empty)
+          }
+        } catch (error) {
+          window.alert(error.message)
+        }
+      })
+      const verificationButton = document.getElementById('send-verification')
+      if (verificationButton)
+        verificationButton.addEventListener('click', async () => {
+          const status = document.getElementById('verification-status')
+          verificationButton.disabled = true
+          try {
+            const response = await fetch('/user/email-verification', {
+              method: 'POST',
+              headers: { Accept: 'application/json' },
+            })
+            const result = await response.json()
+            status.textContent = result.message || 'Unable to send email.'
+            if (!response.ok || result.code !== 0)
+              verificationButton.disabled = false
+          } catch (_) {
+            status.textContent = 'Unable to connect to the server.'
+            verificationButton.disabled = false
+          }
+        })
+      document.getElementById('logout').addEventListener('click', async () => {
+        await fetch('/auth/logout', {
+          method: 'POST',
+          headers: { Accept: 'application/json' },
+        })
+        window.location.href = '/auth/login'
+      })
+    </script>
+    {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
 </html>

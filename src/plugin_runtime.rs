@@ -842,6 +842,7 @@ fn validate_plugin_filter(
             | "user_password"
             | "head_links"
             | "user_badges"
+            | "user_avatar"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -865,6 +866,26 @@ fn validate_plugin_filter(
 
 fn valid_client_ip(value: &str) -> bool {
     value == "unknown" || (value.len() <= 45 && value.parse::<std::net::IpAddr>().is_ok())
+}
+
+fn valid_plugin_avatar_url(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 2048
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+    {
+        return false;
+    }
+    if value.starts_with('/') {
+        return !value.starts_with("//");
+    }
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn valid_plugin_badge(value: &serde_json::Value) -> bool {
@@ -989,6 +1010,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             Ok(())
         }
         "client_ip" if value.as_str().is_some_and(valid_client_ip) => Ok(()),
+        "user_avatar" if value.as_str().is_some_and(valid_plugin_avatar_url) => Ok(()),
         "user_password"
             if value
                 .as_str()
@@ -1045,6 +1067,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         "user_password" => {
             Err("user_password must return a non-empty hash up to 255 bytes".to_owned())
         }
+        "user_avatar" => Err(
+            "user_avatar must return a bounded root-relative or absolute HTTP(S) URL without credentials"
+                .to_owned(),
+        ),
         "head_links" => Err(
             "head_links must return up to 128 safe link objects with rel and href strings"
                 .to_owned(),
@@ -1759,6 +1785,27 @@ mod tests {
             validate_plugin_filter_value("new_player_name", &serde_json::json!("Steve")).is_ok()
         );
         assert!(validate_plugin_filter_value("new_player_name", &serde_json::json!(7)).is_err());
+        assert!(
+            validate_plugin_filter_value("user_avatar", &serde_json::json!("/avatar/12?size=36"))
+                .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_avatar",
+                &serde_json::json!("https://cdn.example.test/avatar.png")
+            )
+            .is_ok()
+        );
+        for unsafe_url in [
+            "javascript:alert(1)",
+            "//evil.example/avatar.png",
+            "https://u:p@example.test/avatar.png",
+        ] {
+            assert!(
+                validate_plugin_filter_value("user_avatar", &serde_json::json!(unsafe_url))
+                    .is_err()
+            );
+        }
         let password_context = serde_json::json!({});
         assert!(
             validate_plugin_filter(

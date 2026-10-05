@@ -901,6 +901,31 @@ async fn apply_plugin_filter_value(
         .await
 }
 
+async fn filter_user_avatar_url(state: &AppState, user: &UserProfile, png: bool) -> String {
+    let default_url = format!(
+        "/avatar/{}?size=36{}",
+        user.avatar,
+        if png { "&png" } else { "" }
+    );
+    let filtered = apply_plugin_filter_value(
+        state,
+        "user_avatar",
+        &serde_json::json!(default_url),
+        &serde_json::json!({
+            "user": {
+                "uid": user.uid,
+                "nickname": user.nickname,
+                "score": user.score,
+                "avatar": user.avatar,
+                "permission": user.permission,
+                "verified": user.verified,
+            }
+        }),
+    )
+    .await;
+    filtered.as_str().unwrap_or(&default_url).to_owned()
+}
+
 async fn filter_user_password_hash(state: &AppState, password_hash: &str) -> String {
     let filtered = apply_plugin_filter_value(
         state,
@@ -4592,6 +4617,8 @@ fn strip_configured_html_tags(value: &str) -> String {
 #[template(path = "dashboard.html")]
 struct DashboardPage {
     site_name: String,
+    avatar_url: String,
+    avatar_png_url: String,
     user: UserProfile,
     players: Vec<PlayerRecord>,
     notifications: Vec<DashboardNotification>,
@@ -5225,6 +5252,8 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
             return unavailable();
         }
     };
+    let avatar_url = filter_user_avatar_url(&state, &user, false).await;
+    let avatar_png_url = filter_user_avatar_url(&state, &user, true).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5240,6 +5269,8 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     );
     let page = DashboardPage {
         site_name,
+        avatar_url,
+        avatar_png_url,
         user,
         players,
         notifications,
@@ -22415,6 +22446,8 @@ mod tests {
         .unwrap();
         assert!(admin_user_dashboard.contains(r#"href="/admin""#));
         assert!(admin_user_dashboard.contains(r#"id="usage-box""#));
+        assert!(admin_user_dashboard.contains(r#"srcset="/avatar/0?size=36" type="image/webp""#));
+        assert!(admin_user_dashboard.contains(r#"src="/avatar/0?size=36&#38;png""#));
         assert!(admin_user_dashboard.contains("http://localhost/app/style.012abcd.css"));
         assert!(admin_user_dashboard.contains("http://localhost/app/app.012abcd.js"));
         let encoded_dashboard_globals = admin_user_dashboard
