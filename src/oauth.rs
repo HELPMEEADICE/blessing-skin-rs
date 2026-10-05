@@ -1946,6 +1946,7 @@ mod integration_tests {
             sub: user_id.to_string(),
             iat: now,
             exp: now + 3600,
+            remember: false,
         };
         let token = encode(
             &Header::new(Algorithm::HS256),
@@ -2042,6 +2043,7 @@ mod integration_tests {
             password_salt: String::new(),
             bcrypt_rounds: 10,
             app_key: Some(session_secret.to_owned()),
+            session_lifetime_seconds: 7_200,
             mail: MailConfig::default(),
         };
         let database = DatabasePool::Sqlite(pool.clone());

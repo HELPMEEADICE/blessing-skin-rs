@@ -15,6 +15,8 @@ pub struct WebSessionClaims {
     pub sub: String,
     pub iat: u64,
     pub exp: u64,
+    #[serde(default)]
+    pub remember: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -512,12 +512,19 @@ async fn detect_locale_preference(
     };
     let path = request.uri().path();
     let is_api = path == "/api" || path.starts_with("/api/");
-    if (is_user_facing_web_path(path) || path.starts_with("/oauth/"))
+    let should_refresh_web_session = is_user_facing_web_path(path) || path.starts_with("/oauth/");
+    if should_refresh_web_session
         && let Err(error) = refresh_web_session_revocation(&state, request.headers()).await
     {
         tracing::error!(%error, path, "failed to verify web session revocation state");
         return unavailable();
     }
+    let session_to_refresh =
+        if should_refresh_web_session && session_user_id(&state, request.headers()).is_some() {
+            web_session_claims(&state, request.headers()).map(|(_, claims)| claims)
+        } else {
+            None
+        };
     let input_locale = body_locale.or_else(|| requested_query_locale(&request));
     let mut locale = select_request_locale(&state, &request, input_locale.as_deref());
     if !is_api && is_user_facing_web_path(path) {
@@ -562,6 +569,17 @@ async fn detect_locale_preference(
         REQUEST_APP_URL.scope(app_url, next.run(request)),
     );
     let mut response = REQUEST_INPUT_LOCALE.scope(input_locale, response).await;
+    if let Some(claims) = session_to_refresh.as_ref()
+        && !response_manages_web_session_cookie(&response)
+    {
+        match renewed_web_session_cookie(&state, claims, request_secure) {
+            Ok(Some(cookie)) => {
+                response.headers_mut().append(SET_COOKIE, cookie);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not extend authenticated web session"),
+        }
+    }
     if should_set_cookie {
         if let Ok(cookie) = HeaderValue::from_str(&format!(
             "locale={locale}; Path=/; Max-Age=7200; SameSite=Lax"
@@ -3012,7 +3030,8 @@ async fn handle_register(
                 jti: Some(Alphanumeric.sample_string(&mut rand::thread_rng(), 32)),
                 sub: uid.to_string(),
                 iat: now_epoch,
-                exp: now_epoch + 60 * 60 * 12,
+                exp: now_epoch.saturating_add(state.config.session_lifetime_seconds),
+                remember: false,
             };
             let Some(key) = &state.session_key else {
                 return unavailable();
@@ -3036,7 +3055,8 @@ async fn handle_register(
                 ""
             };
             let cookie = format!(
-                "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200{secure}"
+                "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+                state.config.session_lifetime_seconds
             );
             match HeaderValue::from_str(&cookie) {
                 Ok(value) => {
@@ -3225,16 +3245,18 @@ async fn handle_login(State(state): State<AppState>, headers: HeaderMap, body: B
         return unavailable();
     };
     let now = jsonwebtoken::get_current_timestamp();
-    let max_age = if request.keep.unwrap_or(false) {
+    let remember = request.keep.unwrap_or(false);
+    let max_age = if remember {
         LEGACY_REMEMBER_TTL_SECONDS
     } else {
-        60 * 60 * 12
+        state.config.session_lifetime_seconds
     };
     let claims = crate::auth::WebSessionClaims {
         jti: Some(Alphanumeric.sample_string(&mut rand::thread_rng(), 32)),
         sub: credential.uid.to_string(),
         iat: now,
-        exp: now + max_age,
+        exp: now.saturating_add(max_age),
+        remember,
     };
     let session = match encode(&Header::new(Algorithm::HS256), &claims, key) {
         Ok(session) => session,
@@ -7885,23 +7907,70 @@ async fn persist_web_session_revocation(
     token: &str,
     claims: &WebSessionClaims,
 ) -> Result<(), sqlx::Error> {
-    let session_hash = web_session_fingerprint(token);
-    // Keep the record through jsonwebtoken's default 60-second expiration leeway.
-    let revoke_until = claims.exp.saturating_add(61);
+    let now = jsonwebtoken::get_current_timestamp();
+    let ttl = if claims.remember {
+        LEGACY_REMEMBER_TTL_SECONDS
+    } else {
+        state.config.session_lifetime_seconds
+    };
+    // Revoke through the furthest possible sliding expiry and JWT's leeway.
+    let revoke_until = claims.exp.max(now.saturating_add(ttl)).saturating_add(61);
     let revoke_until_i64 = i64::try_from(revoke_until).unwrap_or(i64::MAX);
-    database
-        .revoke_web_session(
-            &state.config.database.table_prefix,
-            &session_hash,
-            revoke_until_i64,
-        )
-        .await?;
+    let keys = web_session_revocation_keys(token, claims);
+    for key in &keys {
+        database
+            .revoke_web_session(&state.config.database.table_prefix, key, revoke_until_i64)
+            .await?;
+    }
     state
         .revoked_web_sessions
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_hash, revoke_until);
+        .extend(keys.into_iter().map(|key| (key, revoke_until)));
     Ok(())
+}
+
+fn response_manages_web_session_cookie(response: &Response) -> bool {
+    response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.trim_start().starts_with("blessing_skin_session="))
+}
+
+fn renewed_web_session_cookie(
+    state: &AppState,
+    claims: &WebSessionClaims,
+    request_secure: bool,
+) -> Result<Option<HeaderValue>, String> {
+    if claims.remember {
+        return Ok(None);
+    }
+    let Some(jti) = claims.jti.as_deref().filter(|jti| !jti.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(key) = &state.session_key else {
+        return Err("APP_KEY is required to renew a web session".to_owned());
+    };
+    let now = jsonwebtoken::get_current_timestamp();
+    let lifetime = state.config.session_lifetime_seconds;
+    let renewed = WebSessionClaims {
+        jti: Some(jti.to_owned()),
+        sub: claims.sub.clone(),
+        iat: now,
+        exp: now.saturating_add(lifetime),
+        remember: false,
+    };
+    let session =
+        encode(&Header::new(Algorithm::HS256), &renewed, key).map_err(|error| error.to_string())?;
+    let secure = if request_secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "blessing_skin_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age={lifetime}{secure}"
+    );
+    HeaderValue::from_str(&cookie)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn expire_web_session(state: &AppState, mut response: Response) -> Response {
@@ -7996,6 +8065,22 @@ fn web_session_fingerprint(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
+fn web_session_identity_fingerprint(jti: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("blessing-skin-session:{jti}").as_bytes())
+    )
+}
+
+fn web_session_revocation_keys(token: &str, claims: &WebSessionClaims) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    if let Some(jti) = claims.jti.as_deref().filter(|jti| !jti.is_empty()) {
+        keys.push(web_session_identity_fingerprint(jti));
+    }
+    keys.push(web_session_fingerprint(token));
+    keys
+}
+
 fn web_session_claims(state: &AppState, headers: &HeaderMap) -> Option<(String, WebSessionClaims)> {
     let token = web_session_token(headers)?;
     let claims = decode_web_session(token, state.config.app_key.as_deref()?)?;
@@ -8009,45 +8094,64 @@ async fn refresh_web_session_revocation(
     let Some((token, claims)) = web_session_claims(state, headers) else {
         return Ok(());
     };
-    let session_hash = web_session_fingerprint(&token);
+    let keys = web_session_revocation_keys(&token, &claims);
     let now = jsonwebtoken::get_current_timestamp();
-    if state
-        .revoked_web_sessions
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&session_hash)
-        .is_some_and(|expires_at| *expires_at > now)
-    {
+    let already_revoked = {
+        let local_revocations = state
+            .revoked_web_sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.iter().any(|key| {
+            local_revocations
+                .get(key)
+                .is_some_and(|expires_at| *expires_at > now)
+        })
+    };
+    if already_revoked {
         return Ok(());
     }
     let Some(database) = &state.database else {
         return Ok(());
     };
     let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
-    if database
-        .web_session_is_revoked(&state.config.database.table_prefix, &session_hash, now_i64)
-        .await?
-    {
-        state
-            .revoked_web_sessions
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_hash, claims.exp.saturating_add(61));
+    for key in &keys {
+        if database
+            .web_session_is_revoked(&state.config.database.table_prefix, key, now_i64)
+            .await?
+        {
+            let ttl = if claims.remember {
+                LEGACY_REMEMBER_TTL_SECONDS
+            } else {
+                state.config.session_lifetime_seconds
+            };
+            let revoke_until = claims.exp.max(now.saturating_add(ttl)).saturating_add(61);
+            state
+                .revoked_web_sessions
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(keys.into_iter().map(|key| (key, revoke_until)));
+            break;
+        }
     }
     Ok(())
 }
 
 pub(crate) fn session_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
     let (token, claims) = web_session_claims(state, headers)?;
-    let session_hash = web_session_fingerprint(&token);
+    let keys = web_session_revocation_keys(&token, &claims);
     let now = jsonwebtoken::get_current_timestamp();
-    if state
-        .revoked_web_sessions
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&session_hash)
-        .is_some_and(|expires_at| *expires_at > now)
-    {
+    let already_revoked = {
+        let local_revocations = state
+            .revoked_web_sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.iter().any(|key| {
+            local_revocations
+                .get(key)
+                .is_some_and(|expires_at| *expires_at > now)
+        })
+    };
+    if already_revoked {
         return None;
     }
     claims.sub.parse().ok()
@@ -17348,6 +17452,7 @@ mod tests {
             password_salt: String::new(),
             bcrypt_rounds: 10,
             app_key: None,
+            session_lifetime_seconds: 7_200,
             mail: crate::config::MailConfig::default(),
         };
         let setup_token = super::setup_csrf_token();
@@ -18053,6 +18158,7 @@ mod tests {
             password_salt: String::new(),
             bcrypt_rounds: 10,
             app_key: Some(secret.clone()),
+            session_lifetime_seconds: 7_200,
             mail: crate::config::MailConfig {
                 mailer: "array".to_owned(),
                 ..crate::config::MailConfig::default()
@@ -18359,6 +18465,7 @@ mod tests {
             sub: "9".to_owned(),
             iat: now,
             exp: now + 3600,
+            remember: false,
         };
         let unbound_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -18673,6 +18780,7 @@ mod tests {
             sub: "999".to_owned(),
             iat: stale_now,
             exp: stale_now + 3600,
+            remember: false,
         };
         let stale_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -18845,6 +18953,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registered_dashboard.status(), StatusCode::OK);
+        let renewed_cookie = registered_dashboard
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("blessing_skin_session="))
+            .expect("authenticated web request should slide the legacy idle session");
+        assert!(renewed_cookie.contains("Max-Age=7200"));
+        let renewed_token = renewed_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
+        let renewed_claims = jsonwebtoken::decode::<crate::auth::WebSessionClaims>(
+            renewed_token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::Validation::default(),
+        )
+        .unwrap()
+        .claims;
+        let registered_token = registered_cookie.split_once('=').unwrap().1;
+        let registered_claims = jsonwebtoken::decode::<crate::auth::WebSessionClaims>(
+            registered_token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::Validation::default(),
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(renewed_claims.jti, registered_claims.jti);
+        assert_eq!(renewed_claims.sub, registered_claims.sub);
+        assert!(!renewed_claims.remember);
         let registered_dashboard = String::from_utf8(
             to_bytes(registered_dashboard.into_body(), usize::MAX)
                 .await
@@ -18870,6 +19011,7 @@ mod tests {
             sub: "7".to_owned(),
             iat: admin_now,
             exp: admin_now + 3600,
+            remember: false,
         };
         let admin_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -22565,6 +22707,7 @@ mod tests {
             sub: "7".to_owned(),
             iat: legacy_now,
             exp: legacy_now + 3600,
+            remember: false,
         };
         let legacy_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),

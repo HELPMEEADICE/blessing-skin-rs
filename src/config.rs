@@ -60,6 +60,7 @@ pub struct Config {
     pub password_salt: String,
     pub bcrypt_rounds: u32,
     pub app_key: Option<String>,
+    pub session_lifetime_seconds: u64,
     pub mail: MailConfig,
 }
 
@@ -178,6 +179,9 @@ impl Config {
                 .or_else(|| std::fs::read_to_string(storage.join("app.key")).ok())
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
+            session_lifetime_seconds: parse_session_lifetime_seconds(legacy_env(
+                "SESSION_LIFETIME",
+            )),
             mail: MailConfig::from_env(),
         })
     }
@@ -188,6 +192,13 @@ fn legacy_app_version(value: Option<String>) -> String {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_LEGACY_APP_VERSION.to_owned())
+}
+
+fn parse_session_lifetime_seconds(value: Option<String>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|minutes| minutes.saturating_mul(60))
+        .unwrap_or(120 * 60)
 }
 
 impl MailConfig {
@@ -556,7 +567,8 @@ mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
         legacy_app_version, mysql_connect_options, parse_bcrypt_rounds, parse_legacy_env_os,
-        parse_legacy_env_value, valid_table_prefix, with_mysql_ssl_ca,
+        parse_legacy_env_value, parse_session_lifetime_seconds, valid_table_prefix,
+        with_mysql_ssl_ca,
     };
     use sqlx::{ConnectOptions, mysql::MySqlConnectOptions};
     use std::{ffi::OsString, path::Path};
@@ -567,6 +579,17 @@ mod tests {
             .query_pairs()
             .find(|(name, _)| name == "ssl-ca")
             .map(|(_, value)| value.strip_prefix("file: ").unwrap_or(&value).to_owned())
+    }
+
+    #[test]
+    fn session_lifetime_uses_the_legacy_minutes_setting() {
+        assert_eq!(parse_session_lifetime_seconds(None), 7_200);
+        assert_eq!(parse_session_lifetime_seconds(Some("45".to_owned())), 2_700);
+        assert_eq!(parse_session_lifetime_seconds(Some("0".to_owned())), 0);
+        assert_eq!(
+            parse_session_lifetime_seconds(Some("invalid".to_owned())),
+            7_200
+        );
     }
 
     #[test]
