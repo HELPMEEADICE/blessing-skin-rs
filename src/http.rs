@@ -2539,7 +2539,17 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
             None,
         );
     }
-    let key = format!("verify:{uid}");
+    let session_fingerprint = web_session_claims(&state, &headers)
+        .map(|(token, claims)| {
+            claims
+                .jti
+                .as_deref()
+                .filter(|jti| !jti.is_empty())
+                .map(web_session_identity_fingerprint)
+                .unwrap_or_else(|| web_session_fingerprint(&token))
+        })
+        .unwrap_or_else(|| format!("user:{uid}"));
+    let key = format!("verify:{uid}:{session_fingerprint}");
     if reserve_mail_limit(&state, &key, Duration::from_secs(60)).is_err() {
         return login_result(
             1,
@@ -20257,6 +20267,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repeated_verification["code"], 1);
+
+        let second_verification_session = login_test_account(
+            &app,
+            "first@example.test",
+            "secure pass 123",
+            "203.0.113.42",
+        )
+        .await;
+        let sent_from_second_session = session_request(
+            &app,
+            &second_verification_session,
+            "POST",
+            "/user/email-verification",
+            None,
+        )
+        .await;
+        let sent_from_second_session: serde_json::Value = serde_json::from_slice(
+            &to_bytes(sent_from_second_session.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent_from_second_session["code"], 0);
+        let repeated_second_session = session_request(
+            &app,
+            &second_verification_session,
+            "POST",
+            "/user/email-verification",
+            None,
+        )
+        .await;
+        let repeated_second_session: serde_json::Value = serde_json::from_slice(
+            &to_bytes(repeated_second_session.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repeated_second_session["code"], 1);
 
         let unverified_player_page =
             session_request(&app, &registered_cookie, "GET", "/user/player", None).await;
