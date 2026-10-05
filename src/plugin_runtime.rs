@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.24.0";
+const HOST_API_VERSION: &str = "1.25.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -104,7 +104,11 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "texture.type.updated",
     "notification.sent",
     "notification.read",
+    "report.submitting",
     "report.submitted",
+    "report.reviewing",
+    "report.rejected",
+    "report.resolved",
     "report.reviewed",
 ];
 pub const COMPONENT_FILE_LIMIT: u64 = 32 * 1024 * 1024;
@@ -1236,6 +1240,10 @@ mod tests {
             "user.score.updating",
             "user.permission.updating",
             "user.banned",
+            "report.submitting",
+            "report.reviewing",
+            "report.rejected",
+            "report.resolved",
         ] {
             assert!(
                 validate_plugin_event(name, br#"{"user_id":7}"#).is_ok(),
@@ -1260,6 +1268,34 @@ mod tests {
             validate_plugin_event(
                 "notification.read",
                 br#"{"user_id":7,"notification_id":"legacy-id"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.submitting",
+                br#"{"reporter_id":7,"texture_id":11,"uploader_id":3}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.reviewing",
+                br#"{"report_id":9,"admin_user_id":1,"action":"delete"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.rejected",
+                br#"{"report_id":9,"admin_user_id":1,"action":"reject","status":2}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_event(
+                "report.resolved",
+                br#"{"report_id":9,"admin_user_id":1,"action":"delete","status":1}"#
             )
             .is_ok()
         );

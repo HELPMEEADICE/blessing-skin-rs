@@ -680,6 +680,7 @@ pub enum ReportReviewOutcome {
     NotFound,
     Rejected,
     Resolved,
+    UploaderBanned(i64),
     UploaderNotFound,
     UploaderPermissionDenied,
 }
@@ -2153,7 +2154,7 @@ impl DatabasePool {
             .min(0)
             .saturating_neg()
             .saturating_add(reporter_reward_score);
-        match self {
+        let banned_uploader_id = match self {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
                 let report = sqlx::query_as::<_, (i32, i64, i64)>(sqlx::AssertSqlSafe(report_sql))
@@ -2193,6 +2194,7 @@ impl DatabasePool {
                     .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;
+                report.1
             }
             Self::MySql(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -2233,6 +2235,7 @@ impl DatabasePool {
                     .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;
+                report.1
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -2273,9 +2276,10 @@ impl DatabasePool {
                     .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;
+                report.1
             }
-        }
-        Ok(ReportReviewOutcome::Resolved)
+        };
+        Ok(ReportReviewOutcome::UploaderBanned(banned_uploader_id))
     }
 
     pub async fn toggle_texture_privacy(
@@ -9000,7 +9004,7 @@ mod tests {
                 .ban_report_uploader("bs_", 100, 2, -3, 5)
                 .await
                 .unwrap(),
-            super::ReportReviewOutcome::Resolved
+            super::ReportReviewOutcome::UploaderBanned(8)
         );
         let reporter_score_after_ban: i64 =
             sqlx::query_scalar("SELECT score FROM bs_users WHERE uid = 7")

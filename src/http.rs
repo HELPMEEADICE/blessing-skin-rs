@@ -13080,6 +13080,12 @@ async fn submit_skinlib_report(
             return unavailable();
         }
     };
+    emit_plugin_event(
+        &state,
+        "report.submitting",
+        serde_json::json!({"reporter_id": reporter.uid, "texture_id": tid, "uploader_id": texture.uploader}),
+    )
+    .await;
     let score_modification = match database
         .option(
             &state.config.database.table_prefix,
@@ -16052,6 +16058,12 @@ async fn review_report_action(
     else {
         return report_review_validation_error(&request_locale(&state));
     };
+    emit_plugin_event(
+        state,
+        "report.reviewing",
+        serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action}),
+    )
+    .await;
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -16106,6 +16118,12 @@ async fn review_report_action(
         Ok(crate::database::ReportReviewOutcome::Rejected) => {
             emit_plugin_event(
                 state,
+                "report.rejected",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 2}),
+            )
+            .await;
+            emit_plugin_event(
+                state,
                 "report.reviewed",
                 serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 2}),
             )
@@ -16115,12 +16133,40 @@ async fn review_report_action(
         Ok(crate::database::ReportReviewOutcome::Resolved) => {
             emit_plugin_event(
                 state,
+                "report.resolved",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 1}),
+            )
+            .await;
+            emit_plugin_event(
+                state,
                 "report.reviewed",
                 serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 1}),
             )
             .await;
             report_review_success(state, 1)
         }
+        Ok(crate::database::ReportReviewOutcome::UploaderBanned(user_id)) => {
+            emit_plugin_event(
+                state,
+                "user.banned",
+                serde_json::json!({"user_id": user_id}),
+            )
+            .await;
+            emit_plugin_event(
+                state,
+                "report.resolved",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 1}),
+            )
+            .await;
+            emit_plugin_event(
+                state,
+                "report.reviewed",
+                serde_json::json!({"report_id": id, "admin_user_id": admin_user_id, "action": action, "status": 1}),
+            )
+            .await;
+            report_review_success(state, 1)
+        }
+
         Ok(crate::database::ReportReviewOutcome::UploaderNotFound) => {
             let message = if request_locale(&state).starts_with("zh") {
                 "用户不存在"
@@ -16235,6 +16281,12 @@ async fn delete_reported_texture(
             Ok(crate::database::ReportReviewOutcome::Resolved) => {
                 emit_plugin_event(
                     state,
+                    "report.resolved",
+                    serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
+                )
+                .await;
+                emit_plugin_event(
+                    state,
                     "report.reviewed",
                     serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
                 )
@@ -16336,6 +16388,12 @@ async fn delete_reported_texture(
         public_award,
         take_back_award,
     );
+    emit_plugin_event(
+        state,
+        "texture.deleting",
+        serde_json::json!({"texture_id": texture.tid, "uploader_id": texture.uploader, "hash": texture.hash, "name": texture.name}),
+    )
+    .await;
     let remove_texture_file = match database
         .delete_reported_texture(
             prefix,
@@ -16368,6 +16426,12 @@ async fn delete_reported_texture(
         state,
         "texture.deleted",
         serde_json::json!({"texture_id": texture.tid, "uploader_id": texture.uploader, "hash": texture.hash, "name": texture.name}),
+    )
+    .await;
+    emit_plugin_event(
+        state,
+        "report.resolved",
+        serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
     )
     .await;
     emit_plugin_event(
