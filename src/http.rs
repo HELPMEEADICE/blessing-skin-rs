@@ -1177,17 +1177,6 @@ struct AdminTranslationsQuery {
     added: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct NewLanguageLineForm {
-    group: String,
-    key: String,
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct LanguageLineTextForm {
-    text: String,
-}
 #[derive(Template)]
 #[template(path = "user_reports.html")]
 struct UserReportsPage {
@@ -4689,7 +4678,8 @@ async fn web_admin_language_lines(
 async fn web_create_language_line(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<NewLanguageLineForm>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -4698,15 +4688,32 @@ async fn web_create_language_line(
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let group = form.group.trim();
-    let key = form.key.trim();
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let fields = match parse_legacy_input_object(&query, &body, content_type) {
+        Ok(fields) => fields,
+        Err(()) => return translation_validation_error("group", &request_locale(&state)),
+    };
+    let Some(group) = fields.get("group").and_then(serde_json::Value::as_str) else {
+        return translation_validation_error("group", &request_locale(&state));
+    };
+    let Some(key) = fields.get("key").and_then(serde_json::Value::as_str) else {
+        return translation_validation_error("key", &request_locale(&state));
+    };
+    let Some(text) = fields.get("text").and_then(serde_json::Value::as_str) else {
+        return translation_validation_error("text", &request_locale(&state));
+    };
+    let group = group.trim();
+    let key = key.trim();
     if group.is_empty() || group.chars().count() > 255 {
         return translation_validation_error("group", &request_locale(&state));
     }
     if key.is_empty() || key.chars().count() > 255 {
         return translation_validation_error("key", &request_locale(&state));
     }
-    if form.text.trim().is_empty() {
+    let text = text.trim();
+    if text.is_empty() {
         return translation_validation_error("text", &request_locale(&state));
     }
     let Some(database) = &state.database else {
@@ -4722,13 +4729,7 @@ async fn web_create_language_line(
         Ok(false) => {}
     }
     if let Err(error) = database
-        .create_language_line(
-            prefix,
-            group,
-            key,
-            &request_locale(&state),
-            form.text.trim(),
-        )
+        .create_language_line(prefix, group, key, &request_locale(&state), text)
         .await
     {
         tracing::error!(%error, "failed to create language line");
@@ -4741,7 +4742,8 @@ async fn web_update_language_line(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(id): LegacyRouteId,
-    Json(form): Json<LanguageLineTextForm>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -4750,9 +4752,21 @@ async fn web_update_language_line(
     if user.permission < 1 {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if form.text.trim().is_empty() {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let fields = match parse_legacy_input_object(&query, &body, content_type) {
+        Ok(fields) => fields,
+        Err(()) => return translation_validation_error("text", &request_locale(&state)),
+    };
+    let Some(text) = fields
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
         return translation_validation_error("text", &request_locale(&state));
-    }
+    };
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -4761,7 +4775,7 @@ async fn web_update_language_line(
             &state.config.database.table_prefix,
             id,
             &request_locale(&state),
-            form.text.trim(),
+            text,
         )
         .await
     {
@@ -20621,7 +20635,6 @@ mod tests {
         assert_eq!(translation_globals["i18n"]["auth"]["login"], "Log In");
 
         let create_body = form_urlencoded::Serializer::new(String::new())
-            .append_pair("group", "front-end")
             .append_pair("key", "nav.home")
             .append_pair("text", "Home")
             .finish();
@@ -20630,7 +20643,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/i18n")
+                    .uri("/admin/i18n?group=front-end")
                     .header(
                         "cookie",
                         format!("{}; {}", admin_cookie.clone(), test_csrf_cookie),
@@ -20679,8 +20692,8 @@ mod tests {
             &app,
             &admin_cookie,
             "PUT",
-            &format!("/admin/i18n/{line_id}"),
-            Some(r#"{"text":"Homepage"}"#),
+            &format!("/admin/i18n/{line_id}?text=Homepage"),
+            None,
         )
         .await;
         assert_eq!(updated.status(), StatusCode::OK);
