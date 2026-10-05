@@ -5884,6 +5884,47 @@ impl DatabasePool {
                 .await?),
         }
     }
+    pub async fn player_by_id(
+        &self,
+        prefix: &str,
+        player_id: i64,
+    ) -> Result<Option<PlayerRecord>, sqlx::Error> {
+        let sql = match self {
+            Self::Postgres(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, \
+                 CAST(tid_skin AS BIGINT) AS tid_skin, CAST(tid_cape AS BIGINT) AS tid_cape, \
+                 to_char(last_modified, 'YYYY-MM-DD HH24:MI:SS') AS last_modified \
+                 FROM {prefix}players WHERE pid = $1 LIMIT 1"
+            ),
+            Self::MySql(_) => format!(
+                "SELECT CAST(pid AS SIGNED) AS pid, CAST(uid AS SIGNED) AS uid, name, \
+                 CAST(tid_skin AS SIGNED) AS tid_skin, CAST(tid_cape AS SIGNED) AS tid_cape, \
+                 DATE_FORMAT(last_modified, '%Y-%m-%d %H:%i:%s') AS last_modified \
+                 FROM {prefix}players WHERE pid = ? LIMIT 1"
+            ),
+            Self::Sqlite(_) => format!(
+                "SELECT CAST(pid AS BIGINT) AS pid, CAST(uid AS BIGINT) AS uid, name, \
+                 CAST(tid_skin AS BIGINT) AS tid_skin, CAST(tid_cape AS BIGINT) AS tid_cape, \
+                 CAST(last_modified AS TEXT) AS last_modified \
+                 FROM {prefix}players WHERE pid = ? LIMIT 1"
+            ),
+        };
+        match self {
+            Self::Sqlite(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_optional(pool)
+                .await?),
+            Self::MySql(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_optional(pool)
+                .await?),
+            Self::Postgres(pool) => Ok(sqlx::query_as::<_, PlayerRecord>(sqlx::AssertSqlSafe(sql))
+                .bind(player_id)
+                .fetch_optional(pool)
+                .await?),
+        }
+    }
+
     pub async fn rename_player(
         &self,
         prefix: &str,

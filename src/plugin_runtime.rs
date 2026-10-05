@@ -12,7 +12,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.10.0";
+const HOST_API_VERSION: &str = "1.11.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -49,6 +49,7 @@ const PLUGIN_EVENT_NAMES: &[&str] = &[
     "player.add.attempt",
     "player.adding",
     "player.added",
+    "player.renaming",
     "player.renamed",
     "player.deleted",
     "player.owner.updated",
@@ -758,7 +759,7 @@ fn validate_plugin_filter(
 ) -> Result<(), String> {
     if !matches!(
         name,
-        "can_sign" | "sign_score" | "new_player_name" | "can_add_player"
+        "can_sign" | "sign_score" | "new_player_name" | "can_add_player" | "can_rename_player"
     ) {
         return Err("unsupported plugin filter name".to_owned());
     }
@@ -779,7 +780,7 @@ fn validate_plugin_filter(
 
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
-        "can_sign" | "can_add_player"
+        "can_sign" | "can_add_player" | "can_rename_player"
             if value.is_boolean()
                 || value
                     .get("rejection")
@@ -789,7 +790,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         }
         "new_player_name" if value.is_string() => Ok(()),
         "sign_score" if value.as_i64().is_some() => Ok(()),
-        "can_sign" | "can_add_player" => Err(
+        "can_sign" | "can_add_player" | "can_rename_player" => Err(
             "permission filters must return a boolean or an object with a string rejection"
                 .to_owned(),
         ),
@@ -1176,6 +1177,13 @@ mod tests {
             validate_plugin_event("player.add.attempt", br#"{"user_id":7,"name":"Alex"}"#).is_ok()
         );
         assert!(validate_plugin_event("player.adding", br#"{"user_id":7,"name":"Alex"}"#).is_ok());
+        assert!(
+            validate_plugin_event(
+                "player.renaming",
+                br#"{"user_id":7,"player_id":3,"previous_name":"Alex","name":"Steve"}"#
+            )
+            .is_ok()
+        );
         assert!(validate_plugin_event("player.added", b"[]").is_err());
         assert!(validate_plugin_event("player.deleted", b"not json").is_err());
         assert!(
@@ -1192,6 +1200,16 @@ mod tests {
             validate_plugin_filter("can_add_player", &serde_json::json!(true), &context).is_ok()
         );
         assert!(validate_plugin_filter_value("can_sign", &serde_json::json!(false)).is_ok());
+        assert!(
+            validate_plugin_filter("can_rename_player", &serde_json::json!(true), &context).is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "can_rename_player",
+                &serde_json::json!({ "rejection": "disabled" })
+            )
+            .is_ok()
+        );
         assert!(
             validate_plugin_filter_value(
                 "can_add_player",

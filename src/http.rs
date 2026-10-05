@@ -827,6 +827,79 @@ fn plugin_filter_rejection(value: &serde_json::Value) -> Option<&str> {
     value.get("rejection").and_then(serde_json::Value::as_str)
 }
 
+async fn load_player_for_rename(
+    database: &crate::database::DatabasePool,
+    prefix: &str,
+    user_id: i64,
+    player_id: i64,
+    locale: &str,
+) -> Result<crate::database::PlayerRecord, Response> {
+    let player = match database.player_by_id(prefix, player_id).await {
+        Ok(Some(player)) => player,
+        Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            tracing::error!(%error, player_id, "failed to load player before rename filters");
+            return Err(unavailable());
+        }
+    };
+    if player.uid != user_id {
+        return Err(player_forbidden_response(locale));
+    }
+    Ok(player)
+}
+
+async fn filter_player_rename_name(
+    state: &AppState,
+    user_id: i64,
+    player: &crate::database::PlayerRecord,
+    submitted_name: &str,
+) -> Result<String, String> {
+    let filtered_name = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "new_player_name",
+            &serde_json::json!(submitted_name),
+            &serde_json::json!({
+                "user_id": user_id,
+                "action": "rename",
+                "player": player,
+            }),
+        )
+        .await;
+    let name = filtered_name.as_str().unwrap_or(submitted_name).to_owned();
+    emit_plugin_event(
+        state,
+        "player.renaming",
+        serde_json::json!({
+            "user_id": user_id,
+            "player_id": player.pid,
+            "previous_name": player.name,
+            "name": name,
+        }),
+    )
+    .await;
+    let can_rename = state
+        .wasm_runtime
+        .lock()
+        .await
+        .apply_filter(
+            "can_rename_player",
+            &serde_json::json!(true),
+            &serde_json::json!({
+                "user_id": user_id,
+                "player": player,
+                "name": name,
+            }),
+        )
+        .await;
+    if let Some(reason) = plugin_filter_rejection(&can_rename) {
+        return Err(reason.to_owned());
+    }
+    Ok(name)
+}
+
 fn user_sign_plugin_event(user_id: i64, score: i64) -> serde_json::Value {
     serde_json::json!({
         "user_id": user_id,
@@ -7316,6 +7389,22 @@ async fn web_rename_player(
     if !valid_player_name(&name, &rule, &custom_rule, min_length, max_length) {
         return validation_error("name", &request_locale(&state));
     }
+    let player = match load_player_for_rename(
+        database,
+        prefix,
+        user.uid,
+        player_id,
+        &request_locale(&state),
+    )
+    .await
+    {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    let name = match filter_player_rename_name(&state, user.uid, &player, &name).await {
+        Ok(name) => name,
+        Err(reason) => return login_result(1, &reason, None),
+    };
     match database
         .rename_player(prefix, user.uid, player_id, &name)
         .await
@@ -8768,6 +8857,21 @@ fn duplicate_player_name_error(locale: &str) -> Response {
     )
         .into_response()
 }
+fn player_forbidden_response(locale: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "code": 1,
+            "message": if locale.starts_with("zh") {
+                "无权操作此角色"
+            } else {
+                "You are not allowed to modify this player."
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn login_result(code: i32, message: &str, data: Option<serde_json::Value>) -> Response {
     let mut body = serde_json::json!({ "code": code, "message": message });
     if let Some(data) = data {
@@ -10455,6 +10559,22 @@ async fn api_rename_player(
     if !valid_player_name(&name, &name_rule, &custom_rule, min_length, max_length) {
         return validation_error("name", &request_locale(&state));
     }
+    let player = match load_player_for_rename(
+        database,
+        options,
+        identity.user_id,
+        player_id,
+        &request_locale(&state),
+    )
+    .await
+    {
+        Ok(player) => player,
+        Err(response) => return response,
+    };
+    let name = match filter_player_rename_name(&state, identity.user_id, &player, &name).await {
+        Ok(name) => name,
+        Err(reason) => return login_result(1, &reason, None),
+    };
 
     match database
         .rename_player(options, identity.user_id, player_id, &name)
