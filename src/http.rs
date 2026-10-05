@@ -14303,6 +14303,7 @@ async fn web_admin_closet_add(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(uid): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let Some(actor_uid) = session_user_id(&state, &headers) else {
@@ -14316,7 +14317,7 @@ async fn web_admin_closet_add(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_closet_mutation(&state, uid, body, false).await
+            admin_closet_mutation(&state, uid, &query, &headers, body, false).await
         }
         Ok(Some(_)) => forbidden_action(),
         Ok(None) => Redirect::to("/auth/login").into_response(),
@@ -14331,6 +14332,7 @@ async fn web_admin_closet_remove(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(uid): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let Some(actor_uid) = session_user_id(&state, &headers) else {
@@ -14344,7 +14346,7 @@ async fn web_admin_closet_remove(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_closet_mutation(&state, uid, body, true).await
+            admin_closet_mutation(&state, uid, &query, &headers, body, true).await
         }
         Ok(Some(_)) => forbidden_action(),
         Ok(None) => Redirect::to("/auth/login").into_response(),
@@ -14411,6 +14413,7 @@ async fn api_admin_closet_add(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(uid): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -14428,7 +14431,7 @@ async fn api_admin_closet_add(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_closet_mutation(&state, uid, body, false).await
+            admin_closet_mutation(&state, uid, &query, &headers, body, false).await
         }
         Ok(Some(_)) | Ok(None) => forbidden_action(),
         Err(error) => {
@@ -14442,6 +14445,7 @@ async fn api_admin_closet_remove(
     State(state): State<AppState>,
     headers: HeaderMap,
     LegacyRouteId(uid): LegacyRouteId,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -14459,7 +14463,7 @@ async fn api_admin_closet_remove(
         .await
     {
         Ok(Some(user)) if user.permission >= 1 => {
-            admin_closet_mutation(&state, uid, body, true).await
+            admin_closet_mutation(&state, uid, &query, &headers, body, true).await
         }
         Ok(Some(_)) | Ok(None) => forbidden_action(),
         Err(error) => {
@@ -14469,7 +14473,14 @@ async fn api_admin_closet_remove(
     }
 }
 
-async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: bool) -> Response {
+async fn admin_closet_mutation(
+    state: &AppState,
+    uid: i64,
+    query: &BTreeMap<String, String>,
+    headers: &HeaderMap,
+    body: Bytes,
+    remove: bool,
+) -> Response {
     let Some(database) = &state.database else {
         return unavailable();
     };
@@ -14484,7 +14495,15 @@ async fn admin_closet_mutation(state: &AppState, uid: i64, body: Bytes, remove: 
             return unavailable();
         }
     };
-    let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let request = parse_legacy_input_object(
+        query,
+        &body,
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .ok()
+    .map(serde_json::Value::Object);
     let tid = request
         .as_ref()
         .and_then(|value| value.get("tid"))
@@ -22750,14 +22769,13 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/closet/8")
+                    .uri("/admin/closet/8?tid=2")
                     .header(
                         "cookie",
                         format!("{}; {}", cookie.clone(), test_csrf_cookie),
                     )
                     .header("x-csrf-token", test_csrf_token.as_str())
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"tid":2}"#))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -22827,8 +22845,8 @@ mod tests {
                         format!("{}; {}", cookie.clone(), test_csrf_cookie),
                     )
                     .header("x-csrf-token", test_csrf_token.as_str())
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"tid":2}"#))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("tid=2"))
                     .unwrap(),
             )
             .await
