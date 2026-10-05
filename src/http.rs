@@ -13194,6 +13194,25 @@ async fn submit_skinlib_report(
             return unavailable();
         }
     };
+    let report_permission = apply_plugin_filter_value(
+        &state,
+        "user_can_report",
+        &serde_json::json!(true),
+        &serde_json::json!({
+            "report": {"texture_id": tid, "reason": reason},
+            "reporter": {
+                "uid": reporter.uid,
+                "nickname": reporter.nickname,
+                "score": reporter.score,
+                "permission": reporter.permission,
+                "verified": reporter.verified,
+            },
+        }),
+    )
+    .await;
+    if let Some(reason) = plugin_filter_rejection(&report_permission) {
+        return login_result(1, reason, None);
+    }
     emit_plugin_event(
         &state,
         "report.submitting",

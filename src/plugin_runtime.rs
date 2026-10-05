@@ -821,6 +821,7 @@ fn validate_plugin_filter(
             | "can_delete_player"
             | "can_set_texture"
             | "can_clear_texture"
+            | "user_can_report"
             | "user_can_update_avatar"
             | "user_can_edit_profile"
             | "can_delete_texture"
@@ -860,6 +861,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_player"
         | "can_set_texture"
         | "can_clear_texture"
+        | "user_can_report"
         | "user_can_update_avatar"
         | "user_can_edit_profile"
         | "can_delete_texture"
@@ -899,6 +901,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         | "can_delete_player"
         | "can_set_texture"
         | "can_clear_texture"
+        | "user_can_report"
         | "user_can_update_avatar"
         | "user_can_edit_profile"
         | "can_delete_texture"
@@ -1485,6 +1488,19 @@ mod tests {
         assert!(
             validate_plugin_filter("user_can_update_avatar", &serde_json::json!(true), &context)
                 .is_ok()
+        );
+        assert!(
+            validate_plugin_filter("user_can_report", &serde_json::json!(true), &context).is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value(
+                "user_can_report",
+                &serde_json::json!({ "rejection": "reporting disabled" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter_value("user_can_report", &serde_json::json!("false")).is_err()
         );
         assert!(
             validate_plugin_filter("user_can_edit_profile", &serde_json::json!(true), &context)
