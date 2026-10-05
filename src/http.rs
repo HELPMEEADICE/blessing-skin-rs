@@ -8196,6 +8196,12 @@ async fn web_add_closet_item(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    emit_plugin_event(
+        &state,
+        "closet.adding",
+        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": name}),
+    )
+    .await;
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
@@ -8321,6 +8327,12 @@ async fn web_rename_closet_item(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    emit_plugin_event(
+        &state,
+        "closet.renaming",
+        serde_json::json!({"user_id": user.uid, "texture_id": tid, "item_name": name}),
+    )
+    .await;
     match database
         .rename_closet_item(&state.config.database.table_prefix, user.uid, tid, name)
         .await
@@ -8370,6 +8382,12 @@ async fn web_remove_closet_item(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    emit_plugin_event(
+        &state,
+        "closet.removing",
+        serde_json::json!({"user_id": user.uid, "texture_id": tid}),
+    )
+    .await;
     let refund = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
@@ -11784,6 +11802,12 @@ async fn api_add_closet_item(
             return unavailable();
         }
     };
+    emit_plugin_event(
+        &state,
+        "closet.adding",
+        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": name}),
+    )
+    .await;
     let score_cost = match database.option(prefix, "score_per_closet_item").await {
         Ok(value) => legacy_option_integer(value.as_deref(), 0),
         Err(error) => {
@@ -11911,6 +11935,12 @@ async fn api_rename_closet_item(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    emit_plugin_event(
+        &state,
+        "closet.renaming",
+        serde_json::json!({"user_id": identity.user_id, "texture_id": tid, "item_name": name}),
+    )
+    .await;
     match database
         .rename_closet_item(
             &state.config.database.table_prefix,
@@ -11968,6 +11998,12 @@ async fn api_remove_closet_item(
         return unavailable();
     };
     let prefix = &state.config.database.table_prefix;
+    emit_plugin_event(
+        &state,
+        "closet.removing",
+        serde_json::json!({"user_id": identity.user_id, "texture_id": tid}),
+    )
+    .await;
     let return_score = match database.option(prefix, "return_score").await {
         Ok(value) => legacy_option_bool(value.as_deref()),
         Err(error) => {
@@ -15508,6 +15544,57 @@ async fn admin_closet_mutation(
         };
         return login_result(1, message, None);
     };
+    if remove {
+        emit_plugin_event(
+            state,
+            "closet.removing",
+            serde_json::json!({"user_id": uid, "texture_id": tid}),
+        )
+        .await;
+    } else {
+        let texture = match database
+            .texture_info(&state.config.database.table_prefix, tid)
+            .await
+        {
+            Ok(Some(texture)) => texture,
+            Ok(None) => {
+                let message = if chinese {
+                    "该材质不存在"
+                } else {
+                    "We cannot find this texture."
+                };
+                return login_result(1, message, None);
+            }
+            Err(error) => {
+                tracing::error!(%error, tid, "failed to load texture for managed closet add");
+                return unavailable();
+            }
+        };
+        let items = match database
+            .admin_closet_items(&state.config.database.table_prefix, uid)
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, uid, "failed to check managed closet membership");
+                return unavailable();
+            }
+        };
+        if items.iter().any(|item| item.tid == tid) {
+            let message = if chinese {
+                "你已经收藏过这个材质啦"
+            } else {
+                "You have already added this texture."
+            };
+            return login_result(1, message, None);
+        }
+        emit_plugin_event(
+            state,
+            "closet.adding",
+            serde_json::json!({"user_id": uid, "texture_id": tid, "item_name": texture.name}),
+        )
+        .await;
+    }
     if remove {
         match database
             .remove_admin_closet_item(&state.config.database.table_prefix, uid, tid)
