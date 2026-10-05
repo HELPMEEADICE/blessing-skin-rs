@@ -14404,6 +14404,17 @@ async fn apply_admin_player_mutation(
                     return unavailable();
                 }
             }
+            emit_plugin_event(
+                state,
+                "player.renaming",
+                serde_json::json!({
+                    "user_id": player.uid,
+                    "player_id": pid,
+                    "previous_name": player.name,
+                    "name": name,
+                }),
+            )
+            .await;
             if let Err(error) = database
                 .update_admin_player_text(prefix, pid, "name", name)
                 .await
@@ -14438,6 +14449,16 @@ async fn apply_admin_player_mutation(
             else {
                 return admin_player_validation_error("uid", &request_locale(&state));
             };
+            emit_plugin_event(
+                state,
+                "player.owner.updating",
+                serde_json::json!({
+                    "player_id": pid,
+                    "previous_user_id": player.uid,
+                    "user_id": uid,
+                }),
+            )
+            .await;
             let owner = match database.user_profile(prefix, uid).await {
                 Ok(Some(owner)) => owner,
                 Ok(None) => {
