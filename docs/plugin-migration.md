@@ -21,3 +21,5 @@ Super administrators can install a component by uploading its WASM file or by en
 The host does not expose filesystem, network, raw database, WASI, or arbitrary host imports. Components run with fuel, memory, table, and file-size limits. Plugins cannot register HTTP routes or access arbitrary Blessing Skin business data; event payloads are limited to the documented fields. New host capabilities require an explicit versioned WIT interface and must preserve the sandbox boundary.
 
 See the [Bytecode Alliance Rust component guide](https://component-model.bytecodealliance.org/language-support/building-a-simple-component/rust.html) for the WIT and `wit-bindgen` component workflow.
+
+Host API version 1.45 adds `grid:admin.index` to the admin dashboard with the `usage`, `notification`, and `chart` region identifiers; legacy PHP/Twig partials are rejected.

@@ -40,6 +40,8 @@
     <a href="/admin/status">{% if locale.starts_with("zh") %}系统状态{% else %}System status{% endif %}</a>
     <a href="/admin/plugins/manage">{% if locale.starts_with("zh") %}插件{% else %}Plugins{% endif %}</a>
   </nav>
+  {% for widget in page_widgets %}
+  {% if widget == "notification" %}
   <section class="notice">
     <h2>{% if locale.starts_with("zh") %}发送站内通知{% else %}Send a site notification{% endif %}</h2>
     <form id="notification-form">
@@ -60,26 +62,34 @@
       <p id="notification-status" role="status"></p>
     </form>
   </section>
+  {% endif %}
+  {% if widget == "usage" %}
   <section class="stats" aria-label="{% if locale.starts_with("zh") %}站点统计{% else %}Site statistics{% endif %}">
     <article class="stat"><h2>{% if locale.starts_with("zh") %}用户{% else %}Users{% endif %}</h2><p>{{ stats.users }}</p></article>
     <article class="stat"><h2>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h2><p>{{ stats.players }}</p></article>
     <article class="stat"><h2>{% if locale.starts_with("zh") %}纹理{% else %}Textures{% endif %}</h2><p>{{ stats.textures }}</p></article>
     <article class="stat"><h2>{% if locale.starts_with("zh") %}存储用量（字节）{% else %}Storage (bytes){% endif %}</h2><p>{{ stats.storage }}</p></article>
   </section>
+  {% endif %}
+  {% if widget == "chart" %}
   <section class="charts" aria-label="{% if locale.starts_with("zh") %}近一个月活动{% else %}Recent activity{% endif %}">
     <article class="chart"><h2 id="users-chart-title">{% if locale.starts_with("zh") %}用户注册{% else %}User Registration{% endif %}</h2><div id="chart-users-registration" role="img" aria-labelledby="users-chart-title"></div></article>
     <article class="chart"><h2 id="textures-chart-title">{% if locale.starts_with("zh") %}材质上传{% else %}Texture Uploads{% endif %}</h2><div id="chart-textures-upload" role="img" aria-labelledby="textures-chart-title"></div></article>
   </section>
+  {% endif %}
+  {% endfor %}
 </main>
   <script>
-  document.getElementById('notification-receiver').addEventListener('change', event => {
+  const notificationReceiver = document.getElementById('notification-receiver');
+  if (notificationReceiver) notificationReceiver.addEventListener('change', event => {
     const target = event.currentTarget.value;
     document.getElementById('notification-uid').hidden = target !== 'uid';
     document.getElementById('notification-uid').required = target === 'uid';
     document.getElementById('notification-email').hidden = target !== 'email';
     document.getElementById('notification-email').required = target === 'email';
   });
-  document.getElementById('notification-form').addEventListener('submit', async event => {
+  const notificationForm = document.getElementById('notification-form');
+  if (notificationForm) notificationForm.addEventListener('submit', async event => {
     event.preventDefault();
     const form = event.currentTarget, status = document.getElementById('notification-status');
     const values = Object.fromEntries(new FormData(form));
@@ -136,7 +146,7 @@ async function loadAdminCharts(){
   render('chart-users-registration',0,'#17a2b8');
   render('chart-textures-upload',1,'#6f42c1');
 }
-loadAdminCharts().catch(()=>{});
+if (document.getElementById('chart-users-registration')) loadAdminCharts().catch(()=>{});
 </script>
 {% endif %}
 </body>

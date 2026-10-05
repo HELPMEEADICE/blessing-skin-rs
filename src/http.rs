@@ -1033,6 +1033,15 @@ async fn filter_skinlib_upload_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(state, "grid:skinlib.upload", &["upload_form", "previewer"]).await
 }
 
+async fn filter_admin_dashboard_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(
+        state,
+        "grid:admin.index",
+        &["usage", "notification", "chart"],
+    )
+    .await
+}
+
 async fn filter_admin_status_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(state, "grid:admin.status", &["system_info", "plugins"]).await
 }
@@ -4831,6 +4840,7 @@ struct AdminDashboardPage {
     site_name: String,
     locale: String,
     stats: AdminDashboardStats,
+    page_widgets: Vec<String>,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -5814,6 +5824,7 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
             return unavailable();
         }
     };
+    let page_widgets = filter_admin_dashboard_widgets(&state).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5824,13 +5835,17 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         &state,
         &site_name,
         "admin",
-        serde_json::json!({ "dashboard_stats": &stats }),
+        serde_json::json!({
+            "dashboard_stats": &stats,
+            "page_widgets": &page_widgets,
+        }),
         i18n,
     );
     let page = AdminDashboardPage {
         site_name,
         locale: request_locale(&state),
         stats,
+        page_widgets,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -22673,6 +22688,10 @@ mod tests {
         assert_eq!(admin_globals["extra"]["dashboard_stats"]["players"], 2);
         assert_eq!(admin_globals["extra"]["dashboard_stats"]["textures"], 1);
         assert_eq!(admin_globals["extra"]["dashboard_stats"]["storage"], 8);
+        assert_eq!(
+            admin_globals["extra"]["page_widgets"],
+            serde_json::json!(["usage", "notification", "chart"])
+        );
         let admin_chart = session_request(&app, &admin_cookie, "GET", "/admin/chart", None).await;
         assert_eq!(admin_chart.status(), StatusCode::OK);
         let admin_chart: serde_json::Value =

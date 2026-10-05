@@ -11,6 +11,7 @@ jest.mock('@/views/admin/createDashboardChart', () => ({
 beforeEach(() => {
   window.blessing.extra = {
     dashboard_stats: { users: 4, players: 2, textures: 1, storage: 8 },
+    page_widgets: ['usage', 'notification', 'chart'],
   }
   fetch.get.mockResolvedValue({
     labels: ['User Registration', 'Texture Uploads'],
@@ -29,6 +30,26 @@ test('links administrators to standalone Rust releases', () => {
     'href',
     '/admin/update',
   )
+})
+
+test('renders dashboard regions in the configured order', () => {
+  window.blessing.extra.page_widgets = ['chart', 'notification', 'usage']
+  const { container } = render(<DashboardPage />)
+
+  expect(
+    Array.from(container.querySelectorAll('.notice, .stats, .charts')).map(
+      (region) => region.className,
+    ),
+  ).toEqual(['charts', 'notice', 'stats'])
+})
+
+test('omits filtered regions and does not load hidden charts', () => {
+  window.blessing.extra.page_widgets = ['notification']
+  const { container } = render(<DashboardPage />)
+
+  expect(container.querySelectorAll('.notice, .stats, .charts')).toHaveLength(1)
+  expect(container.querySelector('.notice')).toBeInTheDocument()
+  expect(fetch.get).not.toBeCalled()
 })
 
 test('sends a notification to the selected user', async () => {
