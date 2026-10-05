@@ -9766,6 +9766,7 @@ static NOTIFICATION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 async fn web_send_notification(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
@@ -9782,24 +9783,18 @@ async fn web_send_notification(
     let Some(database) = &state.database else {
         return unavailable();
     };
-    let is_json = headers
+    let content_type = headers
         .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"));
-    let request = if is_json {
-        match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(request) => request,
-            Err(_) => return notification_validation_error("receiver", &request_locale(&state)),
-        }
+        .and_then(|value| value.to_str().ok());
+    let is_json = content_type.is_some_and(|value| value.starts_with("application/json"));
+    let input_content_type = if is_json {
+        content_type
     } else {
-        let fields = form_urlencoded::parse(&body).collect::<HashMap<_, _>>();
-        serde_json::json!({
-            "receiver": fields.get("receiver"),
-            "uid": fields.get("uid"),
-            "email": fields.get("email"),
-            "title": fields.get("title"),
-            "content": fields.get("content")
-        })
+        Some("application/x-www-form-urlencoded")
+    };
+    let request = match parse_legacy_input_object(&query, &body, input_content_type) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return notification_validation_error("receiver", &request_locale(&state)),
     };
     let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
         return notification_validation_error("receiver", &request_locale(&state));
@@ -9888,6 +9883,7 @@ async fn web_send_notification(
 async fn api_send_notification(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let identity = match authenticate(&state, &headers).await {
@@ -9917,9 +9913,12 @@ async fn api_send_notification(
         return missing_scope();
     }
 
-    let request = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(request) => request,
-        Err(_) => return notification_validation_error("receiver", &request_locale(&state)),
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let request = match parse_legacy_input_object(&query, &body, content_type) {
+        Ok(fields) => serde_json::Value::Object(fields),
+        Err(()) => return notification_validation_error("receiver", &request_locale(&state)),
     };
     let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
         return notification_validation_error("receiver", &request_locale(&state));
@@ -23970,6 +23969,24 @@ mod tests {
         let saved_notice: serde_json::Value = serde_json::from_str(&saved_notice).unwrap();
         assert_eq!(saved_notice["title"], "Rust notice");
         assert_eq!(saved_notice["content"], "Maintenance starts tonight.");
+        let query_notice = session_request(
+            &app,
+            &admin_cookie,
+            "POST",
+            "/admin/notifications/send?receiver=uid&uid=7&title=Query+notice&content=Settings+saved",
+            None,
+        )
+        .await;
+        assert_eq!(query_notice.status(), StatusCode::SEE_OTHER);
+        let saved_query_notice: String = sqlx::query_scalar(
+            "SELECT data FROM notifications WHERE notifiable_id = 7 AND data LIKE '%Query notice%' LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let saved_query_notice: serde_json::Value =
+            serde_json::from_str(&saved_query_notice).unwrap();
+        assert_eq!(saved_query_notice["content"], "Settings saved");
         let denied_notice = session_request(
             &app,
             &registered_cookie,
