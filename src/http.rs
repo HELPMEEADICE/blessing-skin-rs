@@ -698,7 +698,7 @@ async fn detect_locale_preference(
     {
         return (
             StatusCode::from_u16(419).expect("HTTP 419 is a valid status"),
-            Json(serde_json::json!({"message": "CSRF token mismatch."})),
+            Json(serde_json::json!({"message": "CSRF token mismatched."})),
         )
             .into_response();
     }
@@ -16414,6 +16414,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(rejected.status(), StatusCode::from_u16(419).unwrap());
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["message"], "CSRF token mismatched.");
 
             let signature_char = csrf_token.as_bytes()[49];
             let replacement = if signature_char == b'0' { "1" } else { "0" };
