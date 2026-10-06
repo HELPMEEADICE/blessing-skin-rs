@@ -611,6 +611,7 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
                 .await
             {
                 Ok(None) => continue,
+                Ok(Some(current)) if current.is_empty() => continue,
                 Ok(Some(_)) => {}
                 Err(error) => {
                     tracing::error!(%error, option = %key, "failed to check current administrator setting");

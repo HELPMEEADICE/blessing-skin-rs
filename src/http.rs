@@ -26441,6 +26441,10 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        sqlx::query("INSERT INTO options (option_name, option_value) VALUES ('meta_description', ''), ('meta_extras', 'legacy value to clear')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let legacy_settings_form = app
             .clone()
             .oneshot(
@@ -26485,6 +26489,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(saved_meta_keywords, "legacy form keywords");
+        let unchanged_empty_meta_description: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'meta_description'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged_empty_meta_description, Some(String::new()));
+        let cleared_meta_extras: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'meta_extras'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared_meta_extras, None);
         assert_eq!(unchanged_site_name, original_site_name);
 
         let legacy_raw_settings_form = app
