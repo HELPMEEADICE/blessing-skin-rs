@@ -543,7 +543,12 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
         let Some(definition) = definitions.iter().find(|definition| definition.key == key) else {
             return invalid(&format!("Unknown setting: {key}"));
         };
-        let Some(value) = normalize_value(definition, value) else {
+        let normalized_value = if legacy_form {
+            normalize_legacy_form_value(definition, value)
+        } else {
+            normalize_value(definition, value)
+        };
+        let Some(value) = normalized_value else {
             return invalid(&format!("Invalid value for {key}"));
         };
         normalized.push((key.clone(), value));
@@ -831,6 +836,31 @@ fn normalize_value(definition: &Definition, value: &Value) -> Option<String> {
     }
 }
 
+fn normalize_legacy_form_value(definition: &Definition, value: &Value) -> Option<String> {
+    let mut value = match value {
+        Value::String(value) => value.clone(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    if value.contains('\0') {
+        return None;
+    }
+    if definition.key == "cdn_address" {
+        if value.ends_with('/') {
+            value.pop();
+        }
+    } else if definition.kind == "url" {
+        if value.ends_with('/') {
+            value.pop();
+        }
+        if value.ends_with("/index.php") {
+            value.truncate(value.len() - "/index.php".len());
+        }
+    }
+    Some(value)
+}
+
 fn invalid(message: &str) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -1009,7 +1039,7 @@ fn chinese_choice(value: &str, fallback: &str) -> String {
 mod tests {
     use super::{
         CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION,
-        RESOURCE, SCORE, legacy_form_values, normalize_value,
+        RESOURCE, SCORE, legacy_form_values, normalize_legacy_form_value, normalize_value,
     };
     use serde_json::json;
 
@@ -1053,6 +1083,35 @@ mod tests {
             .find(|setting| setting.key == "player_name_rule")
             .unwrap();
         assert_eq!(normalize_value(rule, &json!("php")), None);
+    }
+
+    #[test]
+    fn legacy_forms_preserve_raw_values_accepted_by_php_option_forms() {
+        let max_upload = GENERAL
+            .iter()
+            .find(|setting| setting.key == "max_upload_file_size")
+            .unwrap();
+        assert_eq!(normalize_value(max_upload, &json!("1048577")), None);
+        assert_eq!(
+            normalize_legacy_form_value(max_upload, &json!("1048577")),
+            Some("1048577".to_owned())
+        );
+        let max_width = GENERAL
+            .iter()
+            .find(|setting| setting.key == "max_texture_width")
+            .unwrap();
+        assert_eq!(
+            normalize_legacy_form_value(max_width, &json!("065537")),
+            Some("065537".to_owned())
+        );
+        let player_name_rule = GENERAL
+            .iter()
+            .find(|setting| setting.key == "player_name_rule")
+            .unwrap();
+        assert_eq!(
+            normalize_legacy_form_value(player_name_rule, &json!("legacy-custom")),
+            Some("legacy-custom".to_owned())
+        );
     }
 
     #[test]

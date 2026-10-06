@@ -26487,6 +26487,80 @@ mod tests {
         .unwrap();
         assert_eq!(saved_meta_keywords, "legacy form keywords");
         assert_eq!(unchanged_site_name, original_site_name);
+        let original_upload_limit: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'max_upload_file_size'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let original_texture_width: Option<String> = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'max_texture_width'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let legacy_raw_settings_form = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/options")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", &registered_cookie, test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "option=general&register_with_player_name=true&allow_downloading_texture=true&max_upload_file_size=1048577&max_texture_width=065537",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_raw_settings_form.status(), StatusCode::OK);
+        let saved_upload_limit: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'max_upload_file_size'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let saved_texture_width: String = sqlx::query_scalar(
+            "SELECT option_value FROM options WHERE option_name = 'max_texture_width'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(saved_upload_limit, "1048577");
+        assert_eq!(saved_texture_width, "065537");
+        if let Some(original) = original_upload_limit {
+            sqlx::query(
+                "UPDATE options SET option_value = ? WHERE option_name = 'max_upload_file_size'",
+            )
+            .bind(original)
+            .execute(&pool)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("DELETE FROM options WHERE option_name = 'max_upload_file_size'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        if let Some(original) = original_texture_width {
+            sqlx::query(
+                "UPDATE options SET option_value = ? WHERE option_name = 'max_texture_width'",
+            )
+            .bind(original)
+            .execute(&pool)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("DELETE FROM options WHERE option_name = 'max_texture_width'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         if let Some(original) = original_meta_keywords {
             sqlx::query("UPDATE options SET option_value = ? WHERE option_name = 'meta_keywords'")
                 .bind(original)
