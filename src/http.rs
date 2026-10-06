@@ -2927,6 +2927,7 @@ struct OAuthManagePage {
 #[template(path = "user_profile.html")]
 struct UserProfilePage {
     site_name: String,
+    copy: UserProfilePageCopy,
     locale: String,
     user: UserProfile,
     allow_delete: bool,
@@ -2936,6 +2937,147 @@ struct UserProfilePage {
     frontend_script_available: bool,
     frontend_script: String,
     frontend_globals_b64: String,
+}
+
+struct UserProfilePageCopy {
+    title: String,
+    back: String,
+    avatar_current_id: String,
+    avatar_heading: String,
+    avatar_texture_id: String,
+    avatar_submit: String,
+    password_heading: String,
+    password_current: String,
+    password_new: String,
+    password_confirm: String,
+    password_submit: String,
+    nickname_heading: String,
+    nickname_new: String,
+    nickname_submit: String,
+    email_heading: String,
+    email_new: String,
+    email_password: String,
+    email_submit: String,
+    delete_heading: String,
+    delete_notice: String,
+    delete_password: String,
+    delete_submit: String,
+    delete_admin: String,
+    request_failed: String,
+    connection_error: String,
+    password_mismatch: String,
+}
+
+fn profile_static_label(locale: &str, key: &str) -> &'static str {
+    let language = match locale {
+        "zh_TW" => "zh_TW",
+        locale if locale.starts_with("zh") => "zh_CN",
+        "es_ES" => "es_ES",
+        "ru_RU" => "ru_RU",
+        _ => "en",
+    };
+    match (language, key) {
+        ("zh_CN", "title") => "账户资料",
+        ("zh_TW", "title") => "帳戶資料",
+        ("zh_CN", "back") => "返回用户面板",
+        ("zh_TW", "back") => "返回使用者面板",
+        ("zh_CN", "avatar_current_id") => "当前头像材质编号：",
+        ("zh_TW", "avatar_current_id") => "目前頭像材質編號：",
+        ("zh_CN", "avatar_heading") => "修改头像",
+        ("zh_TW", "avatar_heading") => "修改頭像",
+        ("zh_CN", "avatar_texture_id") => "材质编号（0 恢复默认头像）",
+        ("zh_TW", "avatar_texture_id") => "材質編號（0 重設為預設頭像）",
+        ("zh_CN", "avatar_submit") => "设置头像",
+        ("zh_TW", "avatar_submit") => "設定頭像",
+        ("zh_CN", "nickname_new") => "新昵称",
+        ("zh_TW", "nickname_new") => "新暱稱",
+        ("zh_CN", "nickname_submit") => "保存昵称",
+        ("zh_TW", "nickname_submit") => "儲存暱稱",
+        ("zh_CN", "request_failed") => "请求失败。",
+        ("zh_TW", "request_failed") => "請求失敗。",
+        ("zh_CN", "connection_error") => "无法连接服务器。",
+        ("zh_TW", "connection_error") => "無法連接伺服器。",
+        ("zh_CN", "password_mismatch") => "两次输入的新密码不一致。",
+        ("zh_TW", "password_mismatch") => "兩次輸入的新密碼不一致。",
+        ("es_ES", "title") => "Perfil de cuenta",
+        ("es_ES", "back") => "Volver a la cuenta",
+        ("es_ES", "avatar_current_id") => "ID de textura del avatar actual: ",
+        ("es_ES", "avatar_heading") => "Cambiar avatar",
+        ("es_ES", "avatar_texture_id") => "ID de textura (0 restablece el avatar)",
+        ("es_ES", "avatar_submit") => "Establecer avatar",
+        ("es_ES", "nickname_new") => "Nuevo apodo",
+        ("es_ES", "nickname_submit") => "Guardar apodo",
+        ("es_ES", "request_failed") => "La solicitud falló.",
+        ("es_ES", "connection_error") => "No se pudo conectar con el servidor.",
+        ("es_ES", "password_mismatch") => "Las contraseñas nuevas no coinciden.",
+        ("ru_RU", "title") => "Профиль аккаунта",
+        ("ru_RU", "back") => "Вернуться в аккаунт",
+        ("ru_RU", "avatar_current_id") => "ID текущей текстуры аватара: ",
+        ("ru_RU", "avatar_heading") => "Изменить аватар",
+        ("ru_RU", "avatar_texture_id") => "ID текстуры (0 сбрасывает аватар)",
+        ("ru_RU", "avatar_submit") => "Установить аватар",
+        ("ru_RU", "nickname_new") => "Новый никнейм",
+        ("ru_RU", "nickname_submit") => "Сохранить никнейм",
+        ("ru_RU", "request_failed") => "Не удалось выполнить запрос.",
+        ("ru_RU", "connection_error") => "Не удалось подключиться к серверу.",
+        ("ru_RU", "password_mismatch") => "Новые пароли не совпадают.",
+        (_, "title") => "Account profile",
+        (_, "back") => "Back to account",
+        (_, "avatar_current_id") => "Current avatar texture ID: ",
+        (_, "avatar_heading") => "Change avatar",
+        (_, "avatar_texture_id") => "Texture ID (0 resets the avatar)",
+        (_, "avatar_submit") => "Set avatar",
+        (_, "nickname_new") => "New nickname",
+        (_, "nickname_submit") => "Save nickname",
+        (_, "request_failed") => "Request failed.",
+        (_, "connection_error") => "Unable to connect to the server.",
+        (_, "password_mismatch") => "The new passwords do not match.",
+        _ => "",
+    }
+}
+
+fn profile_page_copy(locale: &str, site_name: &str) -> UserProfilePageCopy {
+    let legacy = |path: &[&str], key: &str, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, "user", path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    UserProfilePageCopy {
+        title: profile_static_label(locale, "title").to_owned(),
+        back: profile_static_label(locale, "back").to_owned(),
+        avatar_current_id: profile_static_label(locale, "avatar_current_id").to_owned(),
+        avatar_heading: profile_static_label(locale, "avatar_heading").to_owned(),
+        avatar_texture_id: profile_static_label(locale, "avatar_texture_id").to_owned(),
+        avatar_submit: profile_static_label(locale, "avatar_submit").to_owned(),
+        password_heading: legacy(&["profile", "password"], "title", "Change password"),
+        password_current: legacy(&["profile", "password"], "old", "Current password"),
+        password_new: legacy(&["profile", "password"], "new", "New password"),
+        password_confirm: legacy(&["profile", "password"], "confirm", "Repeat password"),
+        password_submit: legacy(&["profile", "password"], "button", "Change password"),
+        nickname_heading: legacy(&["profile", "nickname"], "title", "Change nickname"),
+        nickname_new: profile_static_label(locale, "nickname_new").to_owned(),
+        nickname_submit: profile_static_label(locale, "nickname_submit").to_owned(),
+        email_heading: legacy(&["profile", "email"], "title", "Change email"),
+        email_new: legacy(&["profile", "email"], "new", "New email"),
+        email_password: legacy(&["profile", "email"], "password", "Current password"),
+        email_submit: legacy(&["profile", "email"], "button", "Change email"),
+        delete_heading: legacy(&["profile", "delete"], "title", "Delete account"),
+        delete_notice: legacy(
+            &["profile", "delete"],
+            "notice",
+            "Account deletion cannot be undone.",
+        )
+        .replace(":site", site_name),
+        delete_password: legacy(&["profile", "delete"], "password", "Current password"),
+        delete_submit: legacy(&["profile", "delete"], "button", "Delete my account"),
+        delete_admin: legacy(
+            &["profile", "delete"],
+            "admin",
+            "Administrator accounts cannot be deleted.",
+        ),
+        request_failed: profile_static_label(locale, "request_failed").to_owned(),
+        connection_error: profile_static_label(locale, "connection_error").to_owned(),
+        password_mismatch: profile_static_label(locale, "password_mismatch").to_owned(),
+    }
 }
 
 #[derive(Template)]
@@ -8860,6 +9002,8 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         frontend_entrypoint(&app_dir, "app", "js", &request_app_url(&state)).await;
     let i18n = load_frontend_translations(&state, &app_dir, &request_locale(&state)).await;
     let allow_delete = user.permission < 1;
+    let locale = request_locale(&state);
+    let copy = profile_page_copy(&locale, &site_name);
     let extra = serde_json::json!({
         "profile": {
             "nickname": &user.nickname,
@@ -8873,7 +9017,8 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         encode_frontend_globals(&state, &site_name, "user/profile", extra, i18n);
     let page = UserProfilePage {
         site_name,
-        locale: request_locale(&state),
+        copy,
+        locale,
         user,
         allow_delete,
         page_widgets,
@@ -20151,6 +20296,72 @@ mod tests {
         assert_eq!(russian.labels.notifications, "Уведомления");
         assert_eq!(russian.labels.no_players, "У вас пока нет игроков");
         assert_eq!(russian.announcement, "Объявление");
+    }
+
+    #[test]
+    fn profile_page_copy_reuses_legacy_translations_and_site_name_placeholder() {
+        let spanish = super::profile_page_copy("es_ES", "Servidor de pruebas");
+        assert_eq!(spanish.title, "Perfil de cuenta");
+        assert_eq!(spanish.password_heading, "Cambiar contraseña");
+        assert_eq!(spanish.email_password, "Contraseña actual");
+        assert_eq!(
+            spanish.delete_notice,
+            "¿Seguro que quieres eliminar su cuenta en Servidor de pruebas?"
+        );
+        assert_eq!(
+            spanish.password_mismatch,
+            "Las contraseñas nuevas no coinciden."
+        );
+
+        let russian = super::profile_page_copy("ru_RU", "Blessing Skin");
+        assert_eq!(russian.password_heading, "Изменить пароль");
+        assert_eq!(russian.delete_submit, "Удалить мой аккаунт");
+    }
+
+    #[test]
+    fn profile_page_renders_legacy_localized_copy_without_frontend_assets() {
+        let page = super::UserProfilePage {
+            site_name: "Servidor de pruebas".to_owned(),
+            copy: super::profile_page_copy("es_ES", "Servidor de pruebas"),
+            locale: "es_ES".to_owned(),
+            user: super::UserProfile {
+                uid: 7,
+                email: "alex@example.test".to_owned(),
+                nickname: "Alex".to_owned(),
+                locale: Some("es_ES".to_owned()),
+                score: 0,
+                avatar: 0,
+                permission: 0,
+                last_sign_at: String::new(),
+                register_at: String::new(),
+                verified: true,
+                is_dark_mode: false,
+            },
+            allow_delete: true,
+            page_widgets: vec![
+                "avatar".to_owned(),
+                "password".to_owned(),
+                "nickname".to_owned(),
+                "email".to_owned(),
+                "delete_account".to_owned(),
+            ],
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains("Perfil de cuenta · Servidor de pruebas"));
+        assert!(html.contains("Cambiar contraseña"));
+        assert!(html.contains("Contraseña antigua"));
+        assert!(html.contains("Cambiar email"));
+        assert!(html.contains("Eliminar cuenta"));
+        assert!(html.contains("Servidor de pruebas?"));
+        assert!(html.contains(r#"data-password-mismatch="Las contraseñas nuevas no coinciden.""#));
+        assert!(html.contains("profileCopy.connectionError"));
+        assert!(!html.contains("The new passwords do not match."));
     }
 
     #[test]
