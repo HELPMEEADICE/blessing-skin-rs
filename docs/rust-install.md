@@ -35,6 +35,8 @@ $env:BS_INSTALL_SITE_NAME = 'Blessing Skin'
 
 新站安装前可运行 `./blessing-skin-rs salt:random`（Windows 使用 `blessing-skin-rs.exe salt:random`）生成旧格式 32 位十六进制 SALT 并写入环境文件；添加 `--show` 只显示生成值。已安装站点会拒绝轮换 SALT，以免现有密码哈希失效。若服务由 systemd 等方式注入 SALT 环境变量，需同时更新进程管理器配置。
 
+迁移旧 Artisan 脚本时也可运行 `blessing-skin-rs key:generate`（Windows 使用 `blessing-skin-rs.exe key:generate`）；`--show` 仅打印一个 Laravel 兼容的 `base64:` 密钥。已有生产 APP_KEY 时必须显式传入 `--force` 才会轮换，因为轮换会使旧的加密值和签名链接失效。
+
 运行 blessing-skin-rs passport:keys（Windows 使用 blessing-skin-rs.exe passport:keys）可生成与旧版 Passport 文件名兼容的 4096 位 RSA 密钥，写入 STORAGE_PATH/oauth-private.key 和 STORAGE_PATH/oauth-public.key。已有任一密钥文件时命令会拒绝覆盖；只有明确传入 --force 才会成对替换密钥。--length=2048 可调整密钥长度。替换旧密钥会使使用旧密钥签发的 OAuth 令牌失效。
 
 ## 数据和密钥

@@ -7,6 +7,7 @@ mod http;
 mod image_cache;
 mod install_command;
 mod installer;
+mod key_generate_command;
 mod mail_templates;
 mod mailer;
 mod oauth;
@@ -87,6 +88,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Application salt [{}] set successfully.", result.salt);
         } else {
             println!("{}", result.salt);
+        }
+        return Ok(());
+    }
+
+    if let Some(result) = key_generate_command::run(
+        &arguments,
+        &env_file,
+        crate::config::legacy_env("APP_ENV")
+            .as_deref()
+            .unwrap_or("production"),
+        crate::config::legacy_env("APP_KEY").as_deref(),
+    )? {
+        match result {
+            key_generate_command::KeyGenerateOutcome::Displayed(key) => println!("{key}"),
+            key_generate_command::KeyGenerateOutcome::Written(key) => {
+                println!("Application key [{key}] set successfully.");
+            }
         }
         return Ok(());
     }
