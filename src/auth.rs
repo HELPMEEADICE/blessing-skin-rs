@@ -128,7 +128,7 @@ pub fn hash_legacy_password(
     bcrypt_rounds: u32,
 ) -> Option<String> {
     match method.to_ascii_uppercase().as_str() {
-        "BCRYPT" | "PHP_PASSWORD_HASH" => bcrypt::hash(password, bcrypt_rounds).ok(),
+        "BCRYPT" | "PHP_PASSWORD_HASH" => hash_bcrypt(password, bcrypt_rounds),
         "ARGON2I" => {
             // Match PHP password_hash(PASSWORD_ARGON2I)'s 64 MiB, 4-pass, single-lane defaults.
             let params = Params::new(65_536, 4, 1, None)
@@ -157,6 +157,14 @@ pub fn hash_legacy_password(
         }
         _ => None,
     }
+}
+
+fn hash_bcrypt(password: &str, rounds: u32) -> Option<String> {
+    let hash = bcrypt::hash(password, rounds).ok()?;
+    Some(match hash.strip_prefix("$2b$") {
+        Some(rest) => format!("$2y${rest}"),
+        None => hash,
+    })
 }
 
 fn verify_bcrypt(password: &str, encoded: &str) -> bool {
@@ -313,6 +321,7 @@ mod tests {
     #[test]
     fn hashes_new_passwords_in_configured_legacy_formats() {
         let bcrypt = super::hash_legacy_password("correct horse", "BCRYPT", "", 4).unwrap();
+        assert!(bcrypt.starts_with("$2y$"));
         assert_eq!(bcrypt.split('$').nth(2), Some("04"));
         assert!(super::verify_legacy_password(
             "correct horse",
