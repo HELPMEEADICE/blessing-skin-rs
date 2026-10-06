@@ -1020,6 +1020,29 @@ async fn filter_user_menu(
     serde_json::from_value(filtered).unwrap_or(items)
 }
 
+fn dashboard_menu_item(label: &str, link: &str) -> DashboardMenuItem {
+    DashboardMenuItem {
+        label: label.to_owned(),
+        link: link.to_owned(),
+    }
+}
+
+async fn filter_side_menu(
+    state: &AppState,
+    menu_type: &str,
+    items: Vec<DashboardMenuItem>,
+) -> Vec<DashboardMenuItem> {
+    let initial = serde_json::to_value(&items).unwrap_or_else(|_| serde_json::json!([]));
+    let filtered = apply_plugin_filter_value(
+        state,
+        "side_menu",
+        &initial,
+        &serde_json::json!({ "type": menu_type }),
+    )
+    .await;
+    serde_json::from_value(filtered).unwrap_or(items)
+}
+
 async fn filter_player_page_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -4829,6 +4852,8 @@ struct DashboardPage {
     notifications: Vec<DashboardNotification>,
     announcement_html: String,
     page_widgets: Vec<String>,
+    side_menu_user: Vec<DashboardMenuItem>,
+    side_menu_explore: Vec<DashboardMenuItem>,
     show_email_verification: bool,
     locale: String,
     frontend_style_available: bool,
@@ -4862,6 +4887,7 @@ struct AdminDashboardPage {
     locale: String,
     stats: AdminDashboardStats,
     page_widgets: Vec<String>,
+    side_menu: Vec<DashboardMenuItem>,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -5506,6 +5532,63 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         serde_json::from_value::<Vec<DashboardBadge>>(filter_user_badges(&state, &user).await)
             .unwrap_or_default();
     let menu = filter_user_menu(&state, &user, &locale).await;
+    let chinese = locale.starts_with("zh");
+    let side_menu_user = filter_side_menu(
+        &state,
+        "user",
+        vec![
+            dashboard_menu_item(
+                if chinese {
+                    "管理角色"
+                } else {
+                    "Manage players"
+                },
+                "/user/player",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "管理衣柜"
+                } else {
+                    "Manage closet"
+                },
+                "/user/closet",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "我的举报"
+                } else {
+                    "My reports"
+                },
+                "/user/reports",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "账户设置"
+                } else {
+                    "Account settings"
+                },
+                "/user/profile",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "OAuth 应用"
+                } else {
+                    "OAuth apps"
+                },
+                "/user/oauth/manage",
+            ),
+        ],
+    )
+    .await;
+    let side_menu_explore = filter_side_menu(
+        &state,
+        "explore",
+        vec![dashboard_menu_item(
+            if chinese { "皮肤库" } else { "Skin library" },
+            "/skinlib",
+        )],
+    )
+    .await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5519,6 +5602,10 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         serde_json::json!({
             "unverified": show_email_verification,
             "page_widgets": &page_widgets,
+            "side_menu": {
+                "user": &side_menu_user,
+                "explore": &side_menu_explore,
+            },
         }),
         i18n,
     );
@@ -5533,6 +5620,8 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         notifications,
         announcement_html,
         page_widgets,
+        side_menu_user,
+        side_menu_explore,
         show_email_verification,
         locale,
         frontend_style_available: stylesheet.is_some(),
@@ -5869,6 +5958,50 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         }
     };
     let page_widgets = filter_admin_dashboard_widgets(&state).await;
+    let locale = request_locale(&state);
+    let chinese = locale.starts_with("zh");
+    let side_menu = filter_side_menu(
+        &state,
+        "admin",
+        vec![
+            dashboard_menu_item(if chinese { "用户" } else { "Users" }, "/admin/users"),
+            dashboard_menu_item(if chinese { "角色" } else { "Players" }, "/admin/players"),
+            dashboard_menu_item(if chinese { "举报" } else { "Reports" }, "/admin/reports"),
+            dashboard_menu_item(
+                if chinese {
+                    "多语言"
+                } else {
+                    "Internationalization"
+                },
+                "/admin/i18n",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "站点设置"
+                } else {
+                    "Site settings"
+                },
+                "/admin/options",
+            ),
+            dashboard_menu_item(
+                if chinese {
+                    "系统状态"
+                } else {
+                    "System status"
+                },
+                "/admin/status",
+            ),
+            dashboard_menu_item(
+                if chinese { "插件" } else { "Plugins" },
+                "/admin/plugins/manage",
+            ),
+            dashboard_menu_item(
+                if chinese { "版本更新" } else { "Updates" },
+                "/admin/update",
+            ),
+        ],
+    )
+    .await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -5882,14 +6015,16 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         serde_json::json!({
             "dashboard_stats": &stats,
             "page_widgets": &page_widgets,
+            "side_menu": &side_menu,
         }),
         i18n,
     );
     let page = AdminDashboardPage {
         site_name,
-        locale: request_locale(&state),
+        locale,
         stats,
         page_widgets,
+        side_menu,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -21916,6 +22051,8 @@ mod tests {
         assert!(registered_dashboard.contains("/user/reports"));
         assert!(registered_dashboard.contains("/user/profile"));
         assert!(registered_dashboard.contains("/user/oauth/manage"));
+        assert!(registered_dashboard.contains(r#"href="/skinlib""#));
+        assert!(registered_dashboard.contains("Skin library"));
         assert!(!registered_dashboard.contains(r#"href="/admin""#));
 
         let non_admin_dashboard =
@@ -22739,6 +22876,19 @@ mod tests {
             admin_globals["extra"]["page_widgets"],
             serde_json::json!(["usage", "notification", "chart"])
         );
+        assert_eq!(
+            admin_globals["extra"]["side_menu"],
+            serde_json::json!([
+                {"label": "Users", "link": "/admin/users"},
+                {"label": "Players", "link": "/admin/players"},
+                {"label": "Reports", "link": "/admin/reports"},
+                {"label": "Internationalization", "link": "/admin/i18n"},
+                {"label": "Site settings", "link": "/admin/options"},
+                {"label": "System status", "link": "/admin/status"},
+                {"label": "Plugins", "link": "/admin/plugins/manage"},
+                {"label": "Updates", "link": "/admin/update"},
+            ])
+        );
         let admin_chart = session_request(&app, &admin_cookie, "GET", "/admin/chart", None).await;
         assert_eq!(admin_chart.status(), StatusCode::OK);
         let admin_chart: serde_json::Value =
@@ -22805,6 +22955,19 @@ mod tests {
         assert_eq!(
             dashboard_globals["extra"]["page_widgets"],
             serde_json::json!(["email_verification", "usage", "announcement"])
+        );
+        assert_eq!(
+            dashboard_globals["extra"]["side_menu"],
+            serde_json::json!({
+                "user": [
+                    {"label": "Manage players", "link": "/user/player"},
+                    {"label": "Manage closet", "link": "/user/closet"},
+                    {"label": "My reports", "link": "/user/reports"},
+                    {"label": "Account settings", "link": "/user/profile"},
+                    {"label": "OAuth apps", "link": "/user/oauth/manage"},
+                ],
+                "explore": [{"label": "Skin library", "link": "/skinlib"}],
+            })
         );
         assert!(admin_user_dashboard.contains("Announcement"));
         assert_eq!(dashboard_globals["i18n"]["auth"]["login"], "Log In");

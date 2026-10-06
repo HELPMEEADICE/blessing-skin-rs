@@ -19,9 +19,15 @@ type ChartData = {
 
 type DashboardWidget = 'usage' | 'notification' | 'chart'
 
+type DashboardMenuItem = {
+  label: string
+  link: string
+}
+
 type DashboardPageData = {
   dashboard_stats: DashboardStats
   page_widgets: DashboardWidget[]
+  side_menu: DashboardMenuItem[]
 }
 
 const Chart: React.FC<{
@@ -62,8 +68,11 @@ const Chart: React.FC<{
 
 const DashboardPage: React.FC = () => {
   const zh = blessing.locale.startsWith('zh')
-  const { dashboard_stats: stats, page_widgets } =
-    blessing.extra as DashboardPageData
+  const {
+    dashboard_stats: stats,
+    page_widgets,
+    side_menu,
+  } = blessing.extra as DashboardPageData
   const showCharts = page_widgets.includes('chart')
   const [chartData, setChartData] = useState<ChartData | null>(null)
   const [chartError, setChartError] = useState('')
@@ -260,28 +269,27 @@ const DashboardPage: React.FC = () => {
       </header>
       <h2>{zh ? '管理后台概览' : 'Admin overview'}</h2>
       <nav aria-label={zh ? '管理导航' : 'Admin navigation'}>
-        <a href={`${blessing.base_url}/admin/users`}>{zh ? '用户' : 'Users'}</a>
-        <a href={`${blessing.base_url}/admin/players`}>
-          {zh ? '角色' : 'Players'}
-        </a>
-        <a href={`${blessing.base_url}/admin/reports`}>
-          {zh ? '举报' : 'Reports'}
-        </a>
-        <a href={`${blessing.base_url}/admin/i18n`}>
-          {zh ? '多语言' : 'Internationalization'}
-        </a>
-        <a href={`${blessing.base_url}/admin/options`}>
-          {zh ? '站点设置' : 'Site settings'}
-        </a>
-        <a href={`${blessing.base_url}/admin/status`}>
-          {zh ? '系统状态' : 'System status'}
-        </a>
-        <a href={`${blessing.base_url}/admin/plugins/manage`}>
-          {zh ? '插件' : 'Plugins'}
-        </a>
-        <a href={`${blessing.base_url}/admin/update`}>
-          {zh ? '版本更新' : 'Updates'}
-        </a>
+        {side_menu.map((item, index) =>
+          item.link === '#divider' ? (
+            <span
+              key={`divider-${index}`}
+              role="separator"
+              aria-orientation="vertical"
+              style={{ borderLeft: '1px solid #c9ced6', alignSelf: 'stretch' }}
+            />
+          ) : (
+            <a
+              key={`${item.link}-${index}`}
+              href={
+                item.link.startsWith('/')
+                  ? `${blessing.base_url}${item.link}`
+                  : item.link
+              }
+            >
+              {item.label}
+            </a>
+          ),
+        )}
       </nav>
       {page_widgets.map((widget) => (
         <React.Fragment key={widget}>{widgets[widget]}</React.Fragment>

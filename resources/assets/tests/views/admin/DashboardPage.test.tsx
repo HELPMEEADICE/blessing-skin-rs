@@ -12,6 +12,16 @@ beforeEach(() => {
   window.blessing.extra = {
     dashboard_stats: { users: 4, players: 2, textures: 1, storage: 8 },
     page_widgets: ['usage', 'notification', 'chart'],
+    side_menu: [
+      { label: 'Users', link: '/admin/users' },
+      { label: 'Players', link: '/admin/players' },
+      { label: 'Reports', link: '/admin/reports' },
+      { label: 'Internationalization', link: '/admin/i18n' },
+      { label: 'Site settings', link: '/admin/options' },
+      { label: 'System status', link: '/admin/status' },
+      { label: 'Plugins', link: '/admin/plugins/manage' },
+      { label: 'Updates', link: '/admin/update' },
+    ],
   }
   fetch.get.mockResolvedValue({
     labels: ['User Registration', 'Texture Uploads'],
@@ -30,6 +40,25 @@ test('links administrators to standalone Rust releases', () => {
     'href',
     '/admin/update',
   )
+})
+
+test('renders the filtered navigation in the configured order', () => {
+  window.blessing.extra.side_menu = [
+    { label: 'Plugins', link: '/admin/plugins/manage' },
+    { label: 'Updates', link: '/admin/update' },
+  ]
+  const { getByRole, queryByRole } = render(<DashboardPage />)
+
+  expect(getByRole('navigation').querySelectorAll('a')).toHaveLength(2)
+  expect(getByRole('link', { name: 'Plugins' })).toHaveAttribute(
+    'href',
+    '/admin/plugins/manage',
+  )
+  expect(getByRole('link', { name: 'Updates' })).toHaveAttribute(
+    'href',
+    '/admin/update',
+  )
+  expect(queryByRole('link', { name: 'Users' })).not.toBeInTheDocument()
 })
 
 test('renders dashboard regions in the configured order', () => {

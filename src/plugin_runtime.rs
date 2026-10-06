@@ -846,6 +846,7 @@ fn validate_plugin_filter(
             | "auth_page_rows:login"
             | "auth_page_rows:register"
             | "user_menu"
+            | "side_menu"
             | "grid:user.player"
             | "grid:user.closet"
             | "grid:skinlib.show"
@@ -859,6 +860,14 @@ fn validate_plugin_filter(
     }
     if !context.is_object() {
         return Err("plugin filter context must be a JSON object".to_owned());
+    }
+    if name == "side_menu"
+        && !context
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|menu_type| matches!(menu_type, "user" | "admin" | "explore"))
+    {
+        return Err("side_menu context must specify user, admin, or explore type".to_owned());
     }
     validate_plugin_filter_value(name, value)?;
     for (label, value) in [("value", value), ("context", context)] {
@@ -1053,6 +1062,34 @@ fn valid_plugin_user_menu(value: &serde_json::Value) -> bool {
         .is_some_and(|items| items.len() <= 64 && items.iter().all(valid_plugin_user_menu_item))
 }
 
+fn valid_plugin_side_menu_item(value: &serde_json::Value) -> bool {
+    let Some(item) = value.as_object() else {
+        return false;
+    };
+    let Some(label) = item.get("label").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(link) = item.get("link").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let safe_link = link == "#divider" || valid_plugin_avatar_url(link);
+    let valid_label = label.len() <= 128 && !label.chars().any(char::is_control);
+    let divider_label = link == "#divider" && label.is_empty();
+    let normal_label = link != "#divider" && !label.trim().is_empty();
+    item.len() == 2
+        && item.contains_key("label")
+        && item.contains_key("link")
+        && safe_link
+        && valid_label
+        && (divider_label || normal_label)
+}
+
+fn valid_plugin_side_menu(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.len() <= 64 && items.iter().all(valid_plugin_side_menu_item))
+}
+
 fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result<(), String> {
     match name {
         "can_register" => Ok(()),
@@ -1062,6 +1099,7 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
             Ok(())
         }
         "user_menu" if valid_plugin_user_menu(value) => Ok(()),
+        "side_menu" if valid_plugin_side_menu(value) => Ok(()),
         "grid:user.player" if valid_plugin_grid(value, &["player_management", "previewer"]) => Ok(()),
         "grid:user.closet" if valid_plugin_grid(value, &["closet_management", "previewer"]) => Ok(()),
         "grid:skinlib.show" if valid_plugin_grid(value, &["texture_preview", "texture_details"]) => Ok(()),
@@ -1184,6 +1222,10 @@ fn validate_plugin_filter_value(name: &str, value: &serde_json::Value) -> Result
         ),
         "user_menu" => Err(
             "user_menu must return up to 64 safe label/link objects"
+                .to_owned(),
+        ),
+        "side_menu" => Err(
+            "side_menu must return up to 64 safe label/link objects"
                 .to_owned(),
         ),
         "grid:user.player" => Err(
@@ -1943,6 +1985,33 @@ mod tests {
             validate_plugin_filter_value(
                 "grid:user.profile",
                 &serde_json::json!(["user.widgets.profile.password"])
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter(
+                "side_menu",
+                &serde_json::json!([
+                    { "label": "Users", "link": "/admin/users" },
+                    { "label": "", "link": "#divider" }
+                ]),
+                &serde_json::json!({ "type": "admin" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_filter(
+                "side_menu",
+                &serde_json::json!([{ "label": "Unsafe", "link": "javascript:alert(1)" }]),
+                &serde_json::json!({ "type": "admin" })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_filter(
+                "side_menu",
+                &serde_json::json!([]),
+                &serde_json::json!({ "type": "invalid" })
             )
             .is_err()
         );

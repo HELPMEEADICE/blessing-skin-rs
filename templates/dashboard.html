@@ -215,36 +215,15 @@
           </button>
         </form>
       </dialog>
-      <p>
-        <a href="/user/player"
-          >{% if locale.starts_with("zh") %}管理角色{% else %}Manage players{%
-          endif %}</a
-        >
-        ·
-        <a href="/user/closet"
-          >{% if locale.starts_with("zh") %}管理衣柜{% else %}Manage closet{%
-          endif %}</a
-        >
-        ·
-        <a href="/user/reports"
-          >{% if locale.starts_with("zh") %}我的举报{% else %}My reports{% endif
-          %}</a
-        >
-        ·
-        <a href="/user/profile"
-          >{% if locale.starts_with("zh") %}账户设置{% else %}Account settings{%
-          endif %}</a
-        >
-        ·
-        <a href="/user/oauth/manage"
-          >{% if locale.starts_with("zh") %}OAuth 应用{% else %}OAuth apps{%
-          endif %}</a
-        >{% if user.permission >= 1 %} ·
-        <a href="/admin"
-          >{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{%
-          endif %}</a
-        >{% endif %}
-      </p>
+      <nav aria-label="{% if locale.starts_with("zh") %}用户导航{% else %}Dashboard navigation{% endif %}" style="display: flex; align-items: center; gap: .75rem; flex-wrap: wrap">
+        {% for item in side_menu_user %}
+        {% if item.link == "#divider" %}<span role="separator" aria-orientation="vertical" style="border-left: 1px solid #c9ced6; margin: 0 .5rem"></span>{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %}
+        {% endfor %}
+        {% for item in side_menu_explore %}
+        {% if item.link == "#divider" %}<span role="separator" aria-orientation="vertical" style="border-left: 1px solid #c9ced6; margin: 0 .5rem"></span>{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %}
+        {% endfor %}
+        {% if user.permission >= 1 %}<a href="/admin">{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{% endif %}</a>{% endif %}
+      </nav>
       <h3>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h3>
       <ul>
         {% for player in players %}
