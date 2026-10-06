@@ -1033,6 +1033,15 @@ async fn filter_skinlib_upload_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(state, "grid:skinlib.upload", &["upload_form", "previewer"]).await
 }
 
+async fn filter_user_profile_widgets(state: &AppState) -> Vec<String> {
+    filter_page_widgets(
+        state,
+        "grid:user.profile",
+        &["avatar", "password", "nickname", "email", "delete_account"],
+    )
+    .await
+}
+
 async fn filter_user_dashboard_widgets(state: &AppState) -> Vec<String> {
     filter_page_widgets(
         state,
@@ -1947,6 +1956,7 @@ struct UserProfilePage {
     locale: String,
     user: UserProfile,
     allow_delete: bool,
+    page_widgets: Vec<String>,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -7580,6 +7590,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         Ok(user) => user,
         Err(response) => return response,
     };
+    let page_widgets = filter_user_profile_widgets(&state).await;
     let site_name = site_name(&state).await;
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -7593,7 +7604,8 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
             "email": &user.email,
             "avatar": user.avatar,
             "allow_delete": allow_delete,
-        }
+        },
+        "page_widgets": &page_widgets,
     });
     let frontend_globals_b64 =
         encode_frontend_globals(&state, &site_name, "user/profile", extra, i18n);
@@ -7602,6 +7614,7 @@ async fn user_profile_page(State(state): State<AppState>, headers: HeaderMap) ->
         locale: request_locale(&state),
         user,
         allow_delete,
+        page_widgets,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -22824,6 +22837,10 @@ mod tests {
         assert_eq!(
             profile_globals["extra"]["profile"]["email"],
             "first@example.test"
+        );
+        assert_eq!(
+            profile_globals["extra"]["page_widgets"],
+            serde_json::json!(["avatar", "password", "nickname", "email", "delete_account"])
         );
         let oauth_page =
             session_request(&app, &registered_cookie, "GET", "/user/oauth/manage", None).await;
