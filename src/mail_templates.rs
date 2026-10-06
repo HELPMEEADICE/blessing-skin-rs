@@ -17,6 +17,8 @@ struct LocaleFiles {
     auth: &'static str,
     errors: &'static str,
     setup: &'static str,
+    general: &'static str,
+    front_end: &'static str,
 }
 
 const LOCALES: &[LocaleFiles] = &[
@@ -26,6 +28,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/de_DE/auth.yml"),
         errors: include_str!("../resources/lang/de_DE/errors.yml"),
         setup: include_str!("../resources/lang/de_DE/setup.yml"),
+        general: include_str!("../resources/lang/de_DE/general.yml"),
+        front_end: include_str!("../resources/lang/de_DE/front-end.yml"),
     },
     LocaleFiles {
         locale: "el_GR",
@@ -33,6 +37,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/el_GR/auth.yml"),
         errors: include_str!("../resources/lang/el_GR/errors.yml"),
         setup: include_str!("../resources/lang/el_GR/setup.yml"),
+        general: include_str!("../resources/lang/el_GR/general.yml"),
+        front_end: include_str!("../resources/lang/el_GR/front-end.yml"),
     },
     LocaleFiles {
         locale: "en",
@@ -40,6 +46,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/en/auth.yml"),
         errors: include_str!("../resources/lang/en/errors.yml"),
         setup: include_str!("../resources/lang/en/setup.yml"),
+        general: include_str!("../resources/lang/en/general.yml"),
+        front_end: include_str!("../resources/lang/en/front-end.yml"),
     },
     LocaleFiles {
         locale: "es_ES",
@@ -47,6 +55,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/es_ES/auth.yml"),
         errors: include_str!("../resources/lang/es_ES/errors.yml"),
         setup: include_str!("../resources/lang/es_ES/setup.yml"),
+        general: include_str!("../resources/lang/es_ES/general.yml"),
+        front_end: include_str!("../resources/lang/es_ES/front-end.yml"),
     },
     LocaleFiles {
         locale: "fr_FR",
@@ -54,6 +64,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/fr_FR/auth.yml"),
         errors: include_str!("../resources/lang/fr_FR/errors.yml"),
         setup: include_str!("../resources/lang/fr_FR/setup.yml"),
+        general: include_str!("../resources/lang/fr_FR/general.yml"),
+        front_end: include_str!("../resources/lang/fr_FR/front-end.yml"),
     },
     LocaleFiles {
         locale: "it_IT",
@@ -61,6 +73,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/it_IT/auth.yml"),
         errors: include_str!("../resources/lang/it_IT/errors.yml"),
         setup: include_str!("../resources/lang/it_IT/setup.yml"),
+        general: include_str!("../resources/lang/it_IT/general.yml"),
+        front_end: include_str!("../resources/lang/it_IT/front-end.yml"),
     },
     LocaleFiles {
         locale: "ja_JP",
@@ -68,6 +82,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/ja_JP/auth.yml"),
         errors: include_str!("../resources/lang/ja_JP/errors.yml"),
         setup: include_str!("../resources/lang/ja_JP/setup.yml"),
+        general: include_str!("../resources/lang/ja_JP/general.yml"),
+        front_end: include_str!("../resources/lang/ja_JP/front-end.yml"),
     },
     LocaleFiles {
         locale: "ko_KR",
@@ -75,6 +91,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/ko_KR/auth.yml"),
         errors: include_str!("../resources/lang/ko_KR/errors.yml"),
         setup: include_str!("../resources/lang/ko_KR/setup.yml"),
+        general: include_str!("../resources/lang/ko_KR/general.yml"),
+        front_end: include_str!("../resources/lang/ko_KR/front-end.yml"),
     },
     LocaleFiles {
         locale: "nl_NL",
@@ -82,6 +100,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/nl_NL/auth.yml"),
         errors: include_str!("../resources/lang/nl_NL/errors.yml"),
         setup: include_str!("../resources/lang/nl_NL/setup.yml"),
+        general: include_str!("../resources/lang/nl_NL/general.yml"),
+        front_end: include_str!("../resources/lang/nl_NL/front-end.yml"),
     },
     LocaleFiles {
         locale: "pt_PT",
@@ -89,6 +109,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/pt_PT/auth.yml"),
         errors: include_str!("../resources/lang/pt_PT/errors.yml"),
         setup: include_str!("../resources/lang/pt_PT/setup.yml"),
+        general: include_str!("../resources/lang/pt_PT/general.yml"),
+        front_end: include_str!("../resources/lang/pt_PT/front-end.yml"),
     },
     LocaleFiles {
         locale: "ru_RU",
@@ -96,6 +118,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/ru_RU/auth.yml"),
         errors: include_str!("../resources/lang/ru_RU/errors.yml"),
         setup: include_str!("../resources/lang/ru_RU/setup.yml"),
+        general: include_str!("../resources/lang/ru_RU/general.yml"),
+        front_end: include_str!("../resources/lang/ru_RU/front-end.yml"),
     },
     LocaleFiles {
         locale: "zh_CN",
@@ -103,6 +127,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/zh_CN/auth.yml"),
         errors: include_str!("../resources/lang/zh_CN/errors.yml"),
         setup: include_str!("../resources/lang/zh_CN/setup.yml"),
+        general: include_str!("../resources/lang/zh_CN/general.yml"),
+        front_end: include_str!("../resources/lang/zh_CN/front-end.yml"),
     },
     LocaleFiles {
         locale: "zh_TW",
@@ -110,6 +136,8 @@ const LOCALES: &[LocaleFiles] = &[
         auth: include_str!("../resources/lang/zh_TW/auth.yml"),
         errors: include_str!("../resources/lang/zh_TW/errors.yml"),
         setup: include_str!("../resources/lang/zh_TW/setup.yml"),
+        general: include_str!("../resources/lang/zh_TW/general.yml"),
+        front_end: include_str!("../resources/lang/zh_TW/front-end.yml"),
     },
 ];
 
@@ -137,9 +165,26 @@ pub(crate) fn legacy_translation(
         "user" => (language.user, english.user),
         "errors" => (language.errors, english.errors),
         "setup" => (language.setup, english.setup),
+        "general" => (language.general, english.general),
+        "front-end" => (language.front_end, english.front_end),
         _ => return None,
     };
     yaml_scalar(source, parent_path, key).or_else(|| yaml_scalar(english_source, parent_path, key))
+}
+
+pub(crate) fn legacy_translation_item(
+    locale: &str,
+    parent_path: &[&str],
+    key: &str,
+    index: usize,
+) -> Option<String> {
+    let language = LOCALES
+        .iter()
+        .find(|files| files.locale == locale)
+        .or_else(|| LOCALES.iter().find(|files| files.locale == "en"))?;
+    let english = LOCALES.iter().find(|files| files.locale == "en")?;
+    yaml_sequence_item(language.front_end, parent_path, key, index)
+        .or_else(|| yaml_sequence_item(english.front_end, parent_path, key, index))
 }
 
 fn render(kind: TemplateKind, locale: &str, site_name: &str, url: &str) -> MailContent {
@@ -242,6 +287,62 @@ fn yaml_scalar(source: &str, parent_path: &[&str], target_key: &str) -> Option<S
     None
 }
 
+fn yaml_sequence_item(
+    source: &str,
+    parent_path: &[&str],
+    target_key: &str,
+    target_index: usize,
+) -> Option<String> {
+    let mut sections: Vec<(usize, &str)> = Vec::new();
+    let mut list_indent = None;
+    let mut item_index = 0;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(parent_indent) = list_indent {
+            if indent > parent_indent {
+                if let Some(item) = trimmed.strip_prefix("-") {
+                    if item_index == target_index {
+                        return parse_yaml_scalar(item.trim());
+                    }
+                    item_index += 1;
+                }
+                continue;
+            }
+            list_indent = None;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        while sections
+            .last()
+            .is_some_and(|(section_indent, _)| indent <= *section_indent)
+        {
+            sections.pop();
+        }
+        if key == target_key
+            && sections.len() == parent_path.len()
+            && sections
+                .iter()
+                .zip(parent_path)
+                .all(|((_, section), expected)| section == expected)
+            && value.trim().is_empty()
+        {
+            list_indent = Some(indent);
+            item_index = 0;
+            continue;
+        }
+        if value.trim().is_empty() {
+            sections.push((indent, key));
+        }
+    }
+    None
+}
+
 fn parse_yaml_scalar(value: &str) -> Option<String> {
     if let Some(inner) = value.strip_prefix('\'') {
         let end = inner.rfind('\'')?;
@@ -255,7 +356,9 @@ fn parse_yaml_scalar(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCALES, email_verification, legacy_translation, password_reset};
+    use super::{
+        LOCALES, email_verification, legacy_translation, legacy_translation_item, password_reset,
+    };
 
     #[test]
     fn resolves_legacy_page_errors_from_all_supported_locale_files() {
@@ -297,6 +400,38 @@ mod tests {
         assert_eq!(
             legacy_translation("zh_CN", "setup", &["database"], "connection-error").as_deref(),
             Some("无法连接至 :type 目标数据库，请检查你的配置。服务器返回的信息：:msg")
+        );
+    }
+
+    #[test]
+    fn reads_general_and_front_end_report_translations_for_all_locales() {
+        for locale in LOCALES {
+            assert!(
+                legacy_translation(locale.locale, "general", &[], "my-reports").is_some(),
+                "{}",
+                locale.locale
+            );
+            assert!(
+                legacy_translation(locale.locale, "front-end", &["report"], "reason").is_some(),
+                "{}",
+                locale.locale
+            );
+            for index in 0..3 {
+                assert!(
+                    super::legacy_translation_item(locale.locale, &["report"], "status", index)
+                        .is_some(),
+                    "{} status {index}",
+                    locale.locale
+                );
+            }
+        }
+        assert_eq!(
+            legacy_translation_item("es_ES", &["report"], "status", 0).as_deref(),
+            Some("Pendiente")
+        );
+        assert_eq!(
+            legacy_translation_item("ru_RU", &["report"], "status", 2).as_deref(),
+            Some("Отклонено")
         );
     }
 

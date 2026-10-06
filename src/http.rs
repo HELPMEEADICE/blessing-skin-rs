@@ -2890,6 +2890,7 @@ struct AdminTranslationsQuery {
 #[template(path = "user_reports.html")]
 struct UserReportsPage {
     site_name: String,
+    copy: UserReportsPageCopy,
     locale: String,
     reports: Vec<UserReportView>,
     current_page: i64,
@@ -2899,6 +2900,86 @@ struct UserReportsPage {
     frontend_script_available: bool,
     frontend_script: String,
     frontend_globals_b64: String,
+}
+
+struct UserReportsPageCopy {
+    title: String,
+    back: String,
+    report_id: String,
+    texture: String,
+    reason: String,
+    status: String,
+    pending: String,
+    resolved: String,
+    rejected: String,
+    date: String,
+    missing_texture: String,
+    empty: String,
+    previous: String,
+    next: String,
+}
+
+fn user_reports_static_label(locale: &str, key: &str) -> &'static str {
+    let language = match locale {
+        "zh_TW" => "zh_TW",
+        locale if locale.starts_with("zh") => "zh_CN",
+        "es_ES" => "es_ES",
+        "ru_RU" => "ru_RU",
+        _ => "en",
+    };
+    match (language, key) {
+        ("zh_CN", "report_id") => "编号",
+        ("zh_TW", "report_id") => "編號",
+        ("zh_CN", "missing_texture") => "材质已删除",
+        ("zh_TW", "missing_texture") => "材質已刪除",
+        ("es_ES", "missing_texture") => "Textura eliminada",
+        ("ru_RU", "missing_texture") => "Текстура удалена",
+        ("zh_CN", "empty") => "你还没有提交举报。",
+        ("zh_TW", "empty") => "你還沒有提交舉報。",
+        ("es_ES", "empty") => "Aún no has enviado ningún informe.",
+        ("ru_RU", "empty") => "Вы ещё не отправляли жалоб.",
+        ("zh_CN", "previous") => "上一页",
+        ("zh_TW", "previous") => "上一頁",
+        ("es_ES", "previous") => "Anterior",
+        ("ru_RU", "previous") => "Назад",
+        ("zh_CN", "next") => "下一页",
+        ("zh_TW", "next") => "下一頁",
+        ("es_ES", "next") => "Siguiente",
+        ("ru_RU", "next") => "Далее",
+        (_, "report_id") => "ID",
+        (_, "missing_texture") => "Texture deleted",
+        (_, "empty") => "You have not submitted any reports.",
+        (_, "previous") => "Previous",
+        (_, "next") => "Next",
+        _ => "",
+    }
+}
+
+fn user_reports_page_copy(locale: &str) -> UserReportsPageCopy {
+    let translation = |catalog: &str, path: &[&str], key: &str, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, catalog, path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let status = |index, fallback: &str| {
+        crate::mail_templates::legacy_translation_item(locale, &["report"], "status", index)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    UserReportsPageCopy {
+        title: translation("general", &[], "my-reports", "My reports"),
+        back: translation("general", &[], "back", "Back"),
+        report_id: user_reports_static_label(locale, "report_id").to_owned(),
+        texture: translation("front-end", &["report"], "tid", "Texture ID"),
+        reason: translation("front-end", &["report"], "reason", "Reason"),
+        status: translation("front-end", &["report"], "status-title", "Status"),
+        pending: status(0, "Pending"),
+        resolved: status(1, "Resolved"),
+        rejected: status(2, "Rejected"),
+        date: translation("front-end", &["report"], "time", "Date"),
+        missing_texture: user_reports_static_label(locale, "missing_texture").to_owned(),
+        empty: user_reports_static_label(locale, "empty").to_owned(),
+        previous: user_reports_static_label(locale, "previous").to_owned(),
+        next: user_reports_static_label(locale, "next").to_owned(),
+    }
 }
 
 #[derive(Serialize)]
@@ -9079,9 +9160,12 @@ async fn web_user_reports(
         serde_json::json!({}),
         i18n,
     );
+    let locale = request_locale(&state);
+    let copy = user_reports_page_copy(&locale);
     let page = UserReportsPage {
         site_name,
-        locale: request_locale(&state),
+        copy,
+        locale,
         reports,
         current_page,
         last_page: total
@@ -20296,6 +20380,81 @@ mod tests {
         assert_eq!(russian.labels.notifications, "Уведомления");
         assert_eq!(russian.labels.no_players, "У вас пока нет игроков");
         assert_eq!(russian.announcement, "Объявление");
+    }
+
+    #[test]
+    fn user_reports_page_copy_uses_legacy_general_and_front_end_catalogs() {
+        let spanish = super::user_reports_page_copy("es_ES");
+        assert_eq!(spanish.title, "Informes");
+        assert_eq!(spanish.back, "Volver");
+        assert_eq!(spanish.texture, "ID de textura");
+        assert_eq!(spanish.reason, "Razón");
+        assert_eq!(spanish.pending, "Pendiente");
+        assert_eq!(spanish.resolved, "Resuelto");
+        assert_eq!(spanish.rejected, "Rechazado");
+
+        let russian = super::user_reports_page_copy("ru_RU");
+        assert_eq!(russian.pending, "В ожидании");
+        assert_eq!(russian.resolved, "Решена");
+        assert_eq!(russian.rejected, "Отклонено");
+    }
+
+    #[test]
+    fn user_reports_page_renders_translated_states_and_empty_fallback() {
+        let page = super::UserReportsPage {
+            site_name: "Blessing Skin".to_owned(),
+            copy: super::user_reports_page_copy("es_ES"),
+            locale: "es_ES".to_owned(),
+            reports: vec![
+                super::UserReportView {
+                    id: 1,
+                    tid: 10,
+                    texture_name: Some("Alex".to_owned()),
+                    reason: "Spam".to_owned(),
+                    status: 0,
+                    report_at: "2026-10-06".to_owned(),
+                },
+                super::UserReportView {
+                    id: 2,
+                    tid: 11,
+                    texture_name: None,
+                    reason: "Broken".to_owned(),
+                    status: 1,
+                    report_at: "2026-10-05".to_owned(),
+                },
+                super::UserReportView {
+                    id: 3,
+                    tid: 12,
+                    texture_name: Some("Steve".to_owned()),
+                    reason: "Other".to_owned(),
+                    status: 2,
+                    report_at: "2026-10-04".to_owned(),
+                },
+            ],
+            current_page: 1,
+            last_page: 1,
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains("<title>Informes · Blessing Skin</title>"));
+        assert!(html.contains("ID de textura"));
+        assert!(html.contains("Textura eliminada"));
+        assert!(html.contains("Pendiente"));
+        assert!(html.contains("Resuelto"));
+        assert!(html.contains("Rechazado"));
+
+        let empty = super::UserReportsPage {
+            reports: Vec::new(),
+            ..page
+        }
+        .render()
+        .unwrap();
+        assert!(empty.contains("Aún no has enviado ningún informe."));
     }
 
     #[test]

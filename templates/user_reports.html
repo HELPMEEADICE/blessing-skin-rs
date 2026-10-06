@@ -1,15 +1,130 @@
-<!doctype html>
-<html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{% if locale.starts_with("zh") %}我的举报{% else %}My reports{% endif %} · {{ site_name }}</title><style>body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}main{max-width:960px;margin:3rem auto;padding:1.5rem;background:#fff;border-radius:8px;box-shadow:0 6px 24px #0001}table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.7rem;border-bottom:1px solid #dee2e6}nav{display:flex;gap:1rem;align-items:center}@media(max-width:640px){main{margin:0;padding:1rem}table{font-size:.88rem}th,td{padding:.4rem}}</style>
-<meta name="csrf-token" content="">
-{% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-{% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}</head>
-<body>
-<main><a href="/user">{% if locale.starts_with("zh") %}返回用户面板{% else %}Back to account{% endif %}</a><h1>{% if locale.starts_with("zh") %}我的举报{% else %}My reports{% endif %}</h1>
-{% if frontend_script_available %}
-<div id="reports-list"></div>
-{% else %}
-<table><thead><tr><th>{% if locale.starts_with("zh") %}编号{% else %}ID{% endif %}</th><th>{% if locale.starts_with("zh") %}材质{% else %}Texture{% endif %}</th><th>{% if locale.starts_with("zh") %}原因{% else %}Reason{% endif %}</th><th>{% if locale.starts_with("zh") %}状态{% else %}Status{% endif %}</th><th>{% if locale.starts_with("zh") %}时间{% else %}Date{% endif %}</th></tr></thead><tbody>{% for report in reports %}<tr><td>{{ report.id }}</td><td><a href="/skinlib/show/{{ report.tid }}">{% match report.texture_name %}{% when Some with (name) %}{{ name }}{% when None %}{% if locale.starts_with("zh") %}材质已删除{% else %}Texture deleted{% endif %}{% endmatch %}</a></td><td>{{ report.reason }}</td><td>{% if report.status == 0 %}{% if locale.starts_with("zh") %}处理中{% else %}Pending{% endif %}{% else if report.status == 1 %}{% if locale.starts_with("zh") %}已处理{% else %}Resolved{% endif %}{% else %}{% if locale.starts_with("zh") %}已驳回{% else %}Rejected{% endif %}{% endif %}</td><td>{{ report.report_at }}</td></tr>{% else %}<tr><td colspan="5">{% if locale.starts_with("zh") %}你还没有提交举报。{% else %}You have not submitted any reports.{% endif %}</td></tr>{% endfor %}</tbody></table><nav>{% if current_page > 1 %}<a href="/user/reports?page={{ current_page - 1 }}">{% if locale.starts_with("zh") %}上一页{% else %}Previous{% endif %}</a>{% endif %}<span>{{ current_page }} / {{ last_page }}</span>{% if current_page < last_page %}<a href="/user/reports?page={{ current_page + 1 }}">{% if locale.starts_with("zh") %}下一页{% else %}Next{% endif %}</a>{% endif %}</nav>
-{% endif %}
-</main>
-{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
-</body></html>
+<!DOCTYPE html>
+<html lang="{{ locale }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ copy.title }} · {{ site_name }}</title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      main {
+        max-width: 960px;
+        margin: 3rem auto;
+        padding: 1.5rem;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 6px 24px #0001;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1rem 0;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.7rem;
+        border-bottom: 1px solid #dee2e6;
+      }
+      nav {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      @media (max-width: 640px) {
+        main {
+          margin: 0;
+          padding: 1rem;
+        }
+        table {
+          font-size: 0.88rem;
+        }
+        th,
+        td {
+          padding: 0.4rem;
+        }
+      }
+    </style>
+    <meta name="csrf-token" content="" />
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body>
+    <main>
+      <a href="/user">{{ copy.back }}</a>
+      <h1>{{ copy.title }}</h1>
+      {% if frontend_script_available %}
+      <div id="reports-list"></div>
+      {% else %}
+      <table>
+        <thead>
+          <tr>
+            <th>{{ copy.report_id }}</th>
+            <th>{{ copy.texture }}</th>
+            <th>{{ copy.reason }}</th>
+            <th>{{ copy.status }}</th>
+            <th>{{ copy.date }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for report in reports %}
+          <tr>
+            <td>{{ report.id }}</td>
+            <td>
+              <a href="/skinlib/show/{{ report.tid }}"
+                >{% match report.texture_name %}{% when Some with (name) %}{{
+                name }}{% when None %}{{ copy.missing_texture }}{% endmatch
+                %}</a
+              >
+            </td>
+            <td>{{ report.reason }}</td>
+            <td>
+              {% if report.status == 0 %}{{ copy.pending }}{% else if
+              report.status == 1 %}{{ copy.resolved }}{% else %}{{ copy.rejected
+              }}{% endif %}
+            </td>
+            <td>{{ report.report_at }}</td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5">{{ copy.empty }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <nav>
+        {% if current_page > 1 %}<a
+          href="/user/reports?page={{ current_page - 1 }}"
+          >{{ copy.previous }}</a
+        >{% endif %}<span>{{ current_page }} / {{ last_page }}</span>{% if
+        current_page < last_page %}<a
+          href="/user/reports?page={{ current_page + 1 }}"
+          >{{ copy.next }}</a
+        >{% endif %}
+      </nav>
+      {% endif %}
+    </main>
+    {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
+</html>
