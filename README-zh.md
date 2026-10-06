@@ -4,10 +4,10 @@
 <p align="center"><img src="https://media.githubusercontent.com/media/bs-community/logo/main/logo.png"></p>
 
 <p align="center">
-<a href="https://github.com/bs-community/blessing-skin-server/actions"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/workflow/status/bs-community/blessing-skin-server/CI?style=flat-square"></a>
-<a href="https://codecov.io/gh/bs-community/blessing-skin-server"><img alt="Codecov" src="https://img.shields.io/codecov/c/github/bs-community/blessing-skin-server?style=flat-square"></a>
-<a href="https://github.com/bs-community/blessing-skin-server/releases"><img alt="GitHub release (latest SemVer including pre-releases)" src="https://img.shields.io/github/v/release/bs-community/blessing-skin-server?include_prereleases&style=flat-square"></a>
-<a href="https://github.com/bs-community/blessing-skin-server/blob/master/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/bs-community/blessing-skin-server?style=flat-square"></a>
+<a href="https://github.com/HELPMEEADICE/blessing-skin-rs/actions"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/HELPMEEADICE/blessing-skin-rs/rust-ci.yml?branch=dev&style=flat-square"></a>
+<a href="https://codecov.io/gh/HELPMEEADICE/blessing-skin-rs"><img alt="Codecov" src="https://img.shields.io/codecov/c/github/HELPMEEADICE/blessing-skin-rs?style=flat-square"></a>
+<a href="https://github.com/HELPMEEADICE/blessing-skin-rs/releases"><img alt="GitHub release (latest SemVer including pre-releases)" src="https://img.shields.io/github/v/release/HELPMEEADICE/blessing-skin-rs?include_prereleases&style=flat-square"></a>
+<a href="https://github.com/HELPMEEADICE/blessing-skin-rs/blob/dev/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/HELPMEEADICE/blessing-skin-rs?style=flat-square"></a>
 <a href="https://discord.com/invite/QAsyEyt"><img alt="Discord" src="https://discord.com/api/guilds/761226550921658380/widget.png"></a>
 </p>
 
@@ -15,7 +15,7 @@
 
 Blessing Skin 是一款能让您上传、管理和分享您的 Minecraft 皮肤和披风的 Web 应用程序。与修改游戏材质包不同的是，所有人都能在游戏中看到各自的皮肤和披风（当然，前提是玩家们要使用同一个皮肤站）。
 
-Blessing Skin 是一个开源的 PHP 项目，这意味着您可以自由地在您的服务器上部署它。
+Blessing Skin 是一个开源 Web 应用，最初使用 PHP 编写。本仓库保留旧 PHP 版本，并持续开发可独立部署的 Rust 服务。
 
 ## 特性
 
@@ -37,7 +37,7 @@ Blessing Skin 是一个开源的 PHP 项目，这意味着您可以自由地在�
 
 ## Rust 重构进度
 
-本仓库正在将服务端逐步迁移到 Rust。迁移尚未完成，PHP 代码仍保留，Rust 服务的功能覆盖也仍在扩展。Rust 服务的构建、配置与独立部署请参阅 [Rust 服务部署指南](docs/rust-deployment.md) 和 [Rust 环境变量示例](rust.env.example)。切换现有站点前请先在副本上验证数据库、纹理和协议兼容性。
+本仓库正在将服务端逐步迁移到 Rust。Rust 服务直接使用旧数据库表和纹理文件，并通过独立程序部署；它不会加载旧 PHP 插件，Rust 扩展使用版本化 WASM 组件接口。构建、安装与配置请参阅 [Rust 服务部署指南](docs/rust-deployment.md)、[Rust 安装指南](docs/rust-install.md) 和 [Rust 环境变量示例](rust.env.example)。切换现有站点前，请先在副本上验证数据库、纹理和协议兼容性。
 
 ## 旧 PHP 版本的环境要求
 
