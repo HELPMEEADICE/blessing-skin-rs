@@ -2014,6 +2014,21 @@ fn http_error_page_message(locale: &str, status: StatusCode, detail: Option<Stri
     }
 }
 
+fn legacy_pretty_error_message(locale: &str, code: i64, message: &str) -> (String, String, String) {
+    let translation = |catalog, parent_path: &[&str], key, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, catalog, parent_path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let title = translation("errors", &["general"], "title", "Error occurred");
+    let code_template = translation("errors", &["exception"], "code", "Error code: :code");
+    let detail_template = translation("errors", &["exception"], "detail", "Details: :msg");
+    (
+        title,
+        code_template.replace(":code", &code.to_string()),
+        detail_template.replace(":msg", message),
+    )
+}
+
 fn legacy_pretty_error_copy(
     locale: &str,
     code: i64,
@@ -2022,32 +2037,59 @@ fn legacy_pretty_error_copy(
     key: &str,
     fallback: &str,
 ) -> (String, String, String) {
-    let translation = |catalog, parent_path: &[&str], key, fallback: &str| {
-        crate::mail_templates::legacy_translation(locale, catalog, parent_path, key)
-            .unwrap_or_else(|| fallback.to_owned())
-    };
-    let title = translation("errors", &["general"], "title", "Error occurred");
-    let code_template = translation("errors", &["exception"], "code", "Error code: :code");
-    let detail_template = translation("errors", &["exception"], "detail", "Details: :msg");
-    let detail = translation(catalog, parent_path, key, fallback);
-    (
-        title,
-        code_template.replace(":code", &code.to_string()),
-        detail_template.replace(":msg", &detail),
-    )
+    let message = crate::mail_templates::legacy_translation(locale, catalog, parent_path, key)
+        .unwrap_or_else(|| fallback.to_owned());
+    legacy_pretty_error_message(locale, code, &message)
 }
 
-async fn render_legacy_pretty_error(
-    state: &AppState,
+fn legacy_setup_database_connection_error_copy(
+    locale: &str,
     code: i64,
-    catalog: &str,
-    parent_path: &[&str],
-    key: &str,
-    fallback: &str,
+    driver: &str,
+    error: &str,
+) -> (String, String, String) {
+    let database_type = match driver {
+        "mysql" => "MySQL/MariaDB",
+        "sqlite" => "SQLite",
+        "pgsql" => "PostgreSQL",
+        _ => "",
+    };
+    let template = crate::mail_templates::legacy_translation(
+        locale,
+        "setup",
+        &["database"],
+        "connection-error",
+    )
+    .unwrap_or_else(|| {
+        "Unable to connect to the target :type database, please check your configuration. The server replied with: :msg".to_owned()
+    });
+    let message = template
+        .replace(":type", database_type)
+        .replace(":msg", error);
+    legacy_pretty_error_message(locale, code, &message)
+}
+
+fn legacy_sqlx_error_code(error: &sqlx::Error) -> i64 {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .and_then(|code| code.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn legacy_database_error_code(error: &crate::database::DatabaseError) -> i64 {
+    match error {
+        crate::database::DatabaseError::Sqlx(error) => legacy_sqlx_error_code(error),
+    }
+}
+
+async fn render_legacy_pretty_error_copy(
+    state: &AppState,
+    locale: String,
+    code: i64,
+    copy: (String, String, String),
 ) -> Response {
-    let locale = request_locale(state);
-    let (title, code_message, detail_message) =
-        legacy_pretty_error_copy(&locale, code, catalog, parent_path, key, fallback);
+    let (title, code_message, detail_message) = copy;
     let page = PrettyErrorPage {
         locale,
         title,
@@ -2063,6 +2105,30 @@ async fn render_legacy_pretty_error(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn render_legacy_pretty_error(
+    state: &AppState,
+    code: i64,
+    catalog: &str,
+    parent_path: &[&str],
+    key: &str,
+    fallback: &str,
+) -> Response {
+    let locale = request_locale(state);
+    let copy = legacy_pretty_error_copy(&locale, code, catalog, parent_path, key, fallback);
+    render_legacy_pretty_error_copy(state, locale, code, copy).await
+}
+
+async fn render_legacy_setup_database_connection_error(
+    state: &AppState,
+    code: i64,
+    driver: &str,
+    error: &str,
+) -> Response {
+    let locale = request_locale(state);
+    let copy = legacy_setup_database_connection_error_copy(&locale, code, driver, error);
+    render_legacy_pretty_error_copy(state, locale, code, copy).await
 }
 
 fn http_error_title(status: StatusCode) -> &'static str {
@@ -10952,13 +11018,13 @@ async fn setup_database_save(
         Ok(pool) => pool,
         Err(error) => {
             tracing::warn!(%error, driver = %form.driver, "database connection failed during setup");
-            let message = setup_message(
+            return render_legacy_setup_database_connection_error(
                 &state,
-                &format!("Could not connect to the database: {error}"),
-                &format!("无法连接数据库：{error}"),
-            );
-            return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY)
-                .await;
+                legacy_database_error_code(&error),
+                &form.driver,
+                &error.to_string(),
+            )
+            .await;
         }
     };
     let ping_result = pool.ping().await;
@@ -10969,13 +11035,13 @@ async fn setup_database_save(
     }
     if let Err(error) = ping_result {
         tracing::warn!(%error, driver = %form.driver, "database ping failed during setup");
-        let message = setup_message(
+        return render_legacy_setup_database_connection_error(
             &state,
-            &format!("Could not use the database: {error}"),
-            &format!("无法使用该数据库：{error}"),
-        );
-        return setup_database_error(&state, &headers, &form, message, StatusCode::BAD_GATEWAY)
-            .await;
+            legacy_sqlx_error_code(&error),
+            &form.driver,
+            &error.to_string(),
+        )
+        .await;
     }
     let env_file = state.env_file.clone();
     let entries = vec![
@@ -21082,6 +21148,19 @@ mod tests {
         assert_eq!(title, "Error occurred");
         assert_eq!(code, "Error code: 1");
         assert_eq!(detail, "Details: Email verification is not available.");
+
+        let (title, code, detail) = super::legacy_setup_database_connection_error_copy(
+            "zh_CN",
+            14,
+            "sqlite",
+            "disk I/O error",
+        );
+        assert_eq!(title, "出现错误");
+        assert_eq!(code, "错误码：14");
+        assert_eq!(
+            detail,
+            "详细信息：无法连接至 SQLite 目标数据库，请检查你的配置。服务器返回的信息：disk I/O error"
+        );
     }
 
     #[test]
@@ -21362,6 +21441,41 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(second_setup_cookie, setup_cookie);
+        let failed_database_form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", setup_cookie.split_once('=').unwrap().1)
+            .append_pair("type", "sqlite")
+            .append_pair("host", "")
+            .append_pair("port", "")
+            .append_pair("username", "")
+            .append_pair("password", "")
+            .append_pair("db", &std::env::temp_dir().display().to_string())
+            .append_pair("prefix", "")
+            .finish();
+        let failed_database = app
+            .clone()
+            .oneshot(
+                Request::post("/setup/database")
+                    .header("cookie", &setup_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(failed_database_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_database.status(), StatusCode::OK);
+        let failed_database_html = String::from_utf8(
+            to_bytes(failed_database.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(failed_database_html.contains("Error code:"));
+        assert!(failed_database_html.contains(
+            "Unable to connect to the target SQLite database, please check your configuration. The server replied with:"
+        ));
+        assert!(!failed_database_html.contains("id=\"setup-database-app\""));
+
         let database_form = form_urlencoded::Serializer::new(String::new())
             .append_pair("csrf", setup_cookie.split_once('=').unwrap().1)
             .append_pair("type", "sqlite")

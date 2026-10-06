@@ -16,6 +16,7 @@ struct LocaleFiles {
     user: &'static str,
     auth: &'static str,
     errors: &'static str,
+    setup: &'static str,
 }
 
 const LOCALES: &[LocaleFiles] = &[
@@ -24,78 +25,91 @@ const LOCALES: &[LocaleFiles] = &[
         user: include_str!("../resources/lang/de_DE/user.yml"),
         auth: include_str!("../resources/lang/de_DE/auth.yml"),
         errors: include_str!("../resources/lang/de_DE/errors.yml"),
+        setup: include_str!("../resources/lang/de_DE/setup.yml"),
     },
     LocaleFiles {
         locale: "el_GR",
         user: include_str!("../resources/lang/el_GR/user.yml"),
         auth: include_str!("../resources/lang/el_GR/auth.yml"),
         errors: include_str!("../resources/lang/el_GR/errors.yml"),
+        setup: include_str!("../resources/lang/el_GR/setup.yml"),
     },
     LocaleFiles {
         locale: "en",
         user: include_str!("../resources/lang/en/user.yml"),
         auth: include_str!("../resources/lang/en/auth.yml"),
         errors: include_str!("../resources/lang/en/errors.yml"),
+        setup: include_str!("../resources/lang/en/setup.yml"),
     },
     LocaleFiles {
         locale: "es_ES",
         user: include_str!("../resources/lang/es_ES/user.yml"),
         auth: include_str!("../resources/lang/es_ES/auth.yml"),
         errors: include_str!("../resources/lang/es_ES/errors.yml"),
+        setup: include_str!("../resources/lang/es_ES/setup.yml"),
     },
     LocaleFiles {
         locale: "fr_FR",
         user: include_str!("../resources/lang/fr_FR/user.yml"),
         auth: include_str!("../resources/lang/fr_FR/auth.yml"),
         errors: include_str!("../resources/lang/fr_FR/errors.yml"),
+        setup: include_str!("../resources/lang/fr_FR/setup.yml"),
     },
     LocaleFiles {
         locale: "it_IT",
         user: include_str!("../resources/lang/it_IT/user.yml"),
         auth: include_str!("../resources/lang/it_IT/auth.yml"),
         errors: include_str!("../resources/lang/it_IT/errors.yml"),
+        setup: include_str!("../resources/lang/it_IT/setup.yml"),
     },
     LocaleFiles {
         locale: "ja_JP",
         user: include_str!("../resources/lang/ja_JP/user.yml"),
         auth: include_str!("../resources/lang/ja_JP/auth.yml"),
         errors: include_str!("../resources/lang/ja_JP/errors.yml"),
+        setup: include_str!("../resources/lang/ja_JP/setup.yml"),
     },
     LocaleFiles {
         locale: "ko_KR",
         user: include_str!("../resources/lang/ko_KR/user.yml"),
         auth: include_str!("../resources/lang/ko_KR/auth.yml"),
         errors: include_str!("../resources/lang/ko_KR/errors.yml"),
+        setup: include_str!("../resources/lang/ko_KR/setup.yml"),
     },
     LocaleFiles {
         locale: "nl_NL",
         user: include_str!("../resources/lang/nl_NL/user.yml"),
         auth: include_str!("../resources/lang/nl_NL/auth.yml"),
         errors: include_str!("../resources/lang/nl_NL/errors.yml"),
+        setup: include_str!("../resources/lang/nl_NL/setup.yml"),
     },
     LocaleFiles {
         locale: "pt_PT",
         user: include_str!("../resources/lang/pt_PT/user.yml"),
         auth: include_str!("../resources/lang/pt_PT/auth.yml"),
         errors: include_str!("../resources/lang/pt_PT/errors.yml"),
+        setup: include_str!("../resources/lang/pt_PT/setup.yml"),
     },
     LocaleFiles {
         locale: "ru_RU",
         user: include_str!("../resources/lang/ru_RU/user.yml"),
         auth: include_str!("../resources/lang/ru_RU/auth.yml"),
         errors: include_str!("../resources/lang/ru_RU/errors.yml"),
+        setup: include_str!("../resources/lang/ru_RU/setup.yml"),
     },
     LocaleFiles {
         locale: "zh_CN",
         user: include_str!("../resources/lang/zh_CN/user.yml"),
         auth: include_str!("../resources/lang/zh_CN/auth.yml"),
         errors: include_str!("../resources/lang/zh_CN/errors.yml"),
+        setup: include_str!("../resources/lang/zh_CN/setup.yml"),
     },
     LocaleFiles {
         locale: "zh_TW",
         user: include_str!("../resources/lang/zh_TW/user.yml"),
         auth: include_str!("../resources/lang/zh_TW/auth.yml"),
         errors: include_str!("../resources/lang/zh_TW/errors.yml"),
+        setup: include_str!("../resources/lang/zh_TW/setup.yml"),
     },
 ];
 
@@ -122,6 +136,7 @@ pub(crate) fn legacy_translation(
         "auth" => (language.auth, english.auth),
         "user" => (language.user, english.user),
         "errors" => (language.errors, english.errors),
+        "setup" => (language.setup, english.setup),
         _ => return None,
     };
     yaml_scalar(source, parent_path, key).or_else(|| yaml_scalar(english_source, parent_path, key))
@@ -260,6 +275,12 @@ mod tests {
                 "{}",
                 locale.locale
             );
+            assert!(
+                legacy_translation(locale.locale, "setup", &["database"], "connection-error")
+                    .is_some(),
+                "{}",
+                locale.locale
+            );
         }
         assert_eq!(
             legacy_translation("zh_CN", "auth", &["forgot"], "disabled").as_deref(),
@@ -272,6 +293,10 @@ mod tests {
         assert_eq!(
             legacy_translation("missing", "errors", &["general"], "title").as_deref(),
             Some("Error occurred")
+        );
+        assert_eq!(
+            legacy_translation("zh_CN", "setup", &["database"], "connection-error").as_deref(),
+            Some("无法连接至 :type 目标数据库，请检查你的配置。服务器返回的信息：:msg")
         );
     }
 
