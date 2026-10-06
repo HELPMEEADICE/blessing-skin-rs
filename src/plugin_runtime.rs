@@ -14,7 +14,7 @@ use wasmtime::{
     component::{Component, ComponentExportIndex, Instance, Linker},
 };
 
-const HOST_API_VERSION: &str = "1.47.0";
+const HOST_API_VERSION: &str = "1.48.0";
 const LIFECYCLE_INTERFACE: &str = "blessing-skin:plugin/lifecycle@1.0.0";
 const HOST_LOG_INTERFACE: &str = "blessing-skin:plugin/host@1.0.0";
 const HOST_STATE_INTERFACE: &str = "blessing-skin:plugin/state@1.0.0";
@@ -1512,6 +1512,11 @@ fn find_components(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_api_version_includes_side_menu_contract() {
+        assert_eq!(super::HOST_API_VERSION, "1.48.0");
+    }
+
     use super::{
         PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_FILTER_FILE_BYTES_LIMIT,
         PLUGIN_FILTER_VALUE_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT,
