@@ -3173,21 +3173,16 @@ async fn handle_forgot(
     };
     let url = format!("{}{}", request_app_url(&state).trim_end_matches('/'), path);
     let site_name = site_name(&state).await;
-    let body = if request_locale(&state).starts_with("zh") {
-        format!(
-            "你收到了这封邮件，因为有人请求重置 {site_name} 账户密码。\n\n请在一小时内访问以下链接重设密码：\n{url}\n\n如果你没有请求重置密码，请忽略此邮件。"
-        )
-    } else {
-        format!(
-            "You received this email because a password reset was requested for your {site_name} account.\n\nReset your password within one hour by visiting:\n{url}\n\nIf you did not request a password reset, you can ignore this email."
-        )
-    };
-    let subject = if request_locale(&state).starts_with("zh") {
-        format!("{site_name} 密码重置")
-    } else {
-        format!("Reset your {site_name} password")
-    };
-    match crate::mailer::send_email(&state.config.mail, email, &subject, &body).await {
+    let mail = crate::mail_templates::password_reset(&request_locale(&state), &site_name, &url);
+    match crate::mailer::send_email_with_html(
+        &state.config.mail,
+        email,
+        &mail.subject,
+        &mail.text,
+        &mail.html,
+    )
+    .await
+    {
         Ok(()) => {
             emit_plugin_event(
                 &state,
@@ -3710,11 +3705,19 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         );
     }
     let locale = request_locale(&state);
-    let Some((subject, body)) = verification_mail_content(&state, uid, &locale).await else {
+    let Some(mail) = verification_mail_content(&state, uid, &locale).await else {
         release_mail_limit(&state, &key);
         return unavailable();
     };
-    match crate::mailer::send_email(&state.config.mail, &user.email, &subject, &body).await {
+    match crate::mailer::send_email_with_html(
+        &state.config.mail,
+        &user.email,
+        &mail.subject,
+        &mail.text,
+        &mail.html,
+    )
+    .await
+    {
         Ok(()) => login_result(
             0,
             &auth_message(
@@ -3820,26 +3823,13 @@ async fn verification_mail_content(
     state: &AppState,
     uid: i64,
     locale: &str,
-) -> Option<(String, String)> {
+) -> Option<crate::mail_templates::MailContent> {
     let path = signed_relative_url(state, &format!("/auth/verify/{uid}"), None)?;
     let url = format!("{}{}", request_app_url(state).trim_end_matches('/'), path);
     let site_name = site_name(state).await;
-    let (subject, body) = if locale.starts_with("zh") {
-        (
-            format!("验证你的 {site_name} 账户"),
-            format!(
-                "有人注册了 {site_name} 账户。如果这是你的账户，请访问以下链接验证邮箱：\n{url}\n\n如果你没有注册，请忽略此邮件。"
-            ),
-        )
-    } else {
-        (
-            format!("Verify your account on {site_name}"),
-            format!(
-                "Someone registered an account with this email address on {site_name}. Verify your email by visiting:\n{url}\n\nIf you did not register, you can ignore this email."
-            ),
-        )
-    };
-    Some((subject, body))
+    Some(crate::mail_templates::email_verification(
+        locale, &site_name, &url,
+    ))
 }
 
 async fn send_registration_verification_email(
@@ -3859,14 +3849,21 @@ async fn send_registration_verification_email(
             return;
         }
     }
-    let Some((subject, body)) = verification_mail_content(state, uid, locale).await else {
+    let Some(mail) = verification_mail_content(state, uid, locale).await else {
         tracing::warn!(
             user_id = uid,
             "could not create signed email-verification link after registration"
         );
         return;
     };
-    if let Err(error) = crate::mailer::send_email(&state.config.mail, email, &subject, &body).await
+    if let Err(error) = crate::mailer::send_email_with_html(
+        &state.config.mail,
+        email,
+        &mail.subject,
+        &mail.text,
+        &mail.html,
+    )
+    .await
     {
         tracing::warn!(%error, user_id = uid, "failed to send registration email-verification message");
     }

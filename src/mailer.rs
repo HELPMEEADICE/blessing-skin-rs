@@ -3,7 +3,7 @@ use std::{process::Stdio, time::Duration};
 use hmac::{Hmac, Mac};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{Mailbox, header::ContentType},
+    message::{Mailbox, MultiPart, SinglePart, header::ContentType},
     transport::smtp::{
         authentication::Credentials,
         client::{Tls, TlsParameters},
@@ -164,33 +164,55 @@ fn decode_url_component(value: &str) -> Result<String, String> {
         .map_err(|error| format!("MAIL_URL contains invalid UTF-8 credentials: {error}"))
 }
 
+#[cfg(test)]
 pub async fn send_email(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<(), String> {
+    send_email_content(config, recipient, subject, body, None).await
+}
+
+pub async fn send_email_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    text_body: &str,
+    html_body: &str,
+) -> Result<(), String> {
+    send_email_content(config, recipient, subject, text_body, Some(html_body)).await
+}
+
+async fn send_email_content(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<(), String> {
     match config.mailer.trim().to_ascii_lowercase().as_str() {
         "log" => {
-            log_email(recipient, subject, body);
+            log_email(recipient, subject, body, html);
             Ok(())
         }
         "array" => Ok(()),
         "failover" => {
             let mut smtp_config = config.clone();
             smtp_config.mailer = "smtp".to_owned();
-            if let Err(error) = send_smtp_email(&smtp_config, recipient, subject, body).await {
+            if let Err(error) = send_smtp_email(&smtp_config, recipient, subject, body, html).await
+            {
                 tracing::warn!(%error, "SMTP delivery failed; falling back to the log mailer");
-                log_email(recipient, subject, body);
+                log_email(recipient, subject, body, html);
             }
             Ok(())
         }
-        "smtp" => send_smtp_email(config, recipient, subject, body).await,
-        "sendmail" => send_sendmail_email(config, recipient, subject, body).await,
-        "mailgun" => send_mailgun_email(config, recipient, subject, body).await,
-        "postmark" => send_postmark_email(config, recipient, subject, body).await,
-        "ses" => send_ses_email(config, recipient, subject, body, SesApiVersion::Query).await,
-        "ses-v2" => send_ses_email(config, recipient, subject, body, SesApiVersion::V2).await,
+        "smtp" => send_smtp_email(config, recipient, subject, body, html).await,
+        "sendmail" => send_sendmail_email(config, recipient, subject, body, html).await,
+        "mailgun" => send_mailgun_email(config, recipient, subject, body, html).await,
+        "postmark" => send_postmark_email(config, recipient, subject, body, html).await,
+        "ses" => send_ses_email(config, recipient, subject, body, html, SesApiVersion::Query).await,
+        "ses-v2" => send_ses_email(config, recipient, subject, body, html, SesApiVersion::V2).await,
         "" => Err("Email delivery is not configured.".to_owned()),
         mailer => Err(format!("Unsupported mailer: {mailer}")),
     }
@@ -263,6 +285,7 @@ async fn send_sendmail_email(
     recipient: &str,
     subject: &str,
     body: &str,
+    html: Option<&str>,
 ) -> Result<(), String> {
     let mut arguments = split_sendmail_command(&config.sendmail_path)?;
     let executable = arguments.remove(0);
@@ -280,7 +303,7 @@ async fn send_sendmail_email(
         arguments.push(recipient.to_owned());
     }
 
-    let message = build_message(config, recipient, subject, body)?;
+    let message = build_message_with_html(config, recipient, subject, body, html)?;
     let mut child = Command::new(executable)
         .args(arguments)
         .stdin(Stdio::piped())
@@ -571,26 +594,52 @@ fn mailgun_url(domain: &str, endpoint: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+#[cfg(test)]
 fn mailgun_fields(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    mailgun_fields_with_html(config, recipient, subject, body, None)
+}
+
+fn mailgun_fields_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
     let from = from_mailbox(config)?.to_string();
-    Ok(vec![
+    let mut fields = vec![
         ("from".to_owned(), from),
         ("to".to_owned(), recipient.to_owned()),
         ("subject".to_owned(), subject.to_owned()),
         ("text".to_owned(), body.to_owned()),
-    ])
+    ];
+    if let Some(html) = html {
+        fields.push(("html".to_owned(), html.to_owned()));
+    }
+    Ok(fields)
 }
 
+#[cfg(test)]
 fn postmark_payload(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
+) -> Result<serde_json::Value, String> {
+    postmark_payload_with_html(config, recipient, subject, body, None)
+}
+
+fn postmark_payload_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let mut payload = serde_json::json!({
         "From": from_mailbox(config)?.to_string(),
@@ -598,6 +647,9 @@ fn postmark_payload(
         "Subject": subject,
         "TextBody": body,
     });
+    if let Some(html) = html {
+        payload["HtmlBody"] = serde_json::Value::String(html.to_owned());
+    }
     if let Some(message_stream) = &config.postmark_message_stream {
         payload["MessageStream"] = serde_json::Value::String(message_stream.clone());
     }
@@ -629,6 +681,7 @@ async fn send_mailgun_email(
     recipient: &str,
     subject: &str,
     body: &str,
+    html: Option<&str>,
 ) -> Result<(), String> {
     let domain = config
         .mailgun_domain
@@ -641,7 +694,7 @@ async fn send_mailgun_email(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "MAILGUN_SECRET is not configured.".to_owned())?;
     let url = mailgun_url(domain, &config.mailgun_endpoint)?;
-    let fields = mailgun_fields(config, recipient, subject, body)?;
+    let fields = mailgun_fields_with_html(config, recipient, subject, body, html)?;
     let form = fields
         .into_iter()
         .fold(Form::new(), |form, (name, value)| form.text(name, value));
@@ -660,13 +713,14 @@ async fn send_postmark_email(
     recipient: &str,
     subject: &str,
     body: &str,
+    html: Option<&str>,
 ) -> Result<(), String> {
     let token = config
         .postmark_token
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "POSTMARK_TOKEN is not configured.".to_owned())?;
-    let payload = postmark_payload(config, recipient, subject, body)?;
+    let payload = postmark_payload_with_html(config, recipient, subject, body, html)?;
     let response = mail_api_client()?
         .post("https://api.postmarkapp.com/email")
         .header("Accept", "application/json")
@@ -695,35 +749,62 @@ fn ses_region_host(region: &str) -> Result<String, String> {
     Ok(format!("email.{region}.{dns_suffix}"))
 }
 
+#[cfg(test)]
 fn ses_query_form(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<String, String> {
+    ses_query_form_with_html(config, recipient, subject, body, None)
+}
+
+fn ses_query_form_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<String, String> {
     let from = from_mailbox(config)?.to_string();
-    let fields = [
-        ("Action", "SendEmail".to_owned()),
-        ("Version", "2010-12-01".to_owned()),
-        ("Source", from),
-        ("Destination.ToAddresses.member.1", recipient.to_owned()),
-        ("Message.Subject.Data", subject.to_owned()),
-        ("Message.Subject.Charset", "UTF-8".to_owned()),
-        ("Message.Body.Text.Data", body.to_owned()),
-        ("Message.Body.Text.Charset", "UTF-8".to_owned()),
-    ];
     let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.extend_pairs(fields);
+    serializer.extend_pairs([
+        ("Action", "SendEmail"),
+        ("Version", "2010-12-01"),
+        ("Source", from.as_str()),
+        ("Destination.ToAddresses.member.1", recipient),
+        ("Message.Subject.Data", subject),
+        ("Message.Subject.Charset", "UTF-8"),
+        ("Message.Body.Text.Data", body),
+        ("Message.Body.Text.Charset", "UTF-8"),
+    ]);
+    if let Some(html) = html {
+        serializer.extend_pairs([
+            ("Message.Body.Html.Data", html),
+            ("Message.Body.Html.Charset", "UTF-8"),
+        ]);
+    }
     Ok(serializer.finish())
 }
 
+#[cfg(test)]
 fn ses_v2_payload(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
+    ses_v2_payload_with_html(config, recipient, subject, body, None)
+}
+
+fn ses_v2_payload_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = serde_json::json!({
         "FromEmailAddress": from_mailbox(config)?.to_string(),
         "Destination": {
             "ToAddresses": [recipient],
@@ -742,7 +823,14 @@ fn ses_v2_payload(
                 },
             },
         },
-    }))
+    });
+    if let Some(html) = html {
+        payload["Content"]["Simple"]["Body"]["Html"] = serde_json::json!({
+            "Data": html,
+            "Charset": "UTF-8",
+        });
+    }
+    Ok(payload)
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -813,6 +901,7 @@ async fn send_ses_email(
     recipient: &str,
     subject: &str,
     body: &str,
+    html: Option<&str>,
     version: SesApiVersion,
 ) -> Result<(), String> {
     let access_key = config
@@ -830,13 +919,15 @@ async fn send_ses_email(
         SesApiVersion::Query => (
             "/",
             "application/x-www-form-urlencoded",
-            ses_query_form(config, recipient, subject, body)?.into_bytes(),
+            ses_query_form_with_html(config, recipient, subject, body, html)?.into_bytes(),
         ),
         SesApiVersion::V2 => (
             "/v2/email/outbound-emails",
             "application/json",
-            serde_json::to_vec(&ses_v2_payload(config, recipient, subject, body)?)
-                .map_err(|error| format!("Could not encode SES v2 request: {error}"))?,
+            serde_json::to_vec(&ses_v2_payload_with_html(
+                config, recipient, subject, body, html,
+            )?)
+            .map_err(|error| format!("Could not encode SES v2 request: {error}"))?,
         ),
     };
     let url = Url::parse(&format!("https://{host}{path}"))
@@ -879,31 +970,53 @@ fn from_mailbox(config: &MailConfig) -> Result<Mailbox, String> {
     Ok(Mailbox::new(Some(config.from_name.clone()), address))
 }
 
+#[cfg(test)]
 fn build_message(
     config: &MailConfig,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<Message, String> {
+    build_message_with_html(config, recipient, subject, body, None)
+}
+
+fn build_message_with_html(
+    config: &MailConfig,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<Message, String> {
     let from = from_mailbox(config)?;
     let to_address = recipient
         .parse()
         .map_err(|error| format!("Invalid recipient address: {error}"))?;
     let to = Mailbox::new(None, to_address);
-    Message::builder()
-        .from(from)
-        .to(to)
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_owned())
-        .map_err(|error| format!("Could not construct email: {error}"))
+    let builder = Message::builder().from(from).to(to).subject(subject);
+    if let Some(html) = html {
+        let plain = SinglePart::builder()
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_owned());
+        let html = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html.to_owned());
+        builder
+            .multipart(MultiPart::alternative().singlepart(plain).singlepart(html))
+            .map_err(|error| format!("Could not construct email: {error}"))
+    } else {
+        builder
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_owned())
+            .map_err(|error| format!("Could not construct email: {error}"))
+    }
 }
 
-fn log_email(recipient: &str, subject: &str, body: &str) {
+fn log_email(recipient: &str, subject: &str, body: &str, html: Option<&str>) {
     tracing::info!(
         to = recipient,
         subject,
         body,
+        html_body = html.unwrap_or_default(),
         "email captured by log mailer"
     );
 }
@@ -913,6 +1026,7 @@ async fn send_smtp_email(
     recipient: &str,
     subject: &str,
     body: &str,
+    html: Option<&str>,
 ) -> Result<(), String> {
     let settings = smtp_settings(config)?;
     if settings.host.trim().is_empty() {
@@ -921,7 +1035,7 @@ async fn send_smtp_email(
     if settings.username.is_some() != settings.password.is_some() {
         return Err("MAIL_USERNAME and MAIL_PASSWORD must be configured together.".to_owned());
     }
-    let message = build_message(config, recipient, subject, body)?;
+    let message = build_message_with_html(config, recipient, subject, body, html)?;
 
     let mut transport = match settings.mode {
         SmtpMode::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(&settings.host),
@@ -962,9 +1076,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SendmailMode, SmtpMode, aws_v4_authorization, build_message, mailgun_fields, mailgun_url,
-        postmark_payload, sendmail_mode, ses_query_form, ses_region_host, ses_v2_payload,
-        smtp_data, smtp_mode, smtp_sendmail_session, smtp_settings, split_sendmail_command,
+        SendmailMode, SmtpMode, aws_v4_authorization, build_message, build_message_with_html,
+        mailgun_fields, mailgun_fields_with_html, mailgun_url, postmark_payload,
+        postmark_payload_with_html, sendmail_mode, ses_query_form, ses_query_form_with_html,
+        ses_region_host, ses_v2_payload, ses_v2_payload_with_html, smtp_data, smtp_mode,
+        smtp_sendmail_session, smtp_settings, split_sendmail_command,
     };
     use crate::config::MailConfig;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1173,6 +1289,87 @@ mod tests {
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn html_mail_alternatives_are_sent_by_every_supported_transport() {
+        let config = MailConfig {
+            from_address: "noreply@example.test".to_owned(),
+            from_name: "Blessing Skin".to_owned(),
+            ..MailConfig::default()
+        };
+        let plain = "Please verify your account.";
+        let html = "<p><a href=\"https://example.test/verify\">Verify</a></p>";
+
+        let message = build_message_with_html(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            plain,
+            Some(html),
+        )
+        .unwrap();
+        let formatted = String::from_utf8(message.formatted()).unwrap();
+        assert!(formatted.contains("multipart/alternative"));
+        assert!(formatted.contains("text/plain"));
+        assert!(formatted.contains("text/html"));
+        assert!(formatted.contains(plain));
+        assert!(formatted.contains(html));
+
+        let mailgun = mailgun_fields_with_html(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            plain,
+            Some(html),
+        )
+        .unwrap();
+        assert_eq!(
+            mailgun.last().unwrap(),
+            &("html".to_owned(), html.to_owned())
+        );
+
+        let postmark = postmark_payload_with_html(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            plain,
+            Some(html),
+        )
+        .unwrap();
+        assert_eq!(postmark["TextBody"], plain);
+        assert_eq!(postmark["HtmlBody"], html);
+
+        let query = ses_query_form_with_html(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            plain,
+            Some(html),
+        )
+        .unwrap();
+        let fields = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(fields["Message.Body.Text.Data"], plain);
+        assert_eq!(fields["Message.Body.Html.Data"], html);
+
+        let ses_v2 = ses_v2_payload_with_html(
+            &config,
+            "skin-user@example.test",
+            "Verify account",
+            plain,
+            Some(html),
+        )
+        .unwrap();
+        assert_eq!(ses_v2["Content"]["Simple"]["Body"]["Text"]["Data"], plain);
+        assert_eq!(ses_v2["Content"]["Simple"]["Body"]["Html"]["Data"], html);
+
+        assert_eq!(
+            ses_v2_payload(&config, "skin-user@example.test", "Verify account", plain).unwrap()
+                ["Content"]["Simple"]["Body"].get("Html"),
+            None
         );
     }
 

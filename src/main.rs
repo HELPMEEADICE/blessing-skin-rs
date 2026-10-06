@@ -7,6 +7,7 @@ mod http;
 mod image_cache;
 mod install_command;
 mod installer;
+mod mail_templates;
 mod mailer;
 mod oauth;
 mod plugin_command;
