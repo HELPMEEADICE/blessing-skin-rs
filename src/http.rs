@@ -669,7 +669,68 @@ async fn prevent_legacy_maintenance(
     legacy_maintenance_response(state, path, headers, locale, data).await
 }
 
-const MAX_LOCALE_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BUFFERED_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+fn post_content_length_exceeds(headers: &HeaderMap, max_size_bytes: usize) -> bool {
+    max_size_bytes > 0
+        && headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|content_length| content_length > max_size_bytes as u64)
+}
+
+async fn render_post_too_large_response(
+    state: AppState,
+    path: String,
+    request_headers: HeaderMap,
+    locale: String,
+) -> Response {
+    if !should_render_html_error(&path, &request_headers) {
+        if should_render_json_error(&request_headers) {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"message": "Payload Too Large"})),
+            )
+                .into_response();
+        }
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let page = NotFoundPage {
+        locale: locale.clone(),
+        title: http_error_title(StatusCode::PAYLOAD_TOO_LARGE).to_owned(),
+        site_name: site_name(&state).await,
+        message: http_error_page_message(&locale, StatusCode::PAYLOAD_TOO_LARGE, None),
+        home_url: request_app_url(&state),
+    };
+    let html = match page.render() {
+        Ok(html) => html,
+        Err(error) => {
+            tracing::error!(%error, "failed to render request size error page");
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    let mut response = (StatusCode::PAYLOAD_TOO_LARGE, Html(html)).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn validate_legacy_post_size(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if post_content_length_exceeds(request.headers(), state.config.post_max_size_bytes) {
+        let path = request.uri().path().to_owned();
+        let request_headers = request.headers().clone();
+        let locale_input = requested_query_locale(&request);
+        let locale = select_request_locale(&state, &request, locale_input.as_deref());
+        return render_post_too_large_response(state, path, request_headers, locale).await;
+    }
+    next.run(request).await
+}
 
 fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
     let locale = if media_type == "application/json" || media_type.ends_with("+json") {
@@ -697,6 +758,7 @@ fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
 
 async fn buffer_request_body_for_locale(
     request: axum::extract::Request,
+    max_buffered_body_bytes: usize,
 ) -> Result<(axum::extract::Request, Option<String>, Option<String>), Response> {
     let (mut parts, request_body) = request.into_parts();
     let convert_empty_strings = !convert_empty_strings_exempt_path(parts.uri.path());
@@ -737,7 +799,7 @@ async fn buffer_request_body_for_locale(
         ));
     }
 
-    let request_body = axum::body::to_bytes(request_body, MAX_LOCALE_REQUEST_BODY_BYTES)
+    let request_body = axum::body::to_bytes(request_body, max_buffered_body_bytes)
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
     let trimmed_body = trim_request_body_strings(&request_body, &media_type, convert_empty_strings);
@@ -1185,9 +1247,30 @@ async fn detect_locale_preference(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let original_path = request.uri().path().to_owned();
+    let original_headers = request.headers().clone();
+    let locale_input = requested_query_locale(&request);
+    let error_locale = select_request_locale(&state, &request, locale_input.as_deref());
+    let max_buffered_body_bytes = if state.config.post_max_size_bytes == 0 {
+        MAX_BUFFERED_REQUEST_BODY_BYTES
+    } else {
+        state
+            .config
+            .post_max_size_bytes
+            .min(MAX_BUFFERED_REQUEST_BODY_BYTES)
+    };
     let (request, body_locale, form_csrf_token) =
-        match buffer_request_body_for_locale(request).await {
+        match buffer_request_body_for_locale(request, max_buffered_body_bytes).await {
             Ok(request) => request,
+            Err(response) if response.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return render_post_too_large_response(
+                    state,
+                    original_path,
+                    original_headers,
+                    error_locale,
+                )
+                .await;
+            }
             Err(response) => return response,
         };
     let path = request.uri().path();
@@ -2292,6 +2375,10 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             detect_locale_preference,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            validate_legacy_post_size,
+        ))
         .layer(axum::middleware::from_fn(infer_peer_client_ip))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2371,6 +2458,26 @@ fn legacy_unsupported_browser(user_agent: &str) -> bool {
         return false;
     };
     version < 55
+}
+
+fn should_render_json_error(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|media_range| {
+                let mut parts = media_range.trim().split(';');
+                let media_type = parts.next().unwrap_or_default().trim();
+                let quality = parts
+                    .filter_map(|parameter| parameter.trim().strip_prefix("q="))
+                    .filter_map(|value| value.parse::<f32>().ok())
+                    .next()
+                    .unwrap_or(1.0);
+                (media_type.eq_ignore_ascii_case("application/json")
+                    || media_type.to_ascii_lowercase().ends_with("+json"))
+                    && quality > 0.0
+            })
+        })
 }
 
 fn should_render_html_error(path: &str, headers: &HeaderMap) -> bool {
@@ -2572,6 +2679,7 @@ fn http_error_title(status: StatusCode) -> &'static str {
         StatusCode::NOT_FOUND => "404 Not Found",
         StatusCode::INTERNAL_SERVER_ERROR => "500 Internal Server Error",
         StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable",
+        StatusCode::PAYLOAD_TOO_LARGE => "413 Payload Too Large",
         _ => "Error",
     }
 }
@@ -2581,6 +2689,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "de_DE" => match status {
             StatusCode::FORBIDDEN => "Sie haben keine Zugriffsberechtigung für diese Seite.",
             StatusCode::METHOD_NOT_ALLOWED => "Methode ist nicht zulässig.",
+            StatusCode::PAYLOAD_TOO_LARGE => "Die übermittelten Daten sind zu groß.",
             status if status.as_u16() == 419 => {
                 "Token stimmt nicht überein. Laden Sie die Seite neu."
             }
@@ -2594,6 +2703,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "es_ES" => match status {
             StatusCode::FORBIDDEN => "No tiene permiso para accesar esta página.",
             StatusCode::METHOD_NOT_ALLOWED => "Método no permitido.",
+            StatusCode::PAYLOAD_TOO_LARGE => "Los datos enviados son demasiado grandes.",
             status if status.as_u16() == 419 => "El token no coincide, intente recargar la página.",
             StatusCode::NOT_FOUND => "No hay nada.",
             StatusCode::INTERNAL_SERVER_ERROR => "Por favor intente más tarde.",
@@ -2603,6 +2713,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "fr_FR" => match status {
             StatusCode::FORBIDDEN => "Vous n'avez pas la permission d'accéder à cette page.",
             StatusCode::METHOD_NOT_ALLOWED => "Méthode non autorisée.",
+            StatusCode::PAYLOAD_TOO_LARGE => "Les données envoyées sont trop volumineuses.",
             status if status.as_u16() == 419 => {
                 "Le jeton ne correspond pas, essayez de recharger la page."
             }
@@ -2614,6 +2725,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "ko_KR" => match status {
             StatusCode::FORBIDDEN => "이 페이지의 액세스 권한이 없습니다.",
             StatusCode::METHOD_NOT_ALLOWED => "지원되지 않는 방법입니다.",
+            StatusCode::PAYLOAD_TOO_LARGE => "전송한 데이터가 너무 큽니다.",
             status if status.as_u16() == 419 => "Token does not match, try reloading the page.",
             StatusCode::NOT_FOUND => "여기에 아무것도 없어!",
             StatusCode::INTERNAL_SERVER_ERROR => "나중에 다시 시도해주십시오.",
@@ -2623,6 +2735,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "ru_RU" => match status {
             StatusCode::FORBIDDEN => "У вас нет прав доступа для этой страницы.",
             StatusCode::METHOD_NOT_ALLOWED => "Метод не поддерживается.",
+            StatusCode::PAYLOAD_TOO_LARGE => "Размер отправленных данных слишком велик.",
             status if status.as_u16() == 419 => {
                 "Токен не совпадает, попробуйте перезагрузить страницу."
             }
@@ -2636,6 +2749,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "zh_CN" => match status {
             StatusCode::FORBIDDEN => "您无权访问此页面。",
             StatusCode::METHOD_NOT_ALLOWED => "不允许的 HTTP 请求方法",
+            StatusCode::PAYLOAD_TOO_LARGE => "提交的数据过大。",
             status if status.as_u16() == 419 => "Token 不正确，请尝试刷新页面",
             StatusCode::NOT_FOUND => "这里什么都没有哦",
             StatusCode::INTERNAL_SERVER_ERROR => "服务器内部错误，请稍后再试。",
@@ -2645,6 +2759,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "zh_TW" => match status {
             StatusCode::FORBIDDEN => "您無權使用這個頁面。",
             StatusCode::METHOD_NOT_ALLOWED => "請求不被允許。",
+            StatusCode::PAYLOAD_TOO_LARGE => "提交的資料過大。",
             status if status.as_u16() == 419 => "Token 不匹配，請嘗試重新載入該頁。",
             StatusCode::NOT_FOUND => "這裡甚麼都沒有。",
             StatusCode::INTERNAL_SERVER_ERROR => "請稍後再試一次。",
@@ -2654,6 +2769,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         _ => match status {
             StatusCode::FORBIDDEN => "You have no permission to access this page.",
             StatusCode::METHOD_NOT_ALLOWED => "Method not allowed.",
+            StatusCode::PAYLOAD_TOO_LARGE => "The submitted data is too large.",
             status if status.as_u16() == 419 => "CSRF token mismatched.",
             StatusCode::NOT_FOUND => "Nothing here.",
             StatusCode::INTERNAL_SERVER_ERROR => "Please try again later.",
@@ -19433,6 +19549,7 @@ mod tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             rust_version: "test",
             legacy_app_version: "test".to_owned(),
+            post_max_size_bytes: 8 * 1024 * 1024,
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
@@ -21654,6 +21771,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_post_size_gate_matches_php_content_length_comparison() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("1024"),
+        );
+        assert!(!super::post_content_length_exceeds(&headers, 1024));
+        assert!(super::post_content_length_exceeds(&headers, 1023));
+        assert!(!super::post_content_length_exceeds(&headers, 0));
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("not-a-number"),
+        );
+        assert!(!super::post_content_length_exceeds(&headers, 1));
+    }
+
+    #[test]
     fn legacy_browser_gate_matches_php_versions_and_web_route_groups() {
         assert!(super::legacy_unsupported_browser(
             "Mozilla/5.0 Chrome/54.0.2840.99 Safari/537.36"
@@ -21781,6 +21915,7 @@ mod tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             rust_version: "test",
             legacy_app_version: "test".to_owned(),
+            post_max_size_bytes: 8 * 1024 * 1024,
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
@@ -22663,6 +22798,7 @@ mod tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             rust_version: "0.1.0-test",
             legacy_app_version: "6.0.2".to_owned(),
+            post_max_size_bytes: 8 * 1024 * 1024,
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: crate::config::DatabaseConfig {
@@ -27868,6 +28004,64 @@ mod tests {
         let legacy_replay = session_request(&app, &legacy_cookie, "GET", "/user", None).await;
         assert_eq!(legacy_replay.status(), StatusCode::SEE_OTHER);
         assert_eq!(legacy_replay.headers()[LOCATION], "/auth/login");
+
+        let oversized_html_request = app
+            .clone()
+            .oneshot(
+                Request::post("/auth/login")
+                    .header("accept", "text/html")
+                    .header(CONTENT_LENGTH, (8 * 1024 * 1024 + 1).to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized_html_request.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(
+            oversized_html_request.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let oversized_html = String::from_utf8(
+            to_bytes(oversized_html_request.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(oversized_html.contains("413 Payload Too Large"));
+        let oversized_api_request = app
+            .clone()
+            .oneshot(
+                Request::post("/api")
+                    .header("accept", "application/json")
+                    .header(CONTENT_LENGTH, (8 * 1024 * 1024 + 1).to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized_api_request.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(
+            oversized_api_request.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let oversized_api_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(oversized_api_request.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(oversized_api_body["message"], "Payload Too Large");
 
         let maintenance_dir = setup_storage.join("framework");
         std::fs::create_dir_all(&maintenance_dir).unwrap();

@@ -146,7 +146,7 @@ server {
 }
 ```
 
-将 `APP_URL` 设为 `https://skin.example.com`，并在反向代理处配置证书和 HTTP 到 HTTPS 跳转。
+将 `APP_URL` 设为 `https://skin.example.com`，并在反向代理处配置证书和 HTTP 到 HTTPS 跳转。`BS_POST_MAX_SIZE` 控制 Rust 的全局请求大小检查，支持字节数或 `K`、`M`、`G` 后缀，默认 `8M`；迁移时将它设为旧 PHP 的 `post_max_size`，并确保反向代理的 `client_max_body_size` 不低于该值。设为 `0` 可关闭 PHP 兼容的 `Content-Length` 检查；JSON 和表单预处理仍有 32 MiB 的内存缓冲上限。
 
 Rust 会继续读取旧站的 `auto_detect_asset_url`、`site_url` 和 `force_ssl` 选项：自动检测开启时使用请求的 `Host`，关闭时使用有效的 `site_url`；`force_ssl` 或安全的反向代理头会强制生成 HTTPS URL。反向代理应保留并校验 `Host`，并按示例传递 `X-Forwarded-Proto`。缺少有效请求 Host 时回退到 `APP_URL`。
 
@@ -157,7 +157,7 @@ Rust 会继续读取旧站的 `auto_detect_asset_url`、`site_url` 和 `force_ss
 ### 切换前
 
 1. 备份数据库和完整纹理目录，记录备份时间、文件数量及纹理哈希清单。先在隔离副本上验证，不直接对唯一生产数据做试运行。
-2. 为 Rust 配置与旧站相同的 `DB_CONNECTION`、`DB_PREFIX`、`DB_SOCKET`（如有）、`TEXTURES_DIR`、`PWD_METHOD`、`SALT`、Passport 公私钥及 `APP_URL`。不要运行新站安装器，也不要更换 Passport 密钥。
+2. 为 Rust 配置与旧站相同的 `DB_CONNECTION`、`DB_PREFIX`、`DB_SOCKET`（如有）、`TEXTURES_DIR`、`PWD_METHOD`、`SALT`、Passport 公私钥及 `APP_URL`，并把旧 PHP `post_max_size` 的值映射到 `BS_POST_MAX_SIZE`。不要运行新站安装器，也不要更换 Passport 密钥。
 3. 用 PHP 生成并保存代表性请求样本：Yggdrasil/CustomSkin、OAuth、用户与管理接口、纹理读取、图片预览和页面请求。记录状态码、内容类型、JSON 字段与错误体、ETag/缓存头及可稳定比较的响应内容；影子比较器仅重放无 session 和文件缓存副作用的只读白名单，上传、预览缓存及网页登录页面需在隔离副本中另行验证。
 4. 检查所需插件是否已有 WASM 移植版本。Rust 不执行 PHP 插件；未移植插件的功能必须在切换前安排替代或接受停用。
 

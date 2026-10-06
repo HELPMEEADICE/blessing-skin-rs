@@ -2056,6 +2056,7 @@ mod integration_tests {
             bind: "127.0.0.1:3000".parse().unwrap(),
             rust_version: "test",
             legacy_app_version: "test".to_owned(),
+            post_max_size_bytes: 8 * 1024 * 1024,
             locale: "en".to_owned(),
             fallback_locale: "en".to_owned(),
             database: DatabaseConfig {

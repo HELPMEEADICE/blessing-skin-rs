@@ -7,6 +7,7 @@ const LEGACY_SQLITE_DATABASE_PATH: &str = "database/database.sqlite";
 const DEFAULT_RUST_RELEASES_API_URL: &str =
     "https://api.github.com/repos/HELPMEEADICE/blessing-skin-rs/releases/latest";
 const DEFAULT_LEGACY_APP_VERSION: &str = "6.0.2";
+const DEFAULT_POST_MAX_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Read an environment value using Laravel's reserved `.env` value semantics.
 /// Laravel's `Env::get` converts `null` and `(null)` to `None`, and `empty` and
@@ -46,6 +47,7 @@ pub struct Config {
     pub bind: SocketAddr,
     pub rust_version: &'static str,
     pub legacy_app_version: String,
+    pub post_max_size_bytes: usize,
     pub locale: String,
     pub fallback_locale: String,
     pub database: DatabaseConfig,
@@ -122,6 +124,8 @@ pub enum ConfigError {
     InvalidTablePrefix,
     #[error("invalid database setup value")]
     InvalidSetupValue,
+    #[error("BS_POST_MAX_SIZE must be a byte count or use a K, M, or G suffix")]
+    InvalidPostMaxSize,
     #[error("invalid DATABASE_URL for the selected DB_CONNECTION")]
     InvalidDatabaseUrl,
 }
@@ -142,6 +146,8 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| storage.join("textures"));
         let passport_public_key = load_passport_public_key(&storage);
+        let post_max_size_bytes = parse_post_max_size(legacy_env("BS_POST_MAX_SIZE"))
+            .ok_or(ConfigError::InvalidPostMaxSize)?;
 
         let plugins_dir = legacy_env_os("PLUGINS_DIR")
             .map(PathBuf::from)
@@ -152,6 +158,7 @@ impl Config {
             bind,
             rust_version: env!("CARGO_PKG_VERSION"),
             legacy_app_version: legacy_app_version(legacy_env("BS_LEGACY_APP_VERSION")),
+            post_max_size_bytes,
             locale: legacy_env("APP_LOCALE").unwrap_or_else(|| "zh_CN".to_owned()),
             fallback_locale: legacy_env("APP_FALLBACK_LOCALE").unwrap_or_else(|| "en".to_owned()),
             database: DatabaseConfig::from_env(table_prefix)?,
@@ -192,6 +199,29 @@ fn legacy_app_version(value: Option<String>) -> String {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_LEGACY_APP_VERSION.to_owned())
+}
+
+fn parse_post_max_size(value: Option<String>) -> Option<usize> {
+    let bytes = match value {
+        Some(value) => parse_php_ini_size(&value)?,
+        None => DEFAULT_POST_MAX_SIZE_BYTES,
+    };
+    usize::try_from(bytes).ok()
+}
+
+fn parse_php_ini_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match value.as_bytes().last()?.to_ascii_uppercase() {
+        b'K' => (&value[..value.len() - 1], 1024_u64),
+        b'M' => (&value[..value.len() - 1], 1024_u64.pow(2)),
+        b'G' => (&value[..value.len() - 1], 1024_u64.pow(3)),
+        last if last.is_ascii_digit() => (value, 1),
+        _ => return None,
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(multiplier)
 }
 
 fn parse_session_lifetime_seconds(value: Option<String>) -> u64 {
@@ -567,8 +597,8 @@ mod tests {
     use super::{
         ConfigError, DatabaseConfig, DatabaseConnection, MailConfig, is_legacy_false,
         legacy_app_version, mysql_connect_options, parse_bcrypt_rounds, parse_legacy_env_os,
-        parse_legacy_env_value, parse_session_lifetime_seconds, valid_table_prefix,
-        with_mysql_ssl_ca,
+        parse_legacy_env_value, parse_post_max_size, parse_session_lifetime_seconds,
+        valid_table_prefix, with_mysql_ssl_ca,
     };
     use sqlx::{ConnectOptions, mysql::MySqlConnectOptions};
     use std::{ffi::OsString, path::Path};
@@ -589,6 +619,33 @@ mod tests {
         assert_eq!(
             parse_session_lifetime_seconds(Some("invalid".to_owned())),
             7_200
+        );
+    }
+
+    #[test]
+    fn parses_php_post_max_size_values_and_defaults() {
+        assert_eq!(parse_post_max_size(None), Some(8 * 1024 * 1024));
+        assert_eq!(parse_post_max_size(Some("0".to_owned())), Some(0));
+        assert_eq!(
+            parse_post_max_size(Some("512K".to_owned())),
+            Some(512 * 1024)
+        );
+        assert_eq!(
+            parse_post_max_size(Some("8m".to_owned())),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_post_max_size(Some(" 2G ".to_owned())),
+            usize::try_from(2_u64 * 1024 * 1024 * 1024).ok()
+        );
+        assert_eq!(
+            parse_post_max_size(Some("8388608".to_owned())),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(parse_post_max_size(Some("8MB".to_owned())), None);
+        assert_eq!(
+            parse_post_max_size(Some("18446744073709551615G".to_owned())),
+            None
         );
     }
 
