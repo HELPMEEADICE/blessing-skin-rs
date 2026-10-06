@@ -4,7 +4,7 @@
   "description": "A web application brings your custom skins back in offline Minecraft servers.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bs-community/blessing-skin-server"
+    "url": "https://github.com/HELPMEEADICE/blessing-skin-rs"
   },
   "author": "printempw",
   "license": "MIT",
