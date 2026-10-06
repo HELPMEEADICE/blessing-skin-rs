@@ -17052,38 +17052,57 @@ async fn apply_admin_user_mutation(
 }
 
 fn admin_user_success(mutation: AdminUserMutation, locale: &str, value: Option<&str>) -> Response {
-    let chinese = locale.starts_with("zh");
-    let message = match (mutation, chinese) {
-        (AdminUserMutation::Email, true) => "邮箱修改成功".to_owned(),
-        (AdminUserMutation::Email, false) => "Email changed successfully.".to_owned(),
-        (AdminUserMutation::Verification, true) => "用户的邮箱验证状态已修改".to_owned(),
-        (AdminUserMutation::Verification, false) => {
-            "Account verification status toggled successfully.".to_owned()
-        }
-        (AdminUserMutation::Nickname, true) => {
-            format!("昵称已成功设置为 {}", value.unwrap_or_default())
-        }
-        (AdminUserMutation::Nickname, false) => "Nickname changed successfully.".to_owned(),
-        (AdminUserMutation::Password, true) => "密码修改成功".to_owned(),
-        (AdminUserMutation::Password, false) => "Password changed successfully.".to_owned(),
-        (AdminUserMutation::Score, true) => "积分修改成功".to_owned(),
-        (AdminUserMutation::Score, false) => "Score changed successfully.".to_owned(),
-        (AdminUserMutation::Permission, true) => "权限已更改".to_owned(),
-        (AdminUserMutation::Permission, false) => "Permission updated.".to_owned(),
-        (AdminUserMutation::Delete, true) => "账号已被成功删除".to_owned(),
-        (AdminUserMutation::Delete, false) => {
-            "The account has been deleted successfully.".to_owned()
-        }
+    let (path, key, fallback): (&[&str], &str, &str) = match mutation {
+        AdminUserMutation::Email => (
+            &["users", "operations", "email"],
+            "success",
+            "Email changed successfully.",
+        ),
+        AdminUserMutation::Verification => (
+            &["users", "operations", "verification"],
+            "success",
+            "Account verification status toggled successfully.",
+        ),
+        AdminUserMutation::Nickname => (
+            &["users", "operations", "nickname"],
+            "success",
+            "Nickname changed successfully.",
+        ),
+        AdminUserMutation::Password => (
+            &["users", "operations", "password"],
+            "success",
+            "Password changed successfully.",
+        ),
+        AdminUserMutation::Score => (
+            &["users", "operations", "score"],
+            "success",
+            "Score changed successfully.",
+        ),
+        AdminUserMutation::Permission => (
+            &["users", "operations"],
+            "permission",
+            "Permission updated.",
+        ),
+        AdminUserMutation::Delete => (
+            &["users", "operations", "delete"],
+            "success",
+            "The account has been deleted successfully.",
+        ),
     };
+    let message = crate::mail_templates::legacy_translation(locale, "admin", path, key)
+        .unwrap_or_else(|| fallback.to_owned())
+        .replace(":new", value.unwrap_or_default());
     login_result(0, &message, None)
 }
 
 fn admin_user_permission_error(locale: &str) -> Response {
-    let message = if locale.starts_with("zh") {
-        "你无权操作此用户"
-    } else {
-        "You have no permission to operate this user."
-    };
+    let message = crate::mail_templates::legacy_translation(
+        locale,
+        "admin",
+        &["users", "operations"],
+        "no-permission",
+    )
+    .unwrap_or_else(|| "You have no permission to operate this user.".to_owned());
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({ "code": 1, "message": message })),
@@ -17573,7 +17592,7 @@ async fn apply_admin_player_mutation(
                 Ok(None) => {
                     return login_result(
                         1,
-                        admin_user_missing_message(&request_locale(&state)),
+                        &admin_user_missing_message(&request_locale(&state)),
                         None,
                     );
                 }
@@ -17723,12 +17742,14 @@ async fn apply_admin_player_mutation(
     }
 }
 
-fn admin_user_missing_message(locale: &str) -> &'static str {
-    if locale.starts_with("zh") {
-        "用户不存在"
-    } else {
-        "No such user."
-    }
+fn admin_user_missing_message(locale: &str) -> String {
+    crate::mail_templates::legacy_translation(
+        locale,
+        "admin",
+        &["users", "operations"],
+        "non-existent",
+    )
+    .unwrap_or_else(|| "No such user.".to_owned())
 }
 
 fn admin_texture_missing_message(tid: i64, locale: &str) -> String {
@@ -28428,22 +28449,22 @@ mod tests {
 
         for (uri, body, content_type, expected) in [
             (
-                "/admin/users/8/email",
+                "/admin/users/8/email?lang=es_ES",
                 "email=uploader2%40example.test",
                 "application/x-www-form-urlencoded",
-                "Email changed successfully.",
+                "Email cambiado con éxito.",
             ),
             (
-                "/admin/users/8/nickname?nickname=Target%20User",
+                "/admin/users/8/nickname?nickname=Target%20User&lang=es_ES",
                 "",
                 "application/x-www-form-urlencoded",
-                "Nickname changed successfully.",
+                "El apodo se ha modificado con éxito.",
             ),
             (
-                "/admin/users/8/score",
+                "/admin/users/8/score?lang=es_ES",
                 r#"{"score":17}"#,
                 "application/json",
-                "Score changed successfully.",
+                "Puntuación cambiada con éxito.",
             ),
         ] {
             let response = app
@@ -28476,7 +28497,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/admin/users/8/permission")
+                    .uri("/admin/users/8/permission?lang=es_ES")
                     .header(
                         "cookie",
                         format!("{}; {}", cookie.clone(), test_csrf_cookie),
@@ -28489,6 +28510,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(promoted.status(), StatusCode::FORBIDDEN);
+        let promoted_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(promoted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            promoted_body["message"],
+            "No tienes permiso para operar este usuario."
+        );
+        sqlx::query("UPDATE users SET locale = 'en' WHERE uid = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
         let self_role_change = app
             .clone()
             .oneshot(
