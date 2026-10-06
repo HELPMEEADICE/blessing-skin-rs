@@ -1940,6 +1940,46 @@ async fn web_not_found(
     }
 }
 
+fn legacy_web_route(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if path == "/oauth/token" {
+        return false;
+    }
+    [
+        "/auth",
+        "/user",
+        "/texture",
+        "/skinlib",
+        "/admin",
+        "/setup",
+        "/oauth",
+        "/.well-known",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn legacy_unsupported_browser(user_agent: &str) -> bool {
+    if user_agent.contains("Trident") || user_agent.contains("MSIE") {
+        return true;
+    }
+    let Some(version) = user_agent
+        .split_once("Chrome/")
+        .map(|(_, version)| {
+            version
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|version| version.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    version < 55
+}
+
 fn should_render_html_error(path: &str, headers: &HeaderMap) -> bool {
     if path == "/api"
         || path.starts_with("/api/")
@@ -2237,6 +2277,26 @@ async fn render_html_error_page(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let request_headers = request.headers().clone();
+    if legacy_web_route(&path)
+        && request_headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(legacy_unsupported_browser)
+    {
+        let locale = request_locale(&state);
+        let message = crate::mail_templates::legacy_translation(
+            &locale,
+            "errors",
+            &["http"],
+            "ie",
+        )
+        .unwrap_or_else(|| {
+            "Your browser isn't supported. Please switch to other modern browsers, such as Firefox or Chrome."
+                .to_owned()
+        });
+        let copy = legacy_pretty_error_message(&locale, 0, &message);
+        return render_legacy_pretty_error_copy(&state, locale, 0, copy).await;
+    }
     let response = next.run(request).await;
     let status = response.status();
     if !matches!(
@@ -21124,6 +21184,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_browser_gate_matches_php_versions_and_web_route_groups() {
+        assert!(super::legacy_unsupported_browser(
+            "Mozilla/5.0 Chrome/54.0.2840.99 Safari/537.36"
+        ));
+        assert!(!super::legacy_unsupported_browser(
+            "Mozilla/5.0 Chrome/55.0.2883.75 Safari/537.36"
+        ));
+        assert!(!super::legacy_unsupported_browser(
+            "Mozilla/5.0 Firefox/52.0"
+        ));
+        assert!(super::legacy_unsupported_browser(
+            "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko"
+        ));
+        assert!(super::legacy_unsupported_browser(
+            "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1)"
+        ));
+
+        assert!(super::legacy_web_route("/"));
+        assert!(super::legacy_web_route("/auth/login"));
+        assert!(super::legacy_web_route("/oauth/authorize"));
+        assert!(super::legacy_web_route("/.well-known/change-password"));
+        assert!(!super::legacy_web_route("/api/user"));
+        assert!(!super::legacy_web_route("/oauth/token"));
+        assert!(!super::legacy_web_route("/textures/abcd"));
+        assert!(!super::legacy_web_route("/Alex.json"));
+    }
+
+    #[test]
     fn legacy_pretty_exception_copy_uses_the_selected_locale() {
         let (title, code, detail) = super::legacy_pretty_error_copy(
             "zh_CN",
@@ -21308,6 +21396,62 @@ mod tests {
         .unwrap();
         assert!(welcome_html.contains("Welcome"));
         assert!(welcome_html.contains("http://localhost/app/app.012abcd.js"));
+        let unsupported_browser = app
+            .clone()
+            .oneshot(
+                Request::get("/setup")
+                    .header(
+                        "user-agent",
+                        "Mozilla/5.0 Chrome/54.0.2840.99 Safari/537.36",
+                    )
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported_browser.status(), StatusCode::OK);
+        let unsupported_browser_html = String::from_utf8(
+            to_bytes(unsupported_browser.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(unsupported_browser_html.contains("Error code: 0"));
+        assert!(unsupported_browser_html.contains("Your browser isn&#39;t supported."));
+        let api_baseline = app
+            .clone()
+            .oneshot(Request::get("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let api_baseline_status = api_baseline.status();
+        let api_baseline_content_type = api_baseline.headers().get(CONTENT_TYPE).cloned();
+        let unsupported_api_browser = app
+            .clone()
+            .oneshot(
+                Request::get("/api")
+                    .header(
+                        "user-agent",
+                        "Mozilla/5.0 Chrome/54.0.2840.99 Safari/537.36",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported_api_browser.status(), api_baseline_status);
+        assert_eq!(
+            unsupported_api_browser.headers().get(CONTENT_TYPE),
+            api_baseline_content_type.as_ref()
+        );
+        let unsupported_api_browser_body_bytes =
+            to_bytes(unsupported_api_browser.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        let unsupported_api_browser_body =
+            String::from_utf8_lossy(&unsupported_api_browser_body_bytes);
+        assert!(!unsupported_api_browser_body.contains("Your browser isn"));
         let encoded_welcome_globals = welcome_html
             .split("atob('")
             .nth(1)
