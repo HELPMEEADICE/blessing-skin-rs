@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>404 Not Found - {{ site_name }}</title>
+  <style>
+    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
+    main{max-width:760px;margin:12vh auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002;text-align:center}
+    h1{font-size:1.6rem}h1 a{color:#007bff;text-decoration:none}
+    .divider{height:1px;background:#dfe3e8;margin:1.5rem 0}
+    h2{margin-top:3rem}p{color:#59636e;line-height:1.6}
+  </style>
+</head>
+<body>
+  <main>
+    <h1><a href="{{ home_url }}">{{ site_name }}</a></h1>
+    <div class="divider"></div>
+    <h2>404 Not Found</h2>
+    <p>{{ message }}</p>
+    <div class="divider"></div>
+  </main>
+</body>
+</html>

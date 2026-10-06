@@ -1611,6 +1611,7 @@ async fn clear_player_textures_with_plugins(
 
 pub fn router(state: AppState) -> Router {
     let app = Router::new()
+        .fallback(web_not_found)
         .route("/health/live", any(live))
         .route("/health/ready", any(ready))
         .route("/app/{*path}", get(frontend_asset))
@@ -1886,6 +1887,81 @@ pub fn router(state: AppState) -> Router {
         app
     };
     app.with_state(state)
+}
+
+async fn web_not_found(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if !should_render_html_not_found(uri.path(), &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let locale = request_locale(&state);
+    let page = NotFoundPage {
+        locale: locale.clone(),
+        site_name: site_name(&state).await,
+        message: not_found_message(&locale).to_owned(),
+        home_url: request_app_url(&state),
+    };
+    match page.render() {
+        Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render not found page");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
+fn should_render_html_not_found(path: &str, headers: &HeaderMap) -> bool {
+    if path == "/api"
+        || path.starts_with("/api/")
+        || path.starts_with("/csl/")
+        || path.starts_with("/textures/")
+        || path.starts_with("/raw/")
+        || path.starts_with("/avatar/")
+        || path.starts_with("/preview/")
+        || path == "/oauth/token"
+    {
+        return false;
+    }
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|media_range| {
+                let mut parts = media_range.trim().split(';');
+                let media_type = parts.next().unwrap_or_default().trim();
+                let quality = parts
+                    .filter_map(|parameter| parameter.trim().strip_prefix("q="))
+                    .filter_map(|value| value.parse::<f32>().ok())
+                    .next()
+                    .unwrap_or(1.0);
+                media_type.eq_ignore_ascii_case("text/html") && quality > 0.0
+            })
+        })
+}
+
+fn not_found_message(locale: &str) -> &'static str {
+    match locale {
+        "de_DE" => "Hier ist nichts.",
+        "es_ES" => "No hay nada.",
+        "fr_FR" => "Il n'y a rien ici.",
+        "ko_KR" => "여기에 아무것도 없어!",
+        "ru_RU" => "Здесь пусто.",
+        "zh_CN" => "这里什么都没有哦",
+        "zh_TW" => "這裡甚麼都沒有。",
+        _ => "Nothing here.",
+    }
+}
+
+#[derive(Template)]
+#[template(path = "not_found.html")]
+struct NotFoundPage {
+    locale: String,
+    site_name: String,
+    message: String,
+    home_url: String,
 }
 
 #[derive(Template)]
@@ -18512,6 +18588,118 @@ mod tests {
         public_download_ip, render_cape_preview, render_skin_avatar, render_skin_preview,
         resolve_legacy_home_background, router, safe_remote_component_url, valid_texture_hash,
     };
+
+    #[tokio::test]
+    async fn unknown_html_page_renders_localized_404_but_api_keeps_plain_404() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, StatusCode, header::CONTENT_TYPE},
+        };
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "blessing-skin-not-found-{}",
+            super::setup_csrf_token()
+        ));
+        let storage_dir = root.join("storage");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::write(storage_dir.join("install.lock"), b"").unwrap();
+        let config = crate::config::Config {
+            bind: "127.0.0.1:3000".parse().unwrap(),
+            rust_version: "test",
+            legacy_app_version: "test".to_owned(),
+            locale: "en".to_owned(),
+            fallback_locale: "en".to_owned(),
+            database: crate::config::DatabaseConfig {
+                connection: crate::config::DatabaseConnection::Sqlite(SqliteConnectOptions::new()),
+                table_prefix: String::new(),
+                driver: "SQLite".to_owned(),
+                host: None,
+                port: None,
+                username: None,
+                database: "test.sqlite".to_owned(),
+            },
+            textures_dir: root.join("textures"),
+            plugins_dir: root.join("plugins"),
+            wasm_plugin_registry_url: None,
+            rust_releases_api_url: None,
+            app_url: "http://localhost/skin".to_owned(),
+            passport_public_key: None,
+            passport_private_key: None,
+            password_method: "BCRYPT".to_owned(),
+            password_salt: String::new(),
+            bcrypt_rounds: 10,
+            app_key: None,
+            session_lifetime_seconds: 7_200,
+            mail: crate::config::MailConfig::default(),
+        };
+        let app = router(crate::AppState {
+            config: Arc::new(config),
+            database: None,
+            passport_key: None,
+            passport_signing_key: None,
+            session_key: None,
+            revoked_web_sessions: Default::default(),
+            login_failures: Default::default(),
+            captcha_challenges: Default::default(),
+            mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
+            storage_dir,
+            env_file: root.join(".env"),
+            public_dir: root.join("public"),
+            wasm_plugins: Vec::new(),
+            wasm_plugin_load_failures: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
+            wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
+        });
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get("/missing/this/page")
+                    .header("accept", "text/html")
+                    .header("accept-language", "zh-CN")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::NOT_FOUND);
+        assert!(
+            page.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let page = String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(page.contains(r#"<html lang="zh_CN">"#));
+        assert!(page.contains("这里什么都没有哦"));
+        assert!(page.contains(r#"name="robots" content="noindex,nofollow""#));
+
+        let api_not_found = app
+            .oneshot(
+                Request::get("/api/missing")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_not_found.status(), StatusCode::NOT_FOUND);
+        let api_not_found = to_bytes(api_not_found.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!api_not_found.starts_with(b"<!doctype html>"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn old_default_home_background_uses_the_available_webp_asset() {
