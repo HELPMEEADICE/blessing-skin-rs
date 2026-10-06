@@ -6291,6 +6291,7 @@ struct AdminDashboardPage {
 #[template(path = "admin_status.html")]
 struct AdminStatusPage {
     site_name: String,
+    copy: AdminStatusPageCopy,
     locale: String,
     groups: Vec<AdminStatusGroup>,
     wasm_plugins: Vec<String>,
@@ -6300,6 +6301,13 @@ struct AdminStatusPage {
     frontend_script_available: bool,
     frontend_script: String,
     frontend_globals_b64: String,
+}
+
+struct AdminStatusPageCopy {
+    title: String,
+    back: String,
+    plugins_title: String,
+    no_plugins: String,
 }
 
 #[derive(Template)]
@@ -7395,6 +7403,93 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     }
 }
 
+fn admin_status_field_label(locale: &str, path: &[&str], key: &str, fallback: &str) -> String {
+    crate::mail_templates::legacy_translation(locale, "admin", path, key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn admin_status_page_title(locale: &str) -> &'static str {
+    match locale {
+        "de_DE" => "Systemstatus",
+        "el_GR" => "Κατάσταση συστήματος",
+        "en" => "System status",
+        "es_ES" => "Estado del sistema",
+        "fr_FR" => "État du système",
+        "it_IT" => "Stato del sistema",
+        "ja_JP" => "システム状態",
+        "ko_KR" => "시스템 상태",
+        "nl_NL" => "Systeemstatus",
+        "pt_PT" => "Estado do sistema",
+        "ru_RU" => "Состояние системы",
+        "zh_CN" => "系统状态",
+        "zh_TW" => "系統狀態",
+        _ => "System status",
+    }
+}
+
+fn admin_status_runtime_label(locale: &str) -> &'static str {
+    match locale {
+        "zh_CN" => "运行时",
+        "zh_TW" => "執行環境",
+        "es_ES" => "Entorno de ejecución",
+        "ru_RU" => "Среда выполнения",
+        _ => "Runtime",
+    }
+}
+
+fn admin_status_yes_no(locale: &str, value: bool) -> &'static str {
+    let (yes, no) = match locale {
+        "de_DE" => ("Ja", "Nein"),
+        "el_GR" => ("Ναι", "Όχι"),
+        "en" => ("Yes", "No"),
+        "es_ES" => ("Sí", "No"),
+        "fr_FR" => ("Oui", "Non"),
+        "it_IT" => ("Sì", "No"),
+        "ja_JP" => ("はい", "いいえ"),
+        "ko_KR" => ("예", "아니요"),
+        "nl_NL" => ("Ja", "Nee"),
+        "pt_PT" => ("Sim", "Não"),
+        "ru_RU" => ("Да", "Нет"),
+        "zh_CN" => ("是", "否"),
+        "zh_TW" => ("是", "否"),
+        _ => ("Yes", "No"),
+    };
+    if value { yes } else { no }
+}
+
+fn admin_status_page_copy(locale: &str, plugin_count: usize) -> AdminStatusPageCopy {
+    let title = admin_status_page_title(locale).to_owned();
+    let back = crate::mail_templates::legacy_translation(locale, "general", &[], "admin-panel")
+        .unwrap_or_else(|| "Admin dashboard".to_owned());
+    let plugins_title =
+        crate::mail_templates::legacy_translation(locale, "admin", &["status"], "plugins")
+            .unwrap_or_else(|| "Enabled plugins (:amount)".to_owned())
+            .replace(":amount", &plugin_count.to_string());
+    let no_plugins = match locale {
+        "de_DE" => "Keine WASM-Plugins geladen.",
+        "el_GR" => "Δεν έχουν φορτωθεί πρόσθετα WASM.",
+        "en" => "No WASM plugins loaded.",
+        "es_ES" => "No hay complementos WASM cargados.",
+        "fr_FR" => "Aucun plugin WASM n’est chargé.",
+        "it_IT" => "Nessun plugin WASM caricato.",
+        "ja_JP" => "WASM プラグインは読み込まれていません。",
+        "ko_KR" => "로드된 WASM 플러그인이 없습니다.",
+        "nl_NL" => "Er zijn geen WASM-plug-ins geladen.",
+        "pt_PT" => "Não há plugins WASM carregados.",
+        "ru_RU" => "Плагины WASM не загружены.",
+        "zh_CN" => "当前没有已加载的 WASM 插件。",
+        "zh_TW" => "目前沒有已載入的 WASM 外掛。",
+        _ => "No WASM plugins loaded.",
+    }
+    .to_owned();
+    AdminStatusPageCopy {
+        title,
+        back,
+        plugins_title,
+        no_plugins,
+    }
+}
+
 async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -7404,17 +7499,15 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let chinese = request_locale(&state).starts_with("zh");
+    let locale = request_locale(&state);
+    let copy = admin_status_page_copy(&locale, state.wasm_plugins.len());
     let debug = app_debug_enabled();
     let commit = crate::config::legacy_env("GIT_COMMIT")
         .or_else(|| crate::config::legacy_env("SOURCE_VERSION"))
         .unwrap_or_default();
     let commit = if commit.is_empty() {
-        if chinese {
-            "未知".to_owned()
-        } else {
-            "Unknown".to_owned()
-        }
+        crate::mail_templates::legacy_translation(&locale, "general", &[], "unknown")
+            .unwrap_or_else(|| "Unknown".to_owned())
     } else {
         commit.chars().take(16).collect()
     };
@@ -7424,88 +7517,106 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
             title: "Blessing Skin".to_owned(),
             fields: vec![
                 AdminStatusField {
-                    label: if chinese { "版本" } else { "Version" }.to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "bs"],
+                        "version",
+                        "Version",
+                    ),
                     value: state.config.legacy_app_version.clone(),
                 },
                 AdminStatusField {
-                    label: if chinese {
-                        "运行环境"
-                    } else {
-                        "Environment"
-                    }
-                    .to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "bs"],
+                        "env",
+                        "Application environment",
+                    ),
                     value: crate::config::legacy_env("APP_ENV")
                         .unwrap_or_else(|| "production".to_owned()),
                 },
                 AdminStatusField {
-                    label: if chinese {
-                        "调试模式"
-                    } else {
-                        "Debug mode"
-                    }
-                    .to_owned(),
-                    value: if chinese {
-                        if debug { "是" } else { "否" }
-                    } else if debug {
-                        "Yes"
-                    } else {
-                        "No"
-                    }
-                    .to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "bs"],
+                        "debug",
+                        "Debug mode",
+                    ),
+                    value: admin_status_yes_no(&locale, debug).to_owned(),
                 },
                 AdminStatusField {
-                    label: if chinese { "提交" } else { "Commit" }.to_owned(),
+                    label: admin_status_field_label(&locale, &["status", "bs"], "commit", "Commit"),
                     value: commit,
                 },
             ],
         },
         AdminStatusGroup {
-            title: if chinese { "服务" } else { "Server" }.to_owned(),
+            title: admin_status_field_label(&locale, &["status", "server"], "name", "Server"),
             fields: vec![
                 AdminStatusField {
-                    label: if chinese { "运行时" } else { "Runtime" }.to_owned(),
+                    label: admin_status_runtime_label(&locale).to_owned(),
                     value: "Rust / Axum / Tokio".to_owned(),
                 },
                 AdminStatusField {
-                    label: if chinese {
-                        "操作系统"
-                    } else {
-                        "Operating system"
-                    }
-                    .to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "server"],
+                        "os",
+                        "Operating system",
+                    ),
                     value: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
                 },
             ],
         },
         AdminStatusGroup {
-            title: if chinese { "数据库" } else { "Database" }.to_owned(),
+            title: admin_status_field_label(&locale, &["status", "db"], "name", "Database"),
             fields: vec![
                 AdminStatusField {
-                    label: if chinese { "类型" } else { "Type" }.to_owned(),
+                    label: admin_status_field_label(&locale, &["status", "db"], "type", "Type"),
                     value: database.driver.clone(),
                 },
                 AdminStatusField {
-                    label: if chinese { "主机" } else { "Host" }.to_owned(),
+                    label: admin_status_field_label(&locale, &["status", "db"], "host", "Host"),
                     value: database.host.clone().unwrap_or_else(|| "—".to_owned()),
                 },
                 AdminStatusField {
-                    label: if chinese { "端口" } else { "Port" }.to_owned(),
+                    label: admin_status_field_label(&locale, &["status", "db"], "port", "Port"),
                     value: database
                         .port
                         .map_or_else(|| "—".to_owned(), |port| port.to_string()),
                 },
                 AdminStatusField {
-                    label: if chinese { "用户名" } else { "Username" }.to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "db"],
+                        "username",
+                        "Username",
+                    ),
                     value: database.username.clone().unwrap_or_else(|| "—".to_owned()),
                 },
                 AdminStatusField {
-                    label: if chinese { "数据库" } else { "Database" }.to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "db"],
+                        "database",
+                        "Database",
+                    ),
                     value: database.database.clone(),
                 },
                 AdminStatusField {
-                    label: if chinese { "表前缀" } else { "Table prefix" }.to_owned(),
+                    label: admin_status_field_label(
+                        &locale,
+                        &["status", "db"],
+                        "prefix",
+                        "Table prefix",
+                    ),
                     value: if database.table_prefix.is_empty() {
-                        if chinese { "（空）" } else { "(none)" }.to_owned()
+                        if locale.starts_with("zh") {
+                            "（空）"
+                        } else {
+                            "(none)"
+                        }
+                        .to_owned()
                     } else {
                         database.table_prefix.clone()
                     },
@@ -7536,7 +7647,8 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     );
     let page = AdminStatusPage {
         site_name,
-        locale: request_locale(&state),
+        copy,
+        locale,
         groups,
         wasm_plugins,
         page_widgets,
@@ -20380,6 +20492,61 @@ mod tests {
         assert_eq!(russian.labels.notifications, "Уведомления");
         assert_eq!(russian.labels.no_players, "У вас пока нет игроков");
         assert_eq!(russian.announcement, "Объявление");
+    }
+
+    #[test]
+    fn admin_status_copy_uses_legacy_locales_and_plugin_count() {
+        let spanish = super::admin_status_page_copy("es_ES", 3);
+        assert_eq!(spanish.title, "Estado del sistema");
+        assert_eq!(spanish.back, "Panel de administración");
+        assert_eq!(spanish.plugins_title, "Plugins habilitados (3)");
+        assert_eq!(spanish.no_plugins, "No hay complementos WASM cargados.");
+        assert_eq!(super::admin_status_yes_no("es_ES", true), "Sí");
+        assert_eq!(super::admin_status_yes_no("ru_RU", false), "Нет");
+        assert_eq!(
+            super::admin_status_field_label("es_ES", &["status", "bs"], "env", "Environment"),
+            "Entorno de aplicación"
+        );
+        assert_eq!(
+            super::admin_status_field_label("es_ES", &["status", "db"], "prefix", "Table prefix"),
+            "Prefijo de tabla"
+        );
+    }
+
+    #[test]
+    fn admin_status_template_renders_legacy_localized_copy() {
+        let page = super::AdminStatusPage {
+            site_name: "Blessing Skin".to_owned(),
+            copy: super::admin_status_page_copy("es_ES", 0),
+            locale: "es_ES".to_owned(),
+            groups: vec![super::AdminStatusGroup {
+                title: "Base de datos".to_owned(),
+                fields: vec![super::AdminStatusField {
+                    label: super::admin_status_field_label(
+                        "es_ES",
+                        &["status", "db"],
+                        "prefix",
+                        "Table prefix",
+                    ),
+                    value: "bs_".to_owned(),
+                }],
+            }],
+            wasm_plugins: Vec::new(),
+            page_widgets: vec!["system_info".to_owned(), "plugins".to_owned()],
+            frontend_style_available: false,
+            frontend_stylesheet: String::new(),
+            frontend_script_available: false,
+            frontend_script: String::new(),
+            frontend_globals_b64: String::new(),
+        };
+        let html = page.render().unwrap();
+
+        assert!(html.contains("Estado del sistema - Blessing Skin"));
+        assert!(html.contains("Panel de administración"));
+        assert!(html.contains("Base de datos"));
+        assert!(html.contains("Prefijo de tabla"));
+        assert!(html.contains("Plugins habilitados (0)"));
+        assert!(html.contains("No hay complementos WASM cargados."));
     }
 
     #[test]

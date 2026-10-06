@@ -1,55 +1,127 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ locale }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% if locale.starts_with("zh") %}系统状态{% else %}System status{% endif %} - {{ site_name }}</title>
-  <style>
-    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}
-    main{max-width:960px;margin:4rem auto;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 8px 28px #0002}
-    header{display:flex;justify-content:space-between;align-items:center;gap:1rem}
-    section{margin-top:1.5rem;padding:1rem 1.25rem;background:#f4f6f9;border-radius:8px}
-    h2{font-size:1.1rem;margin:.25rem 0 1rem}
-    table{width:100%;border-collapse:collapse;background:white}
-    th,td{text-align:left;padding:.65rem;border:1px solid #d9dee5;overflow-wrap:anywhere}
-    th{width:35%;background:#f8f9fa}
-    @media(max-width:640px){main{margin:1rem;padding:1rem}th,td{padding:.45rem}}
-  </style>
-  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
-</head>
-<body><main id="admin-status-app">
-  <header>
-    <h1>{% if locale.starts_with("zh") %}系统状态{% else %}System status{% endif %} - {{ site_name }}</h1>
-    <a href="/admin">{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin dashboard{% endif %}</a>
-  </header>
-  {% for widget in page_widgets %}
-  {% if widget == "system_info" %}
-  {% for group in groups %}
-  <section>
-    <h2>{{ group.title }}</h2>
-    <table><tbody>
-      {% for field in group.fields %}
-      <tr><th scope="row">{{ field.label }}</th><td>{{ field.value }}</td></tr>
-      {% endfor %}
-    </tbody></table>
-  </section>
-  {% endfor %}
-  {% endif %}
-  {% if widget == "plugins" %}
-  <section>
-    <h2>{% if locale.starts_with("zh") %}已加载 WASM 插件（{{ wasm_plugins.len() }}）{% else %}Loaded WASM plugins ({{ wasm_plugins.len() }}){% endif %}</h2>
-    {% if wasm_plugins.is_empty() %}
-      <p>{% if locale.starts_with("zh") %}当前没有已加载的 WASM 插件。{% else %}No WASM plugins loaded.{% endif %}</p>
-    {% else %}
-      <table><tbody>
-        {% for plugin in wasm_plugins %}<tr><td>{{ plugin }}</td></tr>{% endfor %}
-      </tbody></table>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.title }} - {{ site_name }}</title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      main {
+        max-width: 960px;
+        margin: 4rem auto;
+        padding: 2rem;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 8px 28px #0002;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+      }
+      section {
+        margin-top: 1.5rem;
+        padding: 1rem 1.25rem;
+        background: #f4f6f9;
+        border-radius: 8px;
+      }
+      h2 {
+        font-size: 1.1rem;
+        margin: 0.25rem 0 1rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: white;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.65rem;
+        border: 1px solid #d9dee5;
+        overflow-wrap: anywhere;
+      }
+      th {
+        width: 35%;
+        background: #f8f9fa;
+      }
+      @media (max-width: 640px) {
+        main {
+          margin: 1rem;
+          padding: 1rem;
+        }
+        th,
+        td {
+          padding: 0.45rem;
+        }
+      }
+    </style>
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
     {% endif %}
-  </section>
-  {% endif %}
-  {% endfor %}
-</main>
-{% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
-</body>
+  </head>
+  <body>
+    <main id="admin-status-app">
+      <header>
+        <h1>{{ copy.title }} - {{ site_name }}</h1>
+        <a href="/admin">{{ copy.back }}</a>
+      </header>
+      {% for widget in page_widgets %} {% if widget == "system_info" %} {% for
+      group in groups %}
+      <section>
+        <h2>{{ group.title }}</h2>
+        <table>
+          <tbody>
+            {% for field in group.fields %}
+            <tr>
+              <th scope="row">{{ field.label }}</th>
+              <td>{{ field.value }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+      {% endfor %} {% endif %} {% if widget == "plugins" %}
+      <section>
+        <h2>{{ copy.plugins_title }}</h2>
+        {% if wasm_plugins.is_empty() %}
+        <p>{{ copy.no_plugins }}</p>
+        {% else %}
+        <table>
+          <tbody>
+            {% for plugin in wasm_plugins %}
+            <tr>
+              <td>{{ plugin }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </section>
+      {% endif %} {% endfor %}
+    </main>
+    {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
 </html>

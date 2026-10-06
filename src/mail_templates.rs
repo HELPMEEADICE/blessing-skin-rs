@@ -19,6 +19,7 @@ struct LocaleFiles {
     setup: &'static str,
     general: &'static str,
     front_end: &'static str,
+    admin: &'static str,
 }
 
 const LOCALES: &[LocaleFiles] = &[
@@ -30,6 +31,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/de_DE/setup.yml"),
         general: include_str!("../resources/lang/de_DE/general.yml"),
         front_end: include_str!("../resources/lang/de_DE/front-end.yml"),
+        admin: include_str!("../resources/lang/de_DE/admin.yml"),
     },
     LocaleFiles {
         locale: "el_GR",
@@ -39,6 +41,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/el_GR/setup.yml"),
         general: include_str!("../resources/lang/el_GR/general.yml"),
         front_end: include_str!("../resources/lang/el_GR/front-end.yml"),
+        admin: include_str!("../resources/lang/el_GR/admin.yml"),
     },
     LocaleFiles {
         locale: "en",
@@ -48,6 +51,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/en/setup.yml"),
         general: include_str!("../resources/lang/en/general.yml"),
         front_end: include_str!("../resources/lang/en/front-end.yml"),
+        admin: include_str!("../resources/lang/en/admin.yml"),
     },
     LocaleFiles {
         locale: "es_ES",
@@ -57,6 +61,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/es_ES/setup.yml"),
         general: include_str!("../resources/lang/es_ES/general.yml"),
         front_end: include_str!("../resources/lang/es_ES/front-end.yml"),
+        admin: include_str!("../resources/lang/es_ES/admin.yml"),
     },
     LocaleFiles {
         locale: "fr_FR",
@@ -66,6 +71,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/fr_FR/setup.yml"),
         general: include_str!("../resources/lang/fr_FR/general.yml"),
         front_end: include_str!("../resources/lang/fr_FR/front-end.yml"),
+        admin: include_str!("../resources/lang/fr_FR/admin.yml"),
     },
     LocaleFiles {
         locale: "it_IT",
@@ -75,6 +81,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/it_IT/setup.yml"),
         general: include_str!("../resources/lang/it_IT/general.yml"),
         front_end: include_str!("../resources/lang/it_IT/front-end.yml"),
+        admin: include_str!("../resources/lang/it_IT/admin.yml"),
     },
     LocaleFiles {
         locale: "ja_JP",
@@ -84,6 +91,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/ja_JP/setup.yml"),
         general: include_str!("../resources/lang/ja_JP/general.yml"),
         front_end: include_str!("../resources/lang/ja_JP/front-end.yml"),
+        admin: include_str!("../resources/lang/ja_JP/admin.yml"),
     },
     LocaleFiles {
         locale: "ko_KR",
@@ -93,6 +101,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/ko_KR/setup.yml"),
         general: include_str!("../resources/lang/ko_KR/general.yml"),
         front_end: include_str!("../resources/lang/ko_KR/front-end.yml"),
+        admin: include_str!("../resources/lang/ko_KR/admin.yml"),
     },
     LocaleFiles {
         locale: "nl_NL",
@@ -102,6 +111,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/nl_NL/setup.yml"),
         general: include_str!("../resources/lang/nl_NL/general.yml"),
         front_end: include_str!("../resources/lang/nl_NL/front-end.yml"),
+        admin: include_str!("../resources/lang/nl_NL/admin.yml"),
     },
     LocaleFiles {
         locale: "pt_PT",
@@ -111,6 +121,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/pt_PT/setup.yml"),
         general: include_str!("../resources/lang/pt_PT/general.yml"),
         front_end: include_str!("../resources/lang/pt_PT/front-end.yml"),
+        admin: include_str!("../resources/lang/pt_PT/admin.yml"),
     },
     LocaleFiles {
         locale: "ru_RU",
@@ -120,6 +131,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/ru_RU/setup.yml"),
         general: include_str!("../resources/lang/ru_RU/general.yml"),
         front_end: include_str!("../resources/lang/ru_RU/front-end.yml"),
+        admin: include_str!("../resources/lang/ru_RU/admin.yml"),
     },
     LocaleFiles {
         locale: "zh_CN",
@@ -129,6 +141,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/zh_CN/setup.yml"),
         general: include_str!("../resources/lang/zh_CN/general.yml"),
         front_end: include_str!("../resources/lang/zh_CN/front-end.yml"),
+        admin: include_str!("../resources/lang/zh_CN/admin.yml"),
     },
     LocaleFiles {
         locale: "zh_TW",
@@ -138,6 +151,7 @@ const LOCALES: &[LocaleFiles] = &[
         setup: include_str!("../resources/lang/zh_TW/setup.yml"),
         general: include_str!("../resources/lang/zh_TW/general.yml"),
         front_end: include_str!("../resources/lang/zh_TW/front-end.yml"),
+        admin: include_str!("../resources/lang/zh_TW/admin.yml"),
     },
 ];
 
@@ -167,6 +181,7 @@ pub(crate) fn legacy_translation(
         "setup" => (language.setup, english.setup),
         "general" => (language.general, english.general),
         "front-end" => (language.front_end, english.front_end),
+        "admin" => (language.admin, english.admin),
         _ => return None,
     };
     yaml_scalar(source, parent_path, key).or_else(|| yaml_scalar(english_source, parent_path, key))
@@ -416,6 +431,11 @@ mod tests {
                 "{}",
                 locale.locale
             );
+            assert!(
+                legacy_translation(locale.locale, "admin", &["status", "db"], "prefix").is_some(),
+                "{}",
+                locale.locale
+            );
             for index in 0..3 {
                 assert!(
                     super::legacy_translation_item(locale.locale, &["report"], "status", index)
@@ -432,6 +452,10 @@ mod tests {
         assert_eq!(
             legacy_translation_item("ru_RU", &["report"], "status", 2).as_deref(),
             Some("Отклонено")
+        );
+        assert_eq!(
+            legacy_translation("es_ES", "admin", &["status", "db"], "prefix").as_deref(),
+            Some("Prefijo de tabla")
         );
     }
 
