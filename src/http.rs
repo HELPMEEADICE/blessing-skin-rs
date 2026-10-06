@@ -2014,6 +2014,57 @@ fn http_error_page_message(locale: &str, status: StatusCode, detail: Option<Stri
     }
 }
 
+fn legacy_pretty_error_copy(
+    locale: &str,
+    code: i64,
+    catalog: &str,
+    parent_path: &[&str],
+    key: &str,
+    fallback: &str,
+) -> (String, String, String) {
+    let translation = |catalog, parent_path: &[&str], key, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, catalog, parent_path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let title = translation("errors", &["general"], "title", "Error occurred");
+    let code_template = translation("errors", &["exception"], "code", "Error code: :code");
+    let detail_template = translation("errors", &["exception"], "detail", "Details: :msg");
+    let detail = translation(catalog, parent_path, key, fallback);
+    (
+        title,
+        code_template.replace(":code", &code.to_string()),
+        detail_template.replace(":msg", &detail),
+    )
+}
+
+async fn render_legacy_pretty_error(
+    state: &AppState,
+    code: i64,
+    catalog: &str,
+    parent_path: &[&str],
+    key: &str,
+    fallback: &str,
+) -> Response {
+    let locale = request_locale(state);
+    let (title, code_message, detail_message) =
+        legacy_pretty_error_copy(&locale, code, catalog, parent_path, key, fallback);
+    let page = PrettyErrorPage {
+        locale,
+        title,
+        site_name: site_name(state).await,
+        home_url: request_app_url(state),
+        code_message,
+        detail_message,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => {
+            tracing::error!(%error, code, "failed to render legacy pretty error page");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 fn http_error_title(status: StatusCode) -> &'static str {
     match status {
         StatusCode::FORBIDDEN => "403 Forbidden",
@@ -2193,6 +2244,17 @@ struct NotFoundPage {
     site_name: String,
     message: String,
     home_url: String,
+}
+
+#[derive(Template)]
+#[template(path = "pretty_error.html")]
+struct PrettyErrorPage {
+    locale: String,
+    title: String,
+    site_name: String,
+    home_url: String,
+    code_message: String,
+    detail_message: String,
 }
 
 #[derive(Template)]
@@ -2985,6 +3047,17 @@ async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if let Some(response) = authenticated_guest_redirect(&state, &headers).await {
         return response;
     }
+    if state.config.mail.mailer.trim().is_empty() {
+        return render_legacy_pretty_error(
+            &state,
+            8,
+            "auth",
+            &["forgot"],
+            "disabled",
+            "Password resetting is not available.",
+        )
+        .await;
+    }
     let site_name = site_name(&state).await;
     let Some(database) = &state.database else {
         return unavailable();
@@ -3432,11 +3505,15 @@ async fn verify_email_page(
     match verification_is_required(database, &state.config.database.table_prefix).await {
         Ok(true) => {}
         Ok(false) => {
-            return (
-                StatusCode::FORBIDDEN,
+            return render_legacy_pretty_error(
+                &state,
+                1,
+                "user",
+                &["verification"],
+                "disabled",
                 "Email verification is not available.",
             )
-                .into_response();
+            .await;
         }
         Err(error) => {
             tracing::error!(%error, "failed to load email verification option");
@@ -20981,6 +21058,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pretty_exception_copy_uses_the_selected_locale() {
+        let (title, code, detail) = super::legacy_pretty_error_copy(
+            "zh_CN",
+            8,
+            "auth",
+            &["forgot"],
+            "disabled",
+            "fallback",
+        );
+        assert_eq!(title, "出现错误");
+        assert_eq!(code, "错误码：8");
+        assert_eq!(detail, "详细信息：本站已关闭重置密码功能");
+
+        let (title, code, detail) = super::legacy_pretty_error_copy(
+            "en",
+            1,
+            "user",
+            &["verification"],
+            "disabled",
+            "fallback",
+        );
+        assert_eq!(title, "Error occurred");
+        assert_eq!(code, "Error code: 1");
+        assert_eq!(detail, "Details: Email verification is not available.");
+    }
+
+    #[test]
     fn validates_texture_hashes_before_joining_them_to_storage_paths() {
         assert!(valid_texture_hash(&"a".repeat(64)));
         assert!(!valid_texture_hash("../textures"));
@@ -21604,6 +21708,61 @@ mod tests {
         assert!(finish_storage.join("oauth-private.key").exists());
         assert!(finish_storage.join("oauth-public.key").exists());
         assert!(finish_storage.join("app.key").exists());
+
+        let mut disabled_mail_config = finish_config.clone();
+        disabled_mail_config.locale = "zh_CN".to_owned();
+        disabled_mail_config.mail.mailer.clear();
+        let disabled_mail_app = router(crate::AppState {
+            config: Arc::new(disabled_mail_config),
+            database: Some(finish_database.clone()),
+            passport_key: None,
+            passport_signing_key: None,
+            session_key: None,
+            revoked_web_sessions: Default::default(),
+            login_failures: Default::default(),
+            captcha_challenges: Default::default(),
+            mail_limits: Default::default(),
+            image_cache: crate::image_cache::ImageCache::shared(),
+            storage_dir: finish_storage.clone(),
+            env_file: finish_env.clone(),
+            public_dir: finish_public.clone(),
+            wasm_plugins: Vec::new(),
+            wasm_plugin_load_failures: Vec::new(),
+            wasm_plugin_readmes: Vec::new(),
+            wasm_plugin_configurations: Vec::new(),
+            wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
+        });
+        let forgot_disabled = disabled_mail_app
+            .clone()
+            .oneshot(Request::get("/auth/forgot").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(forgot_disabled.status(), StatusCode::OK);
+        let forgot_disabled_html = String::from_utf8(
+            to_bytes(forgot_disabled.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(forgot_disabled_html.contains("错误码：8"));
+        assert!(forgot_disabled_html.contains("本站已关闭重置密码功能"));
+        assert!(!forgot_disabled_html.contains("id=\"forgot-form\""));
+
+        let verification_disabled = disabled_mail_app
+            .oneshot(Request::get("/auth/verify/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(verification_disabled.status(), StatusCode::OK);
+        let verification_disabled_html = String::from_utf8(
+            to_bytes(verification_disabled.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(verification_disabled_html.contains("错误码：1"));
+        assert!(verification_disabled_html.contains("本站已关闭邮箱验证功能"));
         drop(finish_app);
         if let crate::database::DatabasePool::Sqlite(pool) = finish_database {
             pool.close().await;

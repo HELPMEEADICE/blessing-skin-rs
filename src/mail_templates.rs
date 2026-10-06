@@ -15,6 +15,7 @@ struct LocaleFiles {
     locale: &'static str,
     user: &'static str,
     auth: &'static str,
+    errors: &'static str,
 }
 
 const LOCALES: &[LocaleFiles] = &[
@@ -22,66 +23,79 @@ const LOCALES: &[LocaleFiles] = &[
         locale: "de_DE",
         user: include_str!("../resources/lang/de_DE/user.yml"),
         auth: include_str!("../resources/lang/de_DE/auth.yml"),
+        errors: include_str!("../resources/lang/de_DE/errors.yml"),
     },
     LocaleFiles {
         locale: "el_GR",
         user: include_str!("../resources/lang/el_GR/user.yml"),
         auth: include_str!("../resources/lang/el_GR/auth.yml"),
+        errors: include_str!("../resources/lang/el_GR/errors.yml"),
     },
     LocaleFiles {
         locale: "en",
         user: include_str!("../resources/lang/en/user.yml"),
         auth: include_str!("../resources/lang/en/auth.yml"),
+        errors: include_str!("../resources/lang/en/errors.yml"),
     },
     LocaleFiles {
         locale: "es_ES",
         user: include_str!("../resources/lang/es_ES/user.yml"),
         auth: include_str!("../resources/lang/es_ES/auth.yml"),
+        errors: include_str!("../resources/lang/es_ES/errors.yml"),
     },
     LocaleFiles {
         locale: "fr_FR",
         user: include_str!("../resources/lang/fr_FR/user.yml"),
         auth: include_str!("../resources/lang/fr_FR/auth.yml"),
+        errors: include_str!("../resources/lang/fr_FR/errors.yml"),
     },
     LocaleFiles {
         locale: "it_IT",
         user: include_str!("../resources/lang/it_IT/user.yml"),
         auth: include_str!("../resources/lang/it_IT/auth.yml"),
+        errors: include_str!("../resources/lang/it_IT/errors.yml"),
     },
     LocaleFiles {
         locale: "ja_JP",
         user: include_str!("../resources/lang/ja_JP/user.yml"),
         auth: include_str!("../resources/lang/ja_JP/auth.yml"),
+        errors: include_str!("../resources/lang/ja_JP/errors.yml"),
     },
     LocaleFiles {
         locale: "ko_KR",
         user: include_str!("../resources/lang/ko_KR/user.yml"),
         auth: include_str!("../resources/lang/ko_KR/auth.yml"),
+        errors: include_str!("../resources/lang/ko_KR/errors.yml"),
     },
     LocaleFiles {
         locale: "nl_NL",
         user: include_str!("../resources/lang/nl_NL/user.yml"),
         auth: include_str!("../resources/lang/nl_NL/auth.yml"),
+        errors: include_str!("../resources/lang/nl_NL/errors.yml"),
     },
     LocaleFiles {
         locale: "pt_PT",
         user: include_str!("../resources/lang/pt_PT/user.yml"),
         auth: include_str!("../resources/lang/pt_PT/auth.yml"),
+        errors: include_str!("../resources/lang/pt_PT/errors.yml"),
     },
     LocaleFiles {
         locale: "ru_RU",
         user: include_str!("../resources/lang/ru_RU/user.yml"),
         auth: include_str!("../resources/lang/ru_RU/auth.yml"),
+        errors: include_str!("../resources/lang/ru_RU/errors.yml"),
     },
     LocaleFiles {
         locale: "zh_CN",
         user: include_str!("../resources/lang/zh_CN/user.yml"),
         auth: include_str!("../resources/lang/zh_CN/auth.yml"),
+        errors: include_str!("../resources/lang/zh_CN/errors.yml"),
     },
     LocaleFiles {
         locale: "zh_TW",
         user: include_str!("../resources/lang/zh_TW/user.yml"),
         auth: include_str!("../resources/lang/zh_TW/auth.yml"),
+        errors: include_str!("../resources/lang/zh_TW/errors.yml"),
     },
 ];
 
@@ -91,6 +105,26 @@ pub(crate) fn email_verification(locale: &str, site_name: &str, url: &str) -> Ma
 
 pub(crate) fn password_reset(locale: &str, site_name: &str, url: &str) -> MailContent {
     render(TemplateKind::PasswordReset, locale, site_name, url)
+}
+
+pub(crate) fn legacy_translation(
+    locale: &str,
+    catalog: &str,
+    parent_path: &[&str],
+    key: &str,
+) -> Option<String> {
+    let language = LOCALES
+        .iter()
+        .find(|files| files.locale == locale)
+        .or_else(|| LOCALES.iter().find(|files| files.locale == "en"))?;
+    let english = LOCALES.iter().find(|files| files.locale == "en")?;
+    let (source, english_source) = match catalog {
+        "auth" => (language.auth, english.auth),
+        "user" => (language.user, english.user),
+        "errors" => (language.errors, english.errors),
+        _ => return None,
+    };
+    yaml_scalar(source, parent_path, key).or_else(|| yaml_scalar(english_source, parent_path, key))
 }
 
 fn render(kind: TemplateKind, locale: &str, site_name: &str, url: &str) -> MailContent {
@@ -206,7 +240,40 @@ fn parse_yaml_scalar(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCALES, email_verification, password_reset};
+    use super::{LOCALES, email_verification, legacy_translation, password_reset};
+
+    #[test]
+    fn resolves_legacy_page_errors_from_all_supported_locale_files() {
+        for locale in LOCALES {
+            assert!(
+                legacy_translation(locale.locale, "errors", &["general"], "title").is_some(),
+                "{}",
+                locale.locale
+            );
+            assert!(
+                legacy_translation(locale.locale, "auth", &["forgot"], "disabled").is_some(),
+                "{}",
+                locale.locale
+            );
+            assert!(
+                legacy_translation(locale.locale, "user", &["verification"], "disabled").is_some(),
+                "{}",
+                locale.locale
+            );
+        }
+        assert_eq!(
+            legacy_translation("zh_CN", "auth", &["forgot"], "disabled").as_deref(),
+            Some("本站已关闭重置密码功能")
+        );
+        assert_eq!(
+            legacy_translation("zh_TW", "user", &["verification"], "disabled").as_deref(),
+            Some("電子郵件驗證不可用。")
+        );
+        assert_eq!(
+            legacy_translation("missing", "errors", &["general"], "title").as_deref(),
+            Some("Error occurred")
+        );
+    }
 
     #[test]
     fn bundles_all_legacy_email_locales_and_falls_back_to_english() {
