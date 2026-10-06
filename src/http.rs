@@ -1871,6 +1871,10 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            render_html_error_page,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             serve_public_assets,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -1894,14 +1898,15 @@ async fn web_not_found(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
-    if !should_render_html_not_found(uri.path(), &headers) {
+    if !should_render_html_error(uri.path(), &headers) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let locale = request_locale(&state);
     let page = NotFoundPage {
         locale: locale.clone(),
+        title: http_error_title(StatusCode::NOT_FOUND).to_owned(),
         site_name: site_name(&state).await,
-        message: not_found_message(&locale).to_owned(),
+        message: http_error_message(&locale, StatusCode::NOT_FOUND).to_owned(),
         home_url: request_app_url(&state),
     };
     match page.render() {
@@ -1913,7 +1918,7 @@ async fn web_not_found(
     }
 }
 
-fn should_render_html_not_found(path: &str, headers: &HeaderMap) -> bool {
+fn should_render_html_error(path: &str, headers: &HeaderMap) -> bool {
     if path == "/api"
         || path.starts_with("/api/")
         || path.starts_with("/csl/")
@@ -1942,23 +1947,155 @@ fn should_render_html_not_found(path: &str, headers: &HeaderMap) -> bool {
         })
 }
 
-fn not_found_message(locale: &str) -> &'static str {
-    match locale {
-        "de_DE" => "Hier ist nichts.",
-        "es_ES" => "No hay nada.",
-        "fr_FR" => "Il n'y a rien ici.",
-        "ko_KR" => "여기에 아무것도 없어!",
-        "ru_RU" => "Здесь пусто.",
-        "zh_CN" => "这里什么都没有哦",
-        "zh_TW" => "這裡甚麼都沒有。",
-        _ => "Nothing here.",
+fn http_error_title(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::FORBIDDEN => "403 Forbidden",
+        StatusCode::NOT_FOUND => "404 Not Found",
+        StatusCode::INTERNAL_SERVER_ERROR => "500 Internal Server Error",
+        StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable",
+        _ => "Error",
     }
+}
+
+fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
+    match locale {
+        "de_DE" => match status {
+            StatusCode::FORBIDDEN => "Sie haben keine Zugriffsberechtigung für diese Seite.",
+            StatusCode::NOT_FOUND => "Hier ist nichts.",
+            StatusCode::INTERNAL_SERVER_ERROR => "Bitte später nochmal versuchen.",
+            StatusCode::SERVICE_UNAVAILABLE => {
+                "Die Anwendung befindet sich jetzt im Wartungsmodus."
+            }
+            _ => "Fehler aufgetreten",
+        },
+        "es_ES" => match status {
+            StatusCode::FORBIDDEN => "No tiene permiso para accesar esta página.",
+            StatusCode::NOT_FOUND => "No hay nada.",
+            StatusCode::INTERNAL_SERVER_ERROR => "Por favor intente más tarde.",
+            StatusCode::SERVICE_UNAVAILABLE => "La aplicación está ahora en modo de mantenimiento.",
+            _ => "Se produjo un error",
+        },
+        "fr_FR" => match status {
+            StatusCode::FORBIDDEN => "Vous n'avez pas la permission d'accéder à cette page.",
+            StatusCode::NOT_FOUND => "Il n'y a rien ici.",
+            StatusCode::INTERNAL_SERVER_ERROR => "Veuillez réessayer plus tard.",
+            StatusCode::SERVICE_UNAVAILABLE => "L'application est maintenant en mode maintenance.",
+            _ => "Une erreur s'est produite",
+        },
+        "ko_KR" => match status {
+            StatusCode::FORBIDDEN => "이 페이지의 액세스 권한이 없습니다.",
+            StatusCode::NOT_FOUND => "여기에 아무것도 없어!",
+            StatusCode::INTERNAL_SERVER_ERROR => "나중에 다시 시도해주십시오.",
+            StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
+            _ => "오류가 발생했습니다",
+        },
+        "ru_RU" => match status {
+            StatusCode::FORBIDDEN => "У вас нет прав доступа для этой страницы.",
+            StatusCode::NOT_FOUND => "Здесь пусто.",
+            StatusCode::INTERNAL_SERVER_ERROR => "Пожалуйста, повторите попытку позже.",
+            StatusCode::SERVICE_UNAVAILABLE => {
+                "В настоящее время приложение находится в режиме обслуживания."
+            }
+            _ => "Произошла ошибка",
+        },
+        "zh_CN" => match status {
+            StatusCode::FORBIDDEN => "您无权访问此页面。",
+            StatusCode::NOT_FOUND => "这里什么都没有哦",
+            StatusCode::INTERNAL_SERVER_ERROR => "服务器内部错误，请稍后再试。",
+            StatusCode::SERVICE_UNAVAILABLE => "网站维护中",
+            _ => "出现错误",
+        },
+        "zh_TW" => match status {
+            StatusCode::FORBIDDEN => "您無權使用這個頁面。",
+            StatusCode::NOT_FOUND => "這裡甚麼都沒有。",
+            StatusCode::INTERNAL_SERVER_ERROR => "請稍後再試一次。",
+            StatusCode::SERVICE_UNAVAILABLE => "網站現在正在維護中。",
+            _ => "發生錯誤",
+        },
+        _ => match status {
+            StatusCode::FORBIDDEN => "You have no permission to access this page.",
+            StatusCode::NOT_FOUND => "Nothing here.",
+            StatusCode::INTERNAL_SERVER_ERROR => "Please try again later.",
+            StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
+            _ => "Error occurred",
+        },
+    }
+}
+
+async fn render_html_error_page(
+    State(state): State<AppState>,
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let request_headers = request.headers().clone();
+    let response = next.run(request).await;
+    let status = response.status();
+    if !matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE
+    ) || !should_render_html_error(&path, &request_headers)
+    {
+        return response;
+    }
+    if response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type.to_ascii_lowercase().contains("text/html")
+                || content_type.to_ascii_lowercase().contains("json")
+        })
+    {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let locale = request_locale(&state);
+    let detail = if status == StatusCode::FORBIDDEN {
+        axum::body::to_bytes(body, 32 * 1024)
+            .await
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
+            .map(|detail| detail.trim().to_owned())
+            .filter(|detail| !detail.is_empty())
+    } else {
+        None
+    };
+    let page = NotFoundPage {
+        locale: locale.clone(),
+        title: http_error_title(status).to_owned(),
+        site_name: site_name(&state).await,
+        message: detail.unwrap_or_else(|| http_error_message(&locale, status).to_owned()),
+        home_url: request_app_url(&state),
+    };
+    let html = match page.render() {
+        Ok(html) => html,
+        Err(error) => {
+            tracing::error!(%error, status = status.as_u16(), "failed to render HTTP error page");
+            return (status, "").into_response();
+        }
+    };
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_TYPE);
+    parts.headers.remove(ETAG);
+    parts.headers.remove(LAST_MODIFIED);
+    parts
+        .headers
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let mut response = Response::from_parts(parts, Body::from(html));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
 }
 
 #[derive(Template)]
 #[template(path = "not_found.html")]
 struct NotFoundPage {
     locale: String,
+    title: String,
     site_name: String,
     message: String,
     home_url: String,
@@ -18635,7 +18772,7 @@ mod tests {
             session_lifetime_seconds: 7_200,
             mail: crate::config::MailConfig::default(),
         };
-        let app = router(crate::AppState {
+        let state = crate::AppState {
             config: Arc::new(config),
             database: None,
             passport_key: None,
@@ -18654,7 +18791,8 @@ mod tests {
             wasm_plugin_readmes: Vec::new(),
             wasm_plugin_configurations: Vec::new(),
             wasm_runtime: crate::plugin_runtime::PluginRuntime::shared_empty(),
-        });
+        };
+        let app = router(state.clone());
         let page = app
             .clone()
             .oneshot(
@@ -18698,6 +18836,149 @@ mod tests {
             .await
             .unwrap();
         assert!(!api_not_found.starts_with(b"<!doctype html>"));
+
+        let error_app = axum::Router::new()
+            .route(
+                "/denied",
+                axum::routing::get(|| async { (StatusCode::FORBIDDEN, "Permission denied") }),
+            )
+            .route(
+                "/api/denied",
+                axum::routing::get(|| async { (StatusCode::FORBIDDEN, "Permission denied") }),
+            )
+            .route(
+                "/json-error",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({ "status": "not_ready" })),
+                    )
+                }),
+            )
+            .route(
+                "/unavailable",
+                axum::routing::get(|| async {
+                    (StatusCode::SERVICE_UNAVAILABLE, "maintenance details")
+                }),
+            )
+            .route(
+                "/internal-error",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "database password=secret",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::render_html_error_page,
+            ))
+            .with_state(state);
+        let denied = error_app
+            .clone()
+            .oneshot(
+                Request::get("/denied")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(
+            denied.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let denied = String::from_utf8(
+            to_bytes(denied.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(denied.contains("403 Forbidden"));
+        assert!(denied.contains("Permission denied"));
+
+        let api_denied = error_app
+            .clone()
+            .oneshot(
+                Request::get("/api/denied")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_denied.status(), StatusCode::FORBIDDEN);
+        assert!(
+            api_denied.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+
+        let json_error = error_app
+            .clone()
+            .oneshot(
+                Request::get("/json-error")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            json_error.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+
+        let unavailable = error_app
+            .clone()
+            .oneshot(
+                Request::get("/unavailable")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.headers()["cache-control"], "no-store");
+        let unavailable = String::from_utf8(
+            to_bytes(unavailable.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(unavailable.contains("503 Service Unavailable"));
+        assert!(!unavailable.contains("maintenance details"));
+
+        let internal_error = error_app
+            .oneshot(
+                Request::get("/internal-error")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(internal_error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let internal_error = String::from_utf8(
+            to_bytes(internal_error.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(internal_error.contains("500 Internal Server Error"));
+        assert!(!internal_error.contains("database password=secret"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
