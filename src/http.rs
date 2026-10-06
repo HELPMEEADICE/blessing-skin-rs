@@ -415,6 +415,260 @@ fn trim_request_body_strings(
     None
 }
 
+fn maintenance_cookie_mac(timestamp: &str, secret: &str) -> Option<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(timestamp.as_bytes());
+    Some(
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn valid_legacy_maintenance_cookie(cookie: &str, secret: &str) -> bool {
+    let Ok(bytes) = STANDARD.decode(cookie.as_bytes()) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(expires_at) = payload.get("expires_at") else {
+        return false;
+    };
+    let timestamp = match expires_at {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        _ => return false,
+    };
+    let Some(expiration) = timestamp.parse::<i64>().ok() else {
+        return false;
+    };
+    let Some(supplied_mac) = payload.get("mac").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(expected_mac) = maintenance_cookie_mac(&timestamp, secret) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    expiration >= now && bool::from(expected_mac.as_bytes().ct_eq(supplied_mac.as_bytes()))
+}
+
+fn legacy_maintenance_cookie(secret: &str) -> Option<HeaderValue> {
+    let expires_at = SystemTime::now()
+        .checked_add(Duration::from_secs(12 * 60 * 60))?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let timestamp = expires_at.to_string();
+    let mac = maintenance_cookie_mac(&timestamp, secret)?;
+    let value = STANDARD.encode(
+        serde_json::json!({
+            "expires_at": expires_at,
+            "mac": mac,
+        })
+        .to_string(),
+    );
+    let expires = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(expires_at));
+    HeaderValue::from_str(&format!(
+        "laravel_maintenance={value}; Expires={expires}; Max-Age=43200; Path=/; HttpOnly; SameSite=Lax"
+    ))
+    .ok()
+}
+
+fn maintenance_glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.trim_matches('/').chars().collect::<Vec<_>>();
+    let value = value.trim_matches('/').chars().collect::<Vec<_>>();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut wildcard_index, mut wildcard_value_index) = (None, 0);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '*' || pattern[pattern_index] == value[value_index])
+        {
+            if pattern[pattern_index] == '*' {
+                wildcard_index = Some(pattern_index);
+                pattern_index += 1;
+                wildcard_value_index = value_index;
+            } else {
+                pattern_index += 1;
+                value_index += 1;
+            }
+        } else if let Some(wildcard) = wildcard_index {
+            pattern_index = wildcard + 1;
+            wildcard_value_index += 1;
+            value_index = wildcard_value_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn legacy_maintenance_path_is_exempt(path: &str, data: &serde_json::Value) -> bool {
+    let path = decode_uri_path(path).unwrap_or_else(|| path.to_owned());
+    data.get("except")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|pattern| maintenance_glob_matches(pattern, &path))
+}
+
+fn maintenance_error_headers(data: &serde_json::Value) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, field) in [("retry-after", "retry"), ("refresh", "refresh")] {
+        let Some(value) = data.get(field) else {
+            continue;
+        };
+        let value = value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
+            .or_else(|| value.as_u64().map(|value| value.to_string()));
+        if let Some(value) = value
+            && let Ok(value) = HeaderValue::from_str(&value)
+        {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+fn maintenance_status(data: &serde_json::Value) -> StatusCode {
+    data.get("status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+async fn legacy_maintenance_response(
+    state: AppState,
+    path: String,
+    request_headers: HeaderMap,
+    locale: String,
+    data: serde_json::Value,
+) -> Response {
+    let status = maintenance_status(&data);
+    let mut response =
+        if let Some(template) = data.get("template").and_then(serde_json::Value::as_str) {
+            (status, Html(template.to_owned())).into_response()
+        } else if should_render_html_error(&path, &request_headers) {
+            let page = NotFoundPage {
+                locale: locale.clone(),
+                title: http_error_title(status).to_owned(),
+                site_name: site_name(&state).await,
+                message: http_error_page_message(&locale, status, None),
+                home_url: request_app_url(&state),
+            };
+            let html = page.render().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to render legacy maintenance page");
+                String::new()
+            });
+            (status, Html(html)).into_response()
+        } else {
+            (
+                status,
+                Json(serde_json::json!({"message":"Service Unavailable"})),
+            )
+                .into_response()
+        };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    for (name, value) in maintenance_error_headers(&data) {
+        if let Some(name) = name {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
+async fn prevent_legacy_maintenance(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let maintenance_file = state.storage_dir.join("framework").join("down");
+    let bytes = match tokio::fs::read(&maintenance_file).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return next.run(request).await;
+        }
+        Err(error) => {
+            tracing::error!(%error, path = %maintenance_file.display(), "failed to read legacy maintenance state");
+            let path = request.uri().path().to_owned();
+            let headers = request.headers().clone();
+            let locale_input = requested_query_locale(&request);
+            let locale = select_request_locale(&state, &request, locale_input.as_deref());
+            return legacy_maintenance_response(
+                state.clone(),
+                path,
+                headers,
+                locale,
+                serde_json::Value::Null,
+            )
+            .await;
+        }
+    };
+    let data = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(data) if data.is_object() => data,
+        Ok(_) => serde_json::Value::Null,
+        Err(error) => {
+            tracing::warn!(%error, "legacy maintenance state is not valid JSON");
+            serde_json::Value::Null
+        }
+    };
+    let path =
+        decode_uri_path(request.uri().path()).unwrap_or_else(|| request.uri().path().to_owned());
+    let request_path = if path == "/" {
+        "/"
+    } else {
+        path.trim_matches('/')
+    };
+    if let Some(secret) = data.get("secret").and_then(serde_json::Value::as_str) {
+        if request_path == secret {
+            let mut response = (StatusCode::FOUND, [(LOCATION, "/")]).into_response();
+            if let Some(cookie) = legacy_maintenance_cookie(secret) {
+                response.headers_mut().append(SET_COOKIE, cookie);
+            }
+            return response;
+        }
+        if cookie_value(request.headers(), "laravel_maintenance")
+            .is_some_and(|cookie| valid_legacy_maintenance_cookie(&cookie, secret))
+        {
+            return next.run(request).await;
+        }
+    }
+    if legacy_maintenance_path_is_exempt(request.uri().path(), &data) {
+        return next.run(request).await;
+    }
+    if let Some(redirect) = data.get("redirect").and_then(serde_json::Value::as_str) {
+        let redirect_path = if redirect == "/" {
+            "/"
+        } else {
+            redirect.trim_matches('/')
+        };
+        if request_path != redirect_path {
+            if let Ok(location) = HeaderValue::from_str(redirect) {
+                return (StatusCode::FOUND, [(LOCATION, location)]).into_response();
+            }
+        }
+    }
+    let path = request.uri().path().to_owned();
+    let headers = request.headers().clone();
+    let locale_input = requested_query_locale(&request);
+    let locale = select_request_locale(&state, &request, locale_input.as_deref());
+    legacy_maintenance_response(state, path, headers, locale, data).await
+}
+
 const MAX_LOCALE_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
@@ -2038,7 +2292,11 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             detect_locale_preference,
         ))
-        .layer(axum::middleware::from_fn(infer_peer_client_ip));
+        .layer(axum::middleware::from_fn(infer_peer_client_ip))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            prevent_legacy_maintenance,
+        ));
     let app = if !cfg!(test)
         && crate::config::legacy_env("APP_ENV").unwrap_or_else(|| "production".to_owned())
             != "testing"
@@ -27610,6 +27868,75 @@ mod tests {
         let legacy_replay = session_request(&app, &legacy_cookie, "GET", "/user", None).await;
         assert_eq!(legacy_replay.status(), StatusCode::SEE_OTHER);
         assert_eq!(legacy_replay.headers()[LOCATION], "/auth/login");
+
+        let maintenance_dir = setup_storage.join("framework");
+        std::fs::create_dir_all(&maintenance_dir).unwrap();
+        let maintenance_file = maintenance_dir.join("down");
+        std::fs::write(
+            &maintenance_file,
+            r#"{"except":["health/ready"],"retry":60,"refresh":"15","secret":"maintenance-secret","status":503}"#,
+        )
+        .unwrap();
+        let maintenance_exception = app
+            .clone()
+            .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(maintenance_exception.status(), StatusCode::OK);
+        let maintenance_page = app
+            .clone()
+            .oneshot(
+                Request::get("/health/live")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(maintenance_page.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(maintenance_page.headers()["retry-after"], "60");
+        assert_eq!(maintenance_page.headers()["refresh"], "15");
+        let maintenance_html = String::from_utf8(
+            to_bytes(maintenance_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(maintenance_html.contains("maintenance mode"));
+        let maintenance_bypass = app
+            .clone()
+            .oneshot(
+                Request::get("/maintenance-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(maintenance_bypass.status(), StatusCode::FOUND);
+        assert_eq!(maintenance_bypass.headers()[LOCATION], "/");
+        let maintenance_cookie = maintenance_bypass
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let maintenance_bypass_page = app
+            .clone()
+            .oneshot(
+                Request::get("/health/live")
+                    .header("cookie", maintenance_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(maintenance_bypass_page.status(), StatusCode::OK);
+        std::fs::remove_file(&maintenance_file).unwrap();
 
         std::fs::remove_dir_all(&setup_storage).unwrap();
         std::fs::remove_dir_all(&public_dir).unwrap();
