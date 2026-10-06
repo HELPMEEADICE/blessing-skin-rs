@@ -3397,6 +3397,54 @@ fn login_failure_count(state: &AppState, identification: &str) -> u32 {
         .unwrap_or_default()
 }
 
+fn legacy_auth_page_text(locale: &str, section: &[&str], key: &str, fallback: &str) -> String {
+    crate::mail_templates::legacy_translation(locale, "auth", section, key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn auth_form_label(locale: &str, label: &str, fallback: &str) -> String {
+    let localized = match (locale, label) {
+        ("zh_CN", "identification") => Some("邮箱或角色名"),
+        ("zh_TW", "identification") => Some("電子郵件或角色名稱"),
+        ("zh_CN", "password") => Some("密码"),
+        ("zh_TW", "password") => Some("密碼"),
+        ("zh_CN", "remember") => Some("保持登录"),
+        ("zh_TW", "remember") => Some("保持登入"),
+        ("zh_CN", "captcha_alt") => Some("验证码图片"),
+        ("zh_CN", "loading_registration") => Some("正在加载注册表单…"),
+        ("zh_CN", "login_link") => Some("登录"),
+        ("zh_TW", "captcha_alt") => Some("驗證碼圖片"),
+        ("zh_TW", "loading_registration") => Some("正在載入註冊表單…"),
+        ("zh_TW", "login_link") => Some("登入"),
+        ("zh_CN", "captcha") => Some("验证码"),
+        ("zh_TW", "captcha") => Some("驗證碼"),
+        ("zh_CN", "player") => Some("角色名"),
+        ("zh_TW", "player") => Some("角色名稱"),
+        ("zh_CN", "nickname") => Some("昵称"),
+        ("zh_TW", "nickname") => Some("暱稱"),
+        ("es_ES", "identification") => Some("Email o nombre de jugador"),
+        ("es_ES", "password") => Some("Contraseña"),
+        ("es_ES", "remember") => Some("Mantener la sesión iniciada"),
+        ("es_ES", "captcha") => Some("CAPTCHA"),
+        ("es_ES", "captcha_alt") => Some("Imagen CAPTCHA"),
+        ("es_ES", "loading_registration") => Some("Cargando el formulario de registro…"),
+        ("es_ES", "login_link") => Some("Iniciar sesión"),
+        ("es_ES", "player") => Some("Nombre del jugador"),
+        ("es_ES", "nickname") => Some("Apodo"),
+        ("ru_RU", "identification") => Some("Электронная почта или имя игрока"),
+        ("ru_RU", "password") => Some("Пароль"),
+        ("ru_RU", "remember") => Some("Запомнить меня"),
+        ("ru_RU", "captcha") => Some("CAPTCHA"),
+        ("ru_RU", "captcha_alt") => Some("Изображение CAPTCHA"),
+        ("ru_RU", "loading_registration") => Some("Загрузка формы регистрации…"),
+        ("ru_RU", "login_link") => Some("Войти"),
+        ("ru_RU", "player") => Some("Имя игрока"),
+        ("ru_RU", "nickname") => Some("Псевдоним"),
+        _ => None,
+    };
+    localized.unwrap_or(fallback).to_owned()
+}
+
 async fn login_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3419,7 +3467,7 @@ async fn login_page(
         }
         None => "Blessing Skin".to_owned(),
     };
-    let chinese = request_locale(&state).starts_with("zh");
+    let locale = request_locale(&state);
     let redirect_to = safe_local_redirect(query.redirect_to.as_deref()).unwrap_or_default();
     let app_dir = state.public_dir.join("app");
     let stylesheet = frontend_entrypoint(&app_dir, "style", "css", &request_app_url(&state)).await;
@@ -3478,41 +3526,26 @@ async fn login_page(
     );
     let page = LoginPage {
         site_name,
-        locale: request_locale(&state),
+        locale: locale.clone(),
         redirect_to,
-        title: if chinese { "登录" } else { "Log In" }.to_owned(),
-        prompt: if chinese {
-            "登录以管理您的角色与皮肤"
-        } else {
-            "Log in to manage your skin and players"
-        }
-        .to_owned(),
-        identification_label: if chinese {
-            "邮箱或角色名"
-        } else {
-            "Email or player name"
-        }
-        .to_owned(),
-        password_label: if chinese { "密码" } else { "Password" }.to_owned(),
-        remember_label: if chinese {
-            "保持登录"
-        } else {
-            "Remember me"
-        }
-        .to_owned(),
-        submit_label: if chinese { "登录" } else { "Log In" }.to_owned(),
-        registration_link: if chinese {
-            "注册新账号"
-        } else {
-            "Register a new account"
-        }
-        .to_owned(),
-        forgot_link: if chinese {
-            "忘记密码？"
-        } else {
-            "Forgot password?"
-        }
-        .to_owned(),
+        title: legacy_auth_page_text(&locale, &["login"], "title", "Log In"),
+        prompt: legacy_auth_page_text(
+            &locale,
+            &["login"],
+            "message",
+            "Log in to manage your skin and players",
+        ),
+        identification_label: auth_form_label(&locale, "identification", "Email or player name"),
+        password_label: auth_form_label(&locale, "password", "Password"),
+        remember_label: auth_form_label(&locale, "remember", "Remember me"),
+        submit_label: legacy_auth_page_text(&locale, &["login"], "title", "Log In"),
+        registration_link: legacy_auth_page_text(
+            &locale,
+            &[],
+            "register-link",
+            "Register a new account",
+        ),
+        forgot_link: legacy_auth_page_text(&locale, &["forgot"], "title", "Forgot password?"),
         frontend_style_available: !stylesheet.is_empty(),
         frontend_stylesheet: stylesheet,
         frontend_script_available,
@@ -3541,6 +3574,9 @@ struct RegisterPage {
     account_label: String,
     password_label: String,
     captcha_label: String,
+    captcha_alt: String,
+    loading_label: String,
+    login_link: String,
     submit_label: String,
     player_name_registration: bool,
     use_recaptcha: bool,
@@ -3605,7 +3641,7 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             }
         }
     };
-    let chinese = request_locale(&state).starts_with("zh");
+    let locale = request_locale(&state);
     let use_recaptcha = !recaptcha_secret.is_empty();
     let rows = filter_auth_page_rows(
         &state,
@@ -3632,31 +3668,40 @@ async fn register_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         i18n,
     );
     let page = RegisterPage {
-        site_name,
-        locale: request_locale(&state),
-        title: if chinese { "注册" } else { "Register" }.to_owned(),
-        prompt: if chinese {
-            "创建一个账号来管理你的皮肤与角色。"
-        } else {
-            "Create an account to manage your skins and players."
-        }
-        .to_owned(),
-        email_label: if chinese { "邮箱" } else { "Email" }.to_owned(),
-        account_label: (if chinese {
+        site_name: site_name.clone(),
+        locale: locale.clone(),
+        title: legacy_auth_page_text(&locale, &["register"], "title", "Register"),
+        prompt: legacy_auth_page_text(
+            &locale,
+            &["register"],
+            "message",
+            "Create an account to manage your skins and players.",
+        )
+        .replace(":sitename", &site_name),
+        email_label: legacy_auth_page_text(&locale, &[], "email", "Email"),
+        account_label: auth_form_label(
+            &locale,
             if player_name_registration {
-                "角色名"
+                "player"
             } else {
-                "昵称"
-            }
-        } else if player_name_registration {
-            "Player name"
-        } else {
-            "Nickname"
-        })
-        .to_owned(),
-        password_label: if chinese { "密码" } else { "Password" }.to_owned(),
-        captcha_label: if chinese { "验证码" } else { "CAPTCHA" }.to_owned(),
-        submit_label: if chinese { "注册" } else { "Register" }.to_owned(),
+                "nickname"
+            },
+            if player_name_registration {
+                "Player name"
+            } else {
+                "Nickname"
+            },
+        ),
+        password_label: auth_form_label(&locale, "password", "Password"),
+        captcha_label: auth_form_label(&locale, "captcha", "CAPTCHA"),
+        captcha_alt: auth_form_label(&locale, "captcha_alt", "CAPTCHA image"),
+        loading_label: auth_form_label(
+            &locale,
+            "loading_registration",
+            "Loading registration form…",
+        ),
+        login_link: auth_form_label(&locale, "login_link", "Log in"),
+        submit_label: legacy_auth_page_text(&locale, &["register"], "title", "Register"),
         player_name_registration,
         use_recaptcha,
         recaptcha_sitekey,
@@ -19976,6 +20021,34 @@ mod tests {
     }
 
     #[test]
+    fn login_and_registration_copy_uses_legacy_translations_for_supported_locales() {
+        assert_eq!(
+            super::legacy_auth_page_text("es_ES", &["login"], "title", "fallback"),
+            "Iniciar sesión"
+        );
+        assert_eq!(
+            super::legacy_auth_page_text("ru_RU", &["register"], "message", "fallback"),
+            "Добро пожаловать на :sitename!"
+        );
+        assert_eq!(
+            super::legacy_auth_page_text("missing", &["login"], "title", "fallback"),
+            "Log In"
+        );
+        assert_eq!(
+            super::auth_form_label("es_ES", "password", "Password"),
+            "Contraseña"
+        );
+        assert_eq!(
+            super::auth_form_label("ru_RU", "identification", "Email or player name"),
+            "Электронная почта или имя игрока"
+        );
+        assert_eq!(
+            super::auth_form_label("fr_FR", "remember", "Remember me"),
+            "Remember me"
+        );
+    }
+
+    #[test]
     fn legacy_locale_aliases_and_accept_language_quality_are_resolved() {
         assert_eq!(super::normalize_locale("zh-HANS-CN"), Some("zh_CN"));
         assert_eq!(super::normalize_locale("en_US"), Some("en"));
@@ -21490,6 +21563,9 @@ mod tests {
             account_label: "Player name".to_owned(),
             password_label: "Password".to_owned(),
             captcha_label: "CAPTCHA".to_owned(),
+            captcha_alt: "CAPTCHA image".to_owned(),
+            loading_label: "Loading registration form…".to_owned(),
+            login_link: "Log in".to_owned(),
             submit_label: "Register".to_owned(),
             player_name_registration: true,
             use_recaptcha: false,

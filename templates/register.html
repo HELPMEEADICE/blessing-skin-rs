@@ -111,10 +111,7 @@
     </header>
     {% else if row == "auth.rows.register.form" %}
     <main>
-      <p class="text-muted" role="status">
-        {% if locale.starts_with("zh") %}正在加载注册表单…{% else %}Loading
-        registration form…{% endif %}
-      </p>
+      <p class="text-muted" role="status">{{ loading_label }}</p>
     </main>
     {% endif %} {% endfor %} {% else %}
     <main>
@@ -169,7 +166,7 @@
         <img
           id="captcha-image"
           src="/auth/captcha"
-          alt="CAPTCHA image"
+          alt="{{ captcha_alt }}"
           width="180"
           height="60"
         />
@@ -185,7 +182,7 @@
         <div id="error" role="alert"></div>
         <button type="submit">{{ submit_label }}</button>
       </form>
-      <p><a href="/auth/login">Log in</a></p>
+      <p><a href="/auth/login">{{ login_link }}</a></p>
       {% endif %} {% endfor %}
     </main>
     {% endif %} {% if show_form && !frontend_script_available %}
