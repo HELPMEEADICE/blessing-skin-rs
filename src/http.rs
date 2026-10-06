@@ -304,6 +304,86 @@ fn requested_query_locale(request: &axum::extract::Request) -> Option<String> {
     })
 }
 
+fn php_trim_string(value: &str) -> &str {
+    value.trim_matches(|character| matches!(character, ' ' | '\0' | '\t' | '\n' | '\x0B' | '\r'))
+}
+
+fn php_trim_exempts_key(key: &str) -> bool {
+    matches!(
+        key,
+        "current_password" | "password" | "password_confirmation"
+    )
+}
+
+fn trim_json_input_strings(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            let trimmed = php_trim_string(value);
+            if trimmed == value {
+                false
+            } else {
+                *value = trimmed.to_owned();
+                true
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            trim_json_input_strings(value) || changed
+        }),
+        serde_json::Value::Object(values) => {
+            values.iter_mut().fold(false, |changed, (key, value)| {
+                if php_trim_exempts_key(key) {
+                    changed
+                } else {
+                    trim_json_input_strings(value) || changed
+                }
+            })
+        }
+        _ => false,
+    }
+}
+
+fn trim_urlencoded_input_strings(encoded: &str) -> Option<String> {
+    let mut changed = false;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(encoded.as_bytes()) {
+        let value = if php_trim_exempts_key(&key) {
+            value.into_owned()
+        } else {
+            let trimmed = php_trim_string(&value);
+            changed |= trimmed != value;
+            trimmed.to_owned()
+        };
+        serializer.append_pair(&key, &value);
+    }
+    changed.then(|| serializer.finish())
+}
+
+fn trim_request_query(uri: &mut axum::http::Uri) {
+    let Some(query) = uri.query() else {
+        return;
+    };
+    let Some(query) = trim_urlencoded_input_strings(query) else {
+        return;
+    };
+    let trimmed_uri = format!("{}?{query}", uri.path());
+    if let Ok(trimmed_uri) = trimmed_uri.parse() {
+        *uri = trimmed_uri;
+    }
+}
+
+fn trim_request_body_strings(body: &[u8], media_type: &str) -> Option<Bytes> {
+    if media_type == "application/json" || media_type.ends_with("+json") {
+        let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+        return trim_json_input_strings(&mut value)
+            .then(|| serde_json::to_vec(&value).ok().map(Bytes::from))
+            .flatten();
+    }
+    if media_type == "application/x-www-form-urlencoded" {
+        return trim_urlencoded_input_strings(std::str::from_utf8(body).ok()?).map(Bytes::from);
+    }
+    None
+}
+
 const MAX_LOCALE_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
@@ -333,15 +413,26 @@ fn body_locale(body: &[u8], media_type: &str) -> Option<String> {
 async fn buffer_request_body_for_locale(
     request: axum::extract::Request,
 ) -> Result<(axum::extract::Request, Option<String>, Option<String>), Response> {
-    if matches!(*request.method(), Method::GET | Method::HEAD) {
-        return Ok((request, None, None));
+    let (mut parts, request_body) = request.into_parts();
+    trim_request_query(&mut parts.uri);
+    if parts.method == Method::GET || parts.method == Method::HEAD {
+        return Ok((
+            axum::extract::Request::from_parts(parts, request_body),
+            None,
+            None,
+        ));
     }
-    let Some(content_type) = request
-        .headers()
+    let Some(content_type) = parts
+        .headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
     else {
-        return Ok((request, None, None));
+        return Ok((
+            axum::extract::Request::from_parts(parts, request_body),
+            None,
+            None,
+        ));
     };
     let media_type = content_type
         .split(';')
@@ -353,13 +444,25 @@ async fn buffer_request_body_for_locale(
         && !media_type.ends_with("+json")
         && media_type != "application/x-www-form-urlencoded"
     {
-        return Ok((request, None, None));
+        return Ok((
+            axum::extract::Request::from_parts(parts, request_body),
+            None,
+            None,
+        ));
     }
 
-    let (parts, request_body) = request.into_parts();
     let request_body = axum::body::to_bytes(request_body, MAX_LOCALE_REQUEST_BODY_BYTES)
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    let trimmed_body = trim_request_body_strings(&request_body, &media_type);
+    let body_changed = trimmed_body.is_some();
+    let request_body = trimmed_body.unwrap_or(request_body);
+    if body_changed
+        && parts.headers.contains_key(CONTENT_LENGTH)
+        && let Ok(content_length) = HeaderValue::from_str(&request_body.len().to_string())
+    {
+        parts.headers.insert(CONTENT_LENGTH, content_length);
+    }
     let locale = body_locale(&request_body, &media_type);
     let form_csrf_token = (media_type == "application/x-www-form-urlencoded")
         .then(|| {
@@ -13854,7 +13957,7 @@ pub(crate) async fn authenticated_web_user(
 }
 
 fn parse_legacy_form_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
+    match php_trim_string(value).to_ascii_lowercase().as_str() {
         "1" | "true" | "(true)" => Some(true),
         "0" | "false" | "(false)" => Some(false),
         _ => None,
@@ -13997,13 +14100,13 @@ async fn upload_texture(
         };
         match field_name.as_str() {
             "name" => name = Some(value),
-            "type" => texture_type = Some(value),
+            "type" => texture_type = Some(php_trim_string(&value).to_owned()),
             "public" => public = Some(value),
             _ => {}
         }
     }
     let Some(name) = name
-        .map(|value| value.trim().to_owned())
+        .map(|value| php_trim_string(&value).to_owned())
         .filter(|value| !value.is_empty())
     else {
         return upload_validation_error("name", &request_locale(&state));
@@ -21184,6 +21287,39 @@ mod tests {
     }
 
     #[test]
+    fn php_trim_strings_cleans_inputs_and_preserves_password_fields() {
+        assert_eq!(super::php_trim_string("\0 \tAlex\r\n\x0B"), "Alex");
+        assert_eq!(
+            super::php_trim_string("\u{00a0}Alex\u{00a0}"),
+            "\u{00a0}Alex\u{00a0}"
+        );
+
+        let mut json = serde_json::json!({
+            "nickname": "  Alex\t",
+            "nested": { "email": "\r alex@example.test \n" },
+            "password": "  keep these spaces  ",
+            "password_confirmation": ["  also keep  "],
+            "current_password": "\tunchanged\r"
+        });
+        assert!(super::trim_json_input_strings(&mut json));
+        assert_eq!(json["nickname"], "Alex");
+        assert_eq!(json["nested"]["email"], "alex@example.test");
+        assert_eq!(json["password"], "  keep these spaces  ");
+        assert_eq!(json["password_confirmation"][0], "  also keep  ");
+        assert_eq!(json["current_password"], "\tunchanged\r");
+
+        let trimmed_form = super::trim_urlencoded_input_strings(
+            "nickname=++Alex%09&password=+secret+&current_password=%09old%0D",
+        )
+        .unwrap();
+        let pairs = form_urlencoded::parse(trimmed_form.as_bytes()).collect::<Vec<_>>();
+        assert_eq!(pairs[0], ("nickname".into(), "Alex".into()));
+        assert_eq!(pairs[1], ("password".into(), " secret ".into()));
+        assert_eq!(pairs[2], ("current_password".into(), "\told\r".into()));
+        assert!(super::trim_urlencoded_input_strings("nickname=Alex").is_none());
+    }
+
+    #[test]
     fn legacy_browser_gate_matches_php_versions_and_web_route_groups() {
         assert!(super::legacy_unsupported_browser(
             "Mozilla/5.0 Chrome/54.0.2840.99 Safari/537.36"
@@ -25515,7 +25651,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "identification": "alex@example.test",
+                            "identification": " \talex@example.test \r\n",
                             "password": "correct horse",
                             "keep": true,
                             "captcha": captcha_answer,
