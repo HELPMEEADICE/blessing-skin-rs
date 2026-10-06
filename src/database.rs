@@ -9514,7 +9514,7 @@ mod language_line_tests {
         execute_legacy_fixture_sql(
             &database,
             &format!(
-                "INSERT INTO {prefix}options (id, option_name, option_value) VALUES (1, 'site_name', 'Legacy Skin')"
+                "INSERT INTO {prefix}options (option_name, option_value) VALUES ('site_name', 'Legacy Skin')"
             ),
         )
         .await
