@@ -12835,44 +12835,70 @@ async fn web_send_notification(
     };
     let request = match parse_legacy_input_object(&query, &body, input_content_type) {
         Ok(fields) => serde_json::Value::Object(fields),
-        Err(()) => return notification_validation_error("receiver", &request_locale(&state)),
+        Err(()) => {
+            return notification_validation_error("receiver", "required", &request_locale(&state));
+        }
     };
-    let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("receiver", &request_locale(&state));
+    let receiver_value = request.get("receiver");
+    if legacy_required_value_is_missing(receiver_value) {
+        return notification_validation_error("receiver", "required", &request_locale(&state));
+    }
+    let Some(receiver) = receiver_value.and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("receiver", "in", &request_locale(&state));
     };
     let receiver = receiver.trim();
     let audience = match receiver {
         "all" => crate::database::NotificationAudience::All,
         "normal" => crate::database::NotificationAudience::Normal,
         "uid" => {
-            let Some(uid) = request_i64(request.get("uid")) else {
-                return notification_validation_error("uid", &request_locale(&state));
+            let uid_value = request.get("uid");
+            if legacy_required_value_is_missing(uid_value) {
+                return notification_validation_error(
+                    "uid",
+                    "required_if_uid",
+                    &request_locale(&state),
+                );
+            }
+            let Some(uid) = request_i64(uid_value) else {
+                return notification_validation_error("uid", "integer", &request_locale(&state));
             };
             crate::database::NotificationAudience::User(uid)
         }
         "email" => {
-            let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
-                return notification_validation_error("email", &request_locale(&state));
+            let email_value = request.get("email");
+            if legacy_required_value_is_missing(email_value) {
+                return notification_validation_error(
+                    "email",
+                    "required_if_email",
+                    &request_locale(&state),
+                );
+            }
+            let Some(email) = email_value.and_then(serde_json::Value::as_str) else {
+                return notification_validation_error("email", "email", &request_locale(&state));
             };
             let email = email.trim();
             if !valid_email_address(email) {
-                return notification_validation_error("email", &request_locale(&state));
+                return notification_validation_error("email", "email", &request_locale(&state));
             }
             crate::database::NotificationAudience::Email(email.to_owned())
         }
-        _ => return notification_validation_error("receiver", &request_locale(&state)),
+        _ => return notification_validation_error("receiver", "in", &request_locale(&state)),
     };
-    let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("title", &request_locale(&state));
+    let title_value = request.get("title");
+    if legacy_required_value_is_missing(title_value) {
+        return notification_validation_error("title", "required", &request_locale(&state));
+    }
+    let Some(title) = title_value.and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("title", "string", &request_locale(&state));
     };
     let title = title.trim();
-    if title.is_empty() || title.chars().count() > 20 {
-        return notification_validation_error("title", &request_locale(&state));
+    if title.chars().count() > 20 {
+        return notification_validation_error("title", "max_string", &request_locale(&state));
     }
     let content = match request.get("content") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(content)) => Some(content.trim()),
-        _ => return notification_validation_error("content", &request_locale(&state)),
+        _ => return notification_validation_error("content", "string", &request_locale(&state)),
     };
     let prefix = &state.config.database.table_prefix;
     let recipients = match database.notification_recipients(prefix, &audience).await {
@@ -12883,7 +12909,7 @@ async fn web_send_notification(
                 crate::database::NotificationAudience::Email(_) => "email",
                 _ => "receiver",
             };
-            return notification_validation_error(field, &request_locale(&state));
+            return notification_validation_error(field, "exists", &request_locale(&state));
         }
         Err(error) => {
             tracing::error!(%error, sender_uid = user.uid, "failed to select notification recipients");
@@ -12952,44 +12978,70 @@ async fn api_send_notification(
         .and_then(|value| value.to_str().ok());
     let request = match parse_legacy_input_object(&query, &body, content_type) {
         Ok(fields) => serde_json::Value::Object(fields),
-        Err(()) => return notification_validation_error("receiver", &request_locale(&state)),
+        Err(()) => {
+            return notification_validation_error("receiver", "required", &request_locale(&state));
+        }
     };
-    let Some(receiver) = request.get("receiver").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("receiver", &request_locale(&state));
+    let receiver_value = request.get("receiver");
+    if legacy_required_value_is_missing(receiver_value) {
+        return notification_validation_error("receiver", "required", &request_locale(&state));
+    }
+    let Some(receiver) = receiver_value.and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("receiver", "in", &request_locale(&state));
     };
     let receiver = receiver.trim();
     let audience = match receiver {
         "all" => crate::database::NotificationAudience::All,
         "normal" => crate::database::NotificationAudience::Normal,
         "uid" => {
-            let Some(uid) = request_i64(request.get("uid")) else {
-                return notification_validation_error("uid", &request_locale(&state));
+            let uid_value = request.get("uid");
+            if legacy_required_value_is_missing(uid_value) {
+                return notification_validation_error(
+                    "uid",
+                    "required_if_uid",
+                    &request_locale(&state),
+                );
+            }
+            let Some(uid) = request_i64(uid_value) else {
+                return notification_validation_error("uid", "integer", &request_locale(&state));
             };
             crate::database::NotificationAudience::User(uid)
         }
         "email" => {
-            let Some(email) = request.get("email").and_then(serde_json::Value::as_str) else {
-                return notification_validation_error("email", &request_locale(&state));
+            let email_value = request.get("email");
+            if legacy_required_value_is_missing(email_value) {
+                return notification_validation_error(
+                    "email",
+                    "required_if_email",
+                    &request_locale(&state),
+                );
+            }
+            let Some(email) = email_value.and_then(serde_json::Value::as_str) else {
+                return notification_validation_error("email", "email", &request_locale(&state));
             };
             let email = email.trim();
             if !valid_email_address(email) {
-                return notification_validation_error("email", &request_locale(&state));
+                return notification_validation_error("email", "email", &request_locale(&state));
             }
             crate::database::NotificationAudience::Email(email.to_owned())
         }
-        _ => return notification_validation_error("receiver", &request_locale(&state)),
+        _ => return notification_validation_error("receiver", "in", &request_locale(&state)),
     };
-    let Some(title) = request.get("title").and_then(serde_json::Value::as_str) else {
-        return notification_validation_error("title", &request_locale(&state));
+    let title_value = request.get("title");
+    if legacy_required_value_is_missing(title_value) {
+        return notification_validation_error("title", "required", &request_locale(&state));
+    }
+    let Some(title) = title_value.and_then(serde_json::Value::as_str) else {
+        return notification_validation_error("title", "string", &request_locale(&state));
     };
     let title = title.trim();
-    if title.is_empty() || title.chars().count() > 20 {
-        return notification_validation_error("title", &request_locale(&state));
+    if title.chars().count() > 20 {
+        return notification_validation_error("title", "max_string", &request_locale(&state));
     }
     let content = match request.get("content") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(content)) => Some(content.trim()),
-        _ => return notification_validation_error("content", &request_locale(&state)),
+        _ => return notification_validation_error("content", "string", &request_locale(&state)),
     };
 
     let recipients = match database.notification_recipients(prefix, &audience).await {
@@ -13001,6 +13053,7 @@ async fn api_send_notification(
                     crate::database::NotificationAudience::Email(_) => "email",
                     _ => "receiver",
                 },
+                "exists",
                 &request_locale(&state),
             );
         }
@@ -13051,26 +13104,94 @@ fn notification_success_message(locale: &str) -> String {
     .unwrap_or_else(|| "Sent successfully!".to_owned())
 }
 
-fn notification_validation_error(field: &str, locale: &str) -> Response {
+fn notification_validation_error(field: &str, rule: &str, locale: &str) -> Response {
     let chinese = locale.starts_with("zh");
     let message = if chinese {
         "给定数据无效。"
     } else {
         "The given data was invalid."
     };
-    let field_error = match (field, chinese) {
-        ("receiver", true) => "接收对象必须是 all、normal、uid 或 email。",
-        ("receiver", false) => "The receiver must be all, normal, uid, or email.",
-        ("uid", true) => "用户编号为必填整数且必须存在。",
-        ("uid", false) => "The uid must be an integer identifying an existing user.",
-        ("email", true) => "邮箱地址无效或不存在。",
-        ("email", false) => "The email must be valid and belong to an existing user.",
-        ("title", true) => "标题为必填项且不能超过 20 个字符。",
-        ("title", false) => "The title is required and may not exceed 20 characters.",
-        ("content", true) => "内容必须是字符串。",
-        ("content", false) => "The content must be a string.",
-        _ => "The given field is invalid.",
+    let (path, key, fallback, conditional_value, max_value): (
+        &[&str],
+        &str,
+        &str,
+        Option<&str>,
+        Option<&str>,
+    ) = match rule {
+        "required" => (
+            &[],
+            "required",
+            "The :attribute field is required.",
+            None,
+            None,
+        ),
+        "required_if_uid" => (
+            &[],
+            "required_if",
+            "The :attribute field is required when :other is :value.",
+            Some("uid"),
+            None,
+        ),
+        "required_if_email" => (
+            &[],
+            "required_if",
+            "The :attribute field is required when :other is :value.",
+            Some("email"),
+            None,
+        ),
+        "in" => (&[], "in", "The selected :attribute is invalid.", None, None),
+        "integer" => (
+            &[],
+            "integer",
+            "The :attribute must be an integer.",
+            None,
+            None,
+        ),
+        "exists" => (
+            &[],
+            "exists",
+            "The selected :attribute is invalid.",
+            None,
+            None,
+        ),
+        "email" => (
+            &[],
+            "email",
+            "The :attribute must be a valid email address.",
+            None,
+            None,
+        ),
+        "max_string" => (
+            &["max"],
+            "string",
+            "The :attribute may not be greater than :max characters.",
+            None,
+            Some("20"),
+        ),
+        "string" => (
+            &[],
+            "string",
+            "The :attribute must be a string.",
+            None,
+            None,
+        ),
+        _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
+    let attribute =
+        crate::mail_templates::legacy_translation(locale, "validation", &["attributes"], field)
+            .unwrap_or_else(|| field.replace('_', " "));
+    let mut field_error =
+        crate::mail_templates::legacy_translation(locale, "validation", path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+            .replace(":attribute", &attribute);
+    if let Some(value) = conditional_value {
+        field_error = field_error
+            .replace(":other", "receiver")
+            .replace(":value", value);
+    }
+    if let Some(value) = max_value {
+        field_error = field_error.replace(":max", value);
+    }
     let mut errors = serde_json::Map::new();
     errors.insert(field.to_owned(), serde_json::json!([field_error]));
     (
@@ -21726,6 +21847,27 @@ mod tests {
             "¡Enviado con éxito!"
         );
         assert_eq!(super::notification_success_message("zh_CN"), "发送成功");
+    }
+
+    #[tokio::test]
+    async fn notification_validation_uses_laravel_rules_and_translations() {
+        use axum::body::to_bytes;
+
+        let response = super::notification_validation_error("uid", "required_if_uid", "es_ES");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["errors"]["uid"][0],
+            "El campo uid es obligatorio cuando receiver es uid."
+        );
+
+        let response = super::notification_validation_error("title", "max_string", "en");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["errors"]["title"][0],
+            "The title may not be greater than 20 characters."
+        );
     }
 
     #[test]
