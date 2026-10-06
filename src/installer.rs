@@ -69,7 +69,16 @@ pub async fn run(config: &Config) -> Result<(), InstallError> {
     let nickname = required_env("BS_INSTALL_ADMIN_NICKNAME")?;
     let password = required_env("BS_INSTALL_ADMIN_PASSWORD")?;
     let site_name = required_env("BS_INSTALL_SITE_NAME")?;
-    install_with_details(config, &storage, &email, &nickname, &password, &site_name).await
+    install_with_details(
+        config,
+        &storage,
+        &email,
+        &nickname,
+        &password,
+        &site_name,
+        "127.0.0.1",
+    )
+    .await
 }
 
 pub async fn install_with_details(
@@ -79,6 +88,7 @@ pub async fn install_with_details(
     nickname: &str,
     password: &str,
     site_name: &str,
+    admin_ip: &str,
 ) -> Result<(), InstallError> {
     if storage.join("install.lock").exists() {
         return Err(InstallError::AlreadyInstalled);
@@ -137,7 +147,14 @@ pub async fn install_with_details(
     )
     .await?;
     let score = initial_score(&pool, &config.database.table_prefix).await?;
-    insert_admin(&pool, &config.database.table_prefix, &admin, score).await?;
+    insert_admin(
+        &pool,
+        &config.database.table_prefix,
+        &admin,
+        score,
+        admin_ip,
+    )
+    .await?;
     fs::write(storage.join("install.lock"), b"")?;
     drop(pool);
 
@@ -529,16 +546,17 @@ async fn insert_admin(
     prefix: &str,
     admin: &Admin,
     score: i64,
+    admin_ip: &str,
 ) -> Result<(), sqlx::Error> {
     let sql = match pool {
         DatabasePool::Postgres(_) => format!(
-            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES ($1, $2, $3, 0, $4, '127.0.0.1', FALSE, 2, TIMESTAMP '1970-01-02 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
+            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES ($1, $2, $3, 0, $4, $5, FALSE, 2, TIMESTAMP '1970-01-02 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
         ),
         DatabasePool::MySql(_) => format!(
-            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES (?, ?, ?, 0, ?, '127.0.0.1', FALSE, 2, '1970-01-02 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
+            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES (?, ?, ?, 0, ?, ?, FALSE, 2, '1970-01-02 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
         ),
         DatabasePool::Sqlite(_) => format!(
-            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES (?, ?, ?, 0, ?, '127.0.0.1', FALSE, 2, '1970-01-01 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
+            "INSERT INTO {prefix}users (email, nickname, score, avatar, password, ip, is_dark_mode, permission, last_sign_at, register_at, verified, verification_token) VALUES (?, ?, ?, 0, ?, ?, FALSE, 2, '1970-01-01 00:00:00', CURRENT_TIMESTAMP, TRUE, '')"
         ),
     };
     match pool {
@@ -548,6 +566,7 @@ async fn insert_admin(
                 .bind(&admin.nickname)
                 .bind(score)
                 .bind(&admin.password_hash)
+                .bind(admin_ip)
                 .execute(pool)
                 .await?;
         }
@@ -557,6 +576,7 @@ async fn insert_admin(
                 .bind(&admin.nickname)
                 .bind(score)
                 .bind(&admin.password_hash)
+                .bind(admin_ip)
                 .execute(pool)
                 .await?;
         }
@@ -566,6 +586,7 @@ async fn insert_admin(
                 .bind(&admin.nickname)
                 .bind(score)
                 .bind(&admin.password_hash)
+                .bind(admin_ip)
                 .execute(pool)
                 .await?;
         }
@@ -650,13 +671,15 @@ mod tests {
             password_hash,
             site_name: "Test Skin".to_owned(),
         };
-        insert_admin(&pool, "bs_", &admin, 1000).await.unwrap();
+        insert_admin(&pool, "bs_", &admin, 1000, "203.0.113.17")
+            .await
+            .unwrap();
         let sqlite = match &pool {
             DatabasePool::Sqlite(pool) => pool,
             _ => unreachable!(),
         };
         let row = sqlx::query(
-            "SELECT email, nickname, score, permission, verified, password FROM bs_users",
+            "SELECT email, nickname, score, permission, verified, password, ip FROM bs_users",
         )
         .fetch_one(sqlite)
         .await
@@ -665,6 +688,7 @@ mod tests {
         assert_eq!(row.get::<i64, _>("score"), 1000);
         assert_eq!(row.get::<i64, _>("permission"), 2);
         assert!(row.get::<bool, _>("verified"));
+        assert_eq!(row.get::<String, _>("ip"), "203.0.113.17");
         assert!(verify_legacy_password(
             "correct horse",
             &row.get::<String, _>("password"),

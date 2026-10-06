@@ -124,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &arguments.nickname,
             &arguments.password,
             &site_name,
+            "127.0.0.1",
         )
         .await?;
         println!("Installation completed!");

@@ -11141,6 +11141,7 @@ async fn setup_finish(
         &form.nickname,
         &form.password,
         &form.site_name,
+        &registration_client_ip(&headers),
     )
     .await
     {
@@ -21543,6 +21544,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/setup/finish?email=first-admin%40example.test")
+                    .header("x-real-ip", "198.51.100.19")
                     .header("cookie", &finish_cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(finish_form))
@@ -21577,20 +21579,22 @@ mod tests {
         assert_eq!(installed_globals["extra"], serde_json::json!({}));
         assert!(finish_storage.join("install.lock").exists());
         let installed_admin = match &finish_database {
-            crate::database::DatabasePool::Sqlite(pool) => {
-                sqlx::query_as::<_, (String, String, i64, bool, String)>(
-                    "SELECT email, nickname, permission, verified, password FROM web_users LIMIT 1",
-                )
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            crate::database::DatabasePool::Sqlite(pool) => sqlx::query_as::<
+                _,
+                (String, String, i64, bool, String, String),
+            >(
+                "SELECT email, nickname, permission, verified, password, ip FROM web_users LIMIT 1",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
             _ => unreachable!(),
         };
         assert_eq!(installed_admin.0, "first-admin@example.test");
         assert_eq!(installed_admin.1, "First admin");
         assert_eq!(installed_admin.2, 2);
         assert!(installed_admin.3);
+        assert_eq!(installed_admin.5, "198.51.100.19");
         assert!(crate::auth::verify_legacy_password(
             "correct horse",
             &installed_admin.4,
