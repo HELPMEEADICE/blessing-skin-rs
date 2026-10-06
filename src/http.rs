@@ -4551,21 +4551,19 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
     match verification_is_required(database, &state.config.database.table_prefix).await {
         Ok(true) => {}
         Ok(false) => {
-            return login_result(
-                1,
-                &auth_message(
-                    &state,
-                    "邮箱验证未启用。",
-                    "Email verification is not available.",
-                ),
-                None,
+            let message = verification_user_message(
+                &request_locale(&state),
+                "disabled",
+                "Email verification is not available.",
             );
+            return login_result(1, &message, None);
         }
         Err(error) => {
             tracing::error!(%error, "failed to load email verification option");
             return unavailable();
         }
     }
+    let locale = request_locale(&state);
     if state.config.mail.mailer.trim().is_empty() {
         return login_result(
             1,
@@ -4589,7 +4587,7 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         }
     };
     if user.permission == -1 {
-        let message = if request_locale(&state).starts_with("zh") {
+        let message = if locale.starts_with("zh") {
             "你已被本站封禁，详情请联系站点管理员"
         } else {
             "You are banned on this site. Please contact the admin."
@@ -4597,17 +4595,6 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         let mut response = login_result(-1, message, None);
         *response.status_mut() = StatusCode::FORBIDDEN;
         return response;
-    }
-    if user.verified {
-        return login_result(
-            1,
-            &auth_message(
-                &state,
-                "账户已经验证。",
-                "Your account is already verified.",
-            ),
-            None,
-        );
     }
     let session_fingerprint = web_session_claims(&state, &headers)
         .map(|(token, claims)| {
@@ -4620,18 +4607,27 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
         })
         .unwrap_or_else(|| format!("user:{uid}"));
     let key = format!("verify:{uid}:{session_fingerprint}");
-    if reserve_mail_limit(&state, &key, Duration::from_secs(60)).is_err() {
-        return login_result(
-            1,
-            &auth_message(
-                &state,
-                "请等待一分钟后再发送验证邮件。",
-                "You click the send button too fast. Wait for 60 secs.",
-            ),
-            None,
+    if mail_limit_remaining(&state, &key, Duration::from_secs(60)).is_some() {
+        let message = verification_user_message(
+            &locale,
+            "frequent-mail",
+            "You click the send button too fast. Wait for 60 secs.",
         );
+        return login_result(1, &message, None);
     }
-    let locale = request_locale(&state);
+    if user.verified {
+        let message =
+            verification_user_message(&locale, "verified", "Your account is already verified.");
+        return login_result(1, &message, None);
+    }
+    if reserve_mail_limit(&state, &key, Duration::from_secs(60)).is_err() {
+        let message = verification_user_message(
+            &locale,
+            "frequent-mail",
+            "You click the send button too fast. Wait for 60 secs.",
+        );
+        return login_result(1, &message, None);
+    }
     let Some(mail) = verification_mail_content(&state, uid, &locale).await else {
         release_mail_limit(&state, &key);
         return unavailable();
@@ -4645,19 +4641,18 @@ async fn send_verification_email(State(state): State<AppState>, headers: HeaderM
     )
     .await
     {
-        Ok(()) => login_result(
-            0,
-            &auth_message(
-                &state,
-                "验证邮件已发送，请检查收件箱。",
+        Ok(()) => {
+            let message = verification_user_message(
+                &locale,
+                "success",
                 "Verification link was sent, please check your inbox.",
-            ),
-            None,
-        ),
+            );
+            login_result(0, &message, None)
+        }
         Err(error) => {
             release_mail_limit(&state, &key);
             tracing::warn!(%error, uid, "failed to send email verification mail");
-            let message = verification_email_failure_message(&request_locale(&state), &error);
+            let message = verification_email_failure_message(&locale, &error);
             login_result(2, &message, None)
         }
     }
@@ -4671,12 +4666,18 @@ fn forgot_password_failure_message(locale: &str, error: &impl std::fmt::Display)
     }
 }
 
+fn verification_user_message(locale: &str, key: &str, fallback: &str) -> String {
+    crate::mail_templates::legacy_translation(locale, "user", &["verification"], key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 fn verification_email_failure_message(locale: &str, error: &impl std::fmt::Display) -> String {
-    if locale.starts_with("zh") {
-        format!("邮件发送失败，详细信息：{error}")
-    } else {
-        format!("We failed to send you the verification link. Detailed message {error}")
-    }
+    verification_user_message(
+        locale,
+        "failed",
+        "We failed to send you the verification link. Detailed message :msg",
+    )
+    .replace(":msg", &error.to_string())
 }
 
 fn auth_message<'a>(state: &AppState, chinese: &'a str, english: &'a str) -> &'a str {
@@ -4685,6 +4686,16 @@ fn auth_message<'a>(state: &AppState, chinese: &'a str, english: &'a str) -> &'a
     } else {
         english
     }
+}
+
+fn mail_limit_remaining(state: &AppState, key: &str, window: Duration) -> Option<Duration> {
+    let mut limits = state
+        .mail_limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    limits.retain(|_, sent| sent.elapsed() < Duration::from_secs(3600));
+    let elapsed = limits.get(key)?.elapsed();
+    (elapsed < window).then_some(window - elapsed)
 }
 
 fn reserve_mail_limit(state: &AppState, key: &str, window: Duration) -> Result<(), Duration> {
@@ -25697,7 +25708,7 @@ mod tests {
             &app,
             &registered_cookie,
             "POST",
-            "/user/email-verification",
+            "/user/email-verification?lang=es_ES",
             None,
         )
         .await;
@@ -25708,11 +25719,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sent_verification["code"], 0);
+        assert_eq!(
+            sent_verification["message"],
+            "El enlace de verificación fue enviado, por favor comprueba tu bandeja de entrada."
+        );
         let repeated_verification = session_request(
             &app,
             &registered_cookie,
             "POST",
-            "/user/email-verification",
+            "/user/email-verification?lang=es_ES",
             None,
         )
         .await;
@@ -25723,6 +25738,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repeated_verification["code"], 1);
+        assert_eq!(
+            repeated_verification["message"],
+            "Haces clic en el botón de enviar demasiado rápido. Espera 60 segundos, tío."
+        );
 
         let second_verification_session = login_test_account(
             &app,
@@ -25839,6 +25858,30 @@ mod tests {
             serde_json::from_slice(&to_bytes(verified.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(verified["code"], 0);
+        let verified_session_mail_limit = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/email-verification?lang=es_ES",
+            None,
+        )
+        .await;
+        let verified_session_mail_limit: serde_json::Value = serde_json::from_slice(
+            &to_bytes(verified_session_mail_limit.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verified_session_mail_limit["code"], 1);
+        assert_eq!(
+            verified_session_mail_limit["message"],
+            "Haces clic en el botón de enviar demasiado rápido. Espera 60 segundos, tío."
+        );
+        sqlx::query("UPDATE users SET locale = 'en' WHERE uid = ?")
+            .bind(registered_user.0)
+            .execute(&pool)
+            .await
+            .unwrap();
         let verified_state: bool = sqlx::query_scalar("SELECT verified FROM users WHERE uid = ?")
             .bind(registered_user.0)
             .fetch_one(&pool)
