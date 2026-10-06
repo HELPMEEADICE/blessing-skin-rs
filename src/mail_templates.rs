@@ -13,6 +13,7 @@ enum TemplateKind {
 
 struct LocaleFiles {
     locale: &'static str,
+    validation: &'static str,
     user: &'static str,
     skinlib: &'static str,
     auth: &'static str,
@@ -26,6 +27,7 @@ struct LocaleFiles {
 const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "de_DE",
+        validation: include_str!("../resources/lang/de_DE/validation.yml"),
         user: include_str!("../resources/lang/de_DE/user.yml"),
         skinlib: include_str!("../resources/lang/de_DE/skinlib.yml"),
         auth: include_str!("../resources/lang/de_DE/auth.yml"),
@@ -37,6 +39,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "el_GR",
+        validation: include_str!("../resources/lang/el_GR/validation.yml"),
         user: include_str!("../resources/lang/el_GR/user.yml"),
         skinlib: include_str!("../resources/lang/el_GR/skinlib.yml"),
         auth: include_str!("../resources/lang/el_GR/auth.yml"),
@@ -48,6 +51,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "en",
+        validation: include_str!("../resources/lang/en/validation.yml"),
         user: include_str!("../resources/lang/en/user.yml"),
         skinlib: include_str!("../resources/lang/en/skinlib.yml"),
         auth: include_str!("../resources/lang/en/auth.yml"),
@@ -59,6 +63,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "es_ES",
+        validation: include_str!("../resources/lang/es_ES/validation.yml"),
         user: include_str!("../resources/lang/es_ES/user.yml"),
         skinlib: include_str!("../resources/lang/es_ES/skinlib.yml"),
         auth: include_str!("../resources/lang/es_ES/auth.yml"),
@@ -70,6 +75,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "fr_FR",
+        validation: include_str!("../resources/lang/fr_FR/validation.yml"),
         user: include_str!("../resources/lang/fr_FR/user.yml"),
         skinlib: include_str!("../resources/lang/fr_FR/skinlib.yml"),
         auth: include_str!("../resources/lang/fr_FR/auth.yml"),
@@ -81,6 +87,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "it_IT",
+        validation: include_str!("../resources/lang/it_IT/validation.yml"),
         user: include_str!("../resources/lang/it_IT/user.yml"),
         skinlib: include_str!("../resources/lang/it_IT/skinlib.yml"),
         auth: include_str!("../resources/lang/it_IT/auth.yml"),
@@ -92,6 +99,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "ja_JP",
+        validation: include_str!("../resources/lang/ja_JP/validation.yml"),
         user: include_str!("../resources/lang/ja_JP/user.yml"),
         skinlib: include_str!("../resources/lang/ja_JP/skinlib.yml"),
         auth: include_str!("../resources/lang/ja_JP/auth.yml"),
@@ -103,6 +111,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "ko_KR",
+        validation: include_str!("../resources/lang/ko_KR/validation.yml"),
         user: include_str!("../resources/lang/ko_KR/user.yml"),
         skinlib: include_str!("../resources/lang/ko_KR/skinlib.yml"),
         auth: include_str!("../resources/lang/ko_KR/auth.yml"),
@@ -114,6 +123,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "nl_NL",
+        validation: include_str!("../resources/lang/nl_NL/validation.yml"),
         user: include_str!("../resources/lang/nl_NL/user.yml"),
         skinlib: include_str!("../resources/lang/nl_NL/skinlib.yml"),
         auth: include_str!("../resources/lang/nl_NL/auth.yml"),
@@ -125,6 +135,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "pt_PT",
+        validation: include_str!("../resources/lang/pt_PT/validation.yml"),
         user: include_str!("../resources/lang/pt_PT/user.yml"),
         skinlib: include_str!("../resources/lang/pt_PT/skinlib.yml"),
         auth: include_str!("../resources/lang/pt_PT/auth.yml"),
@@ -136,6 +147,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "ru_RU",
+        validation: include_str!("../resources/lang/ru_RU/validation.yml"),
         user: include_str!("../resources/lang/ru_RU/user.yml"),
         skinlib: include_str!("../resources/lang/ru_RU/skinlib.yml"),
         auth: include_str!("../resources/lang/ru_RU/auth.yml"),
@@ -147,6 +159,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "zh_CN",
+        validation: include_str!("../resources/lang/zh_CN/validation.yml"),
         user: include_str!("../resources/lang/zh_CN/user.yml"),
         skinlib: include_str!("../resources/lang/zh_CN/skinlib.yml"),
         auth: include_str!("../resources/lang/zh_CN/auth.yml"),
@@ -158,6 +171,7 @@ const LOCALES: &[LocaleFiles] = &[
     },
     LocaleFiles {
         locale: "zh_TW",
+        validation: include_str!("../resources/lang/zh_TW/validation.yml"),
         user: include_str!("../resources/lang/zh_TW/user.yml"),
         skinlib: include_str!("../resources/lang/zh_TW/skinlib.yml"),
         auth: include_str!("../resources/lang/zh_TW/auth.yml"),
@@ -197,6 +211,7 @@ pub(crate) fn legacy_translation(
         "general" => (language.general, english.general),
         "front-end" => (language.front_end, english.front_end),
         "admin" => (language.admin, english.admin),
+        "validation" => (language.validation, english.validation),
         _ => return None,
     };
     yaml_scalar(source, parent_path, key).or_else(|| yaml_scalar(english_source, parent_path, key))

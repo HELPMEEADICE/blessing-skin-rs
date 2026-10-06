@@ -17117,24 +17117,36 @@ fn admin_user_validation_error(field: &str, rule: &str, locale: &str) -> Respons
     } else {
         "The given data was invalid."
     };
-    let field_error = match (field, rule, chinese) {
-        ("email", "required", true) => "邮箱为必填项。",
-        ("email", "required", false) => "The email field is required.",
-        ("email", "email", true) => "邮箱格式无效。",
-        ("email", "email", false) => "The email must be a valid email address.",
-        ("email", "unique", true) => "该邮箱已被使用。",
-        ("email", "unique", false) => "The email has already been taken.",
-        ("nickname", "required", true) => "昵称为必填项。",
-        ("nickname", "required", false) => "The nickname field is required.",
-        ("password", "required", true) => "密码为必填项。",
-        ("password", "required", false) => "The password field is required.",
-        ("password", "length", true) => "密码长度必须为 8 至 16 个字符。",
-        ("password", "length", false) => "The password must be between 8 and 16 characters.",
-        ("score", "integer", true) => "积分必须是整数。",
-        ("score", "integer", false) => "The score must be an integer.",
-        ("permission", "in", true) => "权限值无效。",
-        ("permission", "in", false) => "The selected permission is invalid.",
-        _ => "The given field is invalid.",
+    let (path, key, fallback): (&[&str], &str, &str) = match (field, rule) {
+        ("email", "required") => (&[], "required", "The email field is required."),
+        ("email", "email") => (
+            &[],
+            "email",
+            "The :attribute must be a valid email address.",
+        ),
+        ("email", "unique") => (&[], "unique", "The :attribute has already been taken."),
+        ("nickname", "required") => (&[], "required", "The :attribute field is required."),
+        ("password", "required") => (&[], "required", "The :attribute field is required."),
+        ("password", "length") => (
+            &["between"],
+            "string",
+            "The :attribute must be between :min and :max characters.",
+        ),
+        ("score", "integer") => (&[], "integer", "The :attribute must be an integer."),
+        ("permission", "in") => (&[], "in", "The selected :attribute is invalid."),
+        _ => (&[], "", "The given field is invalid."),
+    };
+    let attribute =
+        crate::mail_templates::legacy_translation(locale, "validation", &["attributes"], field)
+            .unwrap_or_else(|| field.replace('_', " "));
+    let field_error = if key.is_empty() {
+        fallback.to_owned()
+    } else {
+        crate::mail_templates::legacy_translation(locale, "validation", path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+            .replace(":attribute", &attribute)
+            .replace(":min", "8")
+            .replace(":max", "16")
     };
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -21613,6 +21625,29 @@ mod tests {
         assert_eq!(parsed.get("DB_PASSWORD").unwrap(), password);
         assert_eq!(parsed.get("DB_PREFIX").unwrap(), "bs_");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_user_validation_uses_legacy_locale_catalogs() {
+        use axum::body::to_bytes;
+
+        let required = super::admin_user_validation_error("email", "required", "es_ES");
+        let required: serde_json::Value =
+            serde_json::from_slice(&to_bytes(required.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            required["errors"]["email"][0],
+            "El campo correo electrónico es obligatorio."
+        );
+
+        let length = super::admin_user_validation_error("password", "length", "zh_CN");
+        let length: serde_json::Value =
+            serde_json::from_slice(&to_bytes(length.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            length["errors"]["password"][0],
+            "密码 必须介于 8 - 16 个字符之间。"
+        );
     }
 
     #[tokio::test]
