@@ -10,6 +10,7 @@ mod installer;
 mod mail_templates;
 mod mailer;
 mod oauth;
+mod options_cache_command;
 mod plugin_command;
 mod plugin_runtime;
 mod salt_command;
@@ -129,6 +130,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         println!("Installation completed!");
         println!("We recommend to modify your Site URL option if incorrect.");
+        return Ok(());
+    }
+
+    if options_cache_command::parse(&arguments)? {
+        let config = Config::from_env()?;
+        options_cache_command::run(&config, &storage_dir).await?;
+        println!("Options cached successfully.");
         return Ok(());
     }
 
