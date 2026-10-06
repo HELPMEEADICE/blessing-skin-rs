@@ -12910,15 +12910,8 @@ async fn web_send_notification(
     if !is_json {
         Redirect::to("/admin").into_response()
     } else {
-        login_result(
-            0,
-            if request_locale(&state).starts_with("zh") {
-                "站内通知已发送。"
-            } else {
-                "The site notification was sent."
-            },
-            None,
-        )
+        let message = notification_success_message(&request_locale(&state));
+        login_result(0, &message, None)
     }
 }
 async fn api_send_notification(
@@ -13048,6 +13041,16 @@ fn request_i64(value: Option<&serde_json::Value>) -> Option<i64> {
             .and_then(|number| number.trim().parse::<i64>().ok())
     })
 }
+fn notification_success_message(locale: &str) -> String {
+    crate::mail_templates::legacy_translation(
+        locale,
+        "admin",
+        &["notifications", "send"],
+        "success",
+    )
+    .unwrap_or_else(|| "Sent successfully!".to_owned())
+}
+
 fn notification_validation_error(field: &str, locale: &str) -> Response {
     let chinese = locale.starts_with("zh");
     let message = if chinese {
@@ -21716,6 +21719,15 @@ mod tests {
         assert!(value["errors"]["tid"][0].as_str().is_some());
         assert!(value["errors"]["field"].is_null());
     }
+    #[test]
+    fn notification_send_success_uses_legacy_admin_translations() {
+        assert_eq!(
+            super::notification_success_message("es_ES"),
+            "¡Enviado con éxito!"
+        );
+        assert_eq!(super::notification_success_message("zh_CN"), "发送成功");
+    }
+
     #[test]
     fn creates_unique_legacy_notification_ids() {
         let first = super::new_notification_id();
