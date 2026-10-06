@@ -189,7 +189,7 @@ python3 tools/compat_compare.py \
 
 可在本机复制并修改 [示例探针](compat-shadow.example.json)，令牌应从环境变量传入，不要写入 fixture。动态 JSON 字段可用 `ignore_json_pointers` 标注；响应体中的其他字段、状态码和缓存相关头仍会比较。工具只打印差异类别、JSON 字段路径或非 JSON 响应的 SHA-256，不打印响应内容。
 
-示例中的 `BS_SHADOW_ADMIN_TOKEN` 应属于有管理权限且只包含所需只读 scope 的测试账号；`BS_SHADOW_OAUTH_TOKEN` 需包含用户、玩家、衣柜和通知只读 scope。示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_USER_ID`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。默认探针覆盖用户与管理只读 API、皮肤库页面和列表，以及 Yggdrasil/CustomSkin 资料和原始纹理读取；不请求写路由、登录 session 页面或会生成缓存的图片路由。需要比较头像与预览的响应体、ETag 和缓存头时，只能对隔离副本使用 [图像探针样例](compat-images-isolated.example.json)，并额外传入 `--allow-image-cache-in-isolated-clones`；比较器会打印缓存写入警告。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理，以及在隔离副本中比较不同来源的头像和按 ID/哈希生成的皮肤预览响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
+示例中的 `BS_SHADOW_ADMIN_TOKEN` 应属于有管理权限且只包含所需只读 scope 的测试账号；`BS_SHADOW_OAUTH_TOKEN` 需包含用户、玩家、衣柜和通知只读 scope。示例中的 `BS_SHADOW_PLAYER`、`BS_SHADOW_USER_ID`、`BS_SHADOW_TEXTURE_HASH` 和 `BS_SHADOW_TEXTURE_ID` 也从环境变量读取。默认探针覆盖用户与管理只读 API、皮肤库页面和列表，以及 Yggdrasil/CustomSkin 角色资料、纹理哈希读取（含 CustomSkin 别名）和原始纹理读取；不请求写路由、登录 session 页面或会生成缓存的图片路由。需要比较头像与预览的响应体、ETag 和缓存头时，只能对隔离副本使用 [图像探针样例](compat-images-isolated.example.json)，并额外传入 `--allow-image-cache-in-isolated-clones`；比较器会打印缓存写入警告。将它们设为 PHP 与 Rust 副本中都存在的玩家名、由 64 个十六进制字符组成的纹理哈希和纹理 ID，便可比较 Yggdrasil 玩家资料、按哈希读取纹理，以及在隔离副本中比较不同来源的头像和按 ID/哈希生成的皮肤预览响应。路径变量展开后会再次经过只读 GET 白名单校验；如果变量缺失、含控制字符或构造出其他路由，比较器会在发送请求前拒绝该 fixture。
 
 ### 单业务域灰度（每个域至少 24 小时）
 

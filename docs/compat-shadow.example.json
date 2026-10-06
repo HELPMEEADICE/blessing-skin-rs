@@ -24,8 +24,22 @@
       }
     },
     {
+      "name": "CustomSkin player profile",
+      "path": "/csl/${BS_SHADOW_PLAYER}.json",
+      "headers": {
+        "Accept": "application/json"
+      }
+    },
+    {
       "name": "Texture by hash",
       "path": "/textures/${BS_SHADOW_TEXTURE_HASH}",
+      "headers": {
+        "Accept": "image/png"
+      }
+    },
+    {
+      "name": "CustomSkin texture by hash",
+      "path": "/csl/textures/${BS_SHADOW_TEXTURE_HASH}",
       "headers": {
         "Accept": "image/png"
       }

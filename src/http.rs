@@ -23831,6 +23831,46 @@ mod tests {
         .unwrap();
         assert_eq!(api_root["blessing_skin"], "6.0.2");
 
+        sqlx::query("UPDATE players SET tid_skin = 2, tid_cape = 2 WHERE pid = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let yggdrasil_profile = app
+            .clone()
+            .oneshot(Request::get("/Alex.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(yggdrasil_profile.status(), StatusCode::OK);
+        assert!(yggdrasil_profile.headers().contains_key(LAST_MODIFIED));
+        let yggdrasil_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(yggdrasil_profile.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yggdrasil_body["username"], "Alex");
+        assert_eq!(yggdrasil_body["skins"]["slim"], "reported-hash");
+        assert_eq!(yggdrasil_body["cape"], "reported-hash");
+
+        let customskin_profile = app
+            .clone()
+            .oneshot(Request::get("/csl/Alex.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(customskin_profile.status(), StatusCode::OK);
+        assert!(customskin_profile.headers().contains_key(LAST_MODIFIED));
+        let customskin_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(customskin_profile.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(customskin_body, yggdrasil_body);
+        sqlx::query("UPDATE players SET tid_skin = 0, tid_cape = 0 WHERE pid = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let public_upload = app
             .clone()
             .oneshot(
@@ -28453,6 +28493,37 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let texture_by_hash = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/textures/{preview_skin_hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(texture_by_hash.status(), StatusCode::OK);
+        let texture_by_hash_bytes = to_bytes(texture_by_hash.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let customskin_texture = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/csl/textures/{preview_skin_hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(customskin_texture.status(), StatusCode::OK);
+        assert_eq!(customskin_texture.headers()[CONTENT_TYPE], "image/png");
+        assert_eq!(
+            to_bytes(customskin_texture.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            texture_by_hash_bytes,
+            "the CustomSkin texture route must return the same bytes as the canonical route"
+        );
         let raw_invalid_id = app
             .clone()
             .oneshot(

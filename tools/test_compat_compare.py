@@ -33,6 +33,7 @@ class CompatCompareTests(unittest.TestCase):
             "/Alex.json",
             "/csl/Alex.json",
             "/textures/0123456789abcdef0123456789abcdef",
+            "/csl/textures/0123456789abcdef0123456789abcdef",
         ):
             with self.subTest(path=path):
                 self.assertTrue(compat.is_safe_path(path))
@@ -77,7 +78,7 @@ class CompatCompareTests(unittest.TestCase):
             probes = compat.validate_fixture(fixture)
             for probe in probes:
                 probe["path"] = compat.resolve_probe_path(probe["path"])
-        self.assertEqual(len(probes), 16)
+        self.assertEqual(len(probes), 18)
         self.assertTrue(all(compat.is_safe_path(probe["path"]) for probe in probes))
 
     def test_image_cache_routes_require_explicit_isolated_clone_opt_in(self):
