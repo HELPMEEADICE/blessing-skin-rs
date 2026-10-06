@@ -6291,6 +6291,7 @@ struct AdminDashboardPage {
     stats: AdminDashboardStats,
     page_widgets: Vec<String>,
     side_menu: Vec<DashboardMenuItem>,
+    notification_success_message: String,
     frontend_style_available: bool,
     frontend_stylesheet: String,
     frontend_script_available: bool,
@@ -7358,6 +7359,13 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
     };
     let page_widgets = filter_admin_dashboard_widgets(&state).await;
     let locale = request_locale(&state);
+    let show_notification_success =
+        cookie_value(&headers, ADMIN_NOTIFICATION_FLASH_COOKIE) == Some("sent");
+    let notification_success_message = if show_notification_success {
+        notification_success_message(&locale)
+    } else {
+        String::new()
+    };
     let chinese = locale.starts_with("zh");
     let side_menu = filter_side_menu(
         &state,
@@ -7424,6 +7432,7 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         stats,
         page_widgets,
         side_menu,
+        notification_success_message,
         frontend_style_available: stylesheet.is_some(),
         frontend_stylesheet: stylesheet.unwrap_or_default(),
         frontend_script_available: frontend_script.is_some(),
@@ -7431,7 +7440,28 @@ async fn web_admin_dashboard(State(state): State<AppState>, headers: HeaderMap) 
         frontend_globals_b64,
     };
     match page.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => {
+            let mut response = Html(html).into_response();
+            if show_notification_success {
+                let secure = if request_app_url(&state).starts_with("https://") {
+                    "; Secure"
+                } else {
+                    ""
+                };
+                let cookie = format!(
+                    "{ADMIN_NOTIFICATION_FLASH_COOKIE}=; Path=/admin; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax{secure}"
+                );
+                match HeaderValue::from_str(&cookie) {
+                    Ok(value) => {
+                        response.headers_mut().append(SET_COOKIE, value);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not clear admin notification flash")
+                    }
+                }
+            }
+            response
+        }
         Err(error) => {
             tracing::error!(%error, "failed to render admin dashboard");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -12803,6 +12833,7 @@ async fn api_user(State(state): State<AppState>, headers: HeaderMap) -> Response
 }
 
 static NOTIFICATION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const ADMIN_NOTIFICATION_FLASH_COOKIE: &str = "blessing_skin_admin_notice";
 
 async fn web_send_notification(
     State(state): State<AppState>,
@@ -12934,7 +12965,22 @@ async fn web_send_notification(
         .await;
     }
     if !is_json {
-        Redirect::to("/admin").into_response()
+        let mut response = Redirect::to("/admin").into_response();
+        let secure = if request_app_url(&state).starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        };
+        let cookie = format!(
+            "{ADMIN_NOTIFICATION_FLASH_COOKIE}=sent; Path=/admin; Max-Age=60; HttpOnly; SameSite=Lax{secure}"
+        );
+        match HeaderValue::from_str(&cookie) {
+            Ok(value) => {
+                response.headers_mut().append(SET_COOKIE, value);
+            }
+            Err(error) => tracing::warn!(%error, "could not set admin notification flash"),
+        }
+        response
     } else {
         let message = notification_success_message(&request_locale(&state));
         login_result(0, &message, None)
@@ -29275,6 +29321,53 @@ mod tests {
         )
         .await;
         assert_eq!(query_notice.status(), StatusCode::SEE_OTHER);
+        let flash_cookie = query_notice
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|cookie| cookie.to_str().ok())
+            .find(|cookie| cookie.starts_with("blessing_skin_admin_notice=sent; Path=/admin;"))
+            .expect("form notification redirect should set a one-shot success marker");
+        assert!(flash_cookie.contains("HttpOnly; SameSite=Lax"));
+        let flashed_dashboard = session_request(
+            &app,
+            &format!(
+                "{admin_cookie}; {}=sent",
+                super::ADMIN_NOTIFICATION_FLASH_COOKIE
+            ),
+            "GET",
+            "/admin",
+            None,
+        )
+        .await;
+        assert_eq!(flashed_dashboard.status(), StatusCode::OK);
+        let clears_flash_cookie = flashed_dashboard
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|cookie| cookie.to_str().ok())
+            .any(|cookie| {
+                cookie.starts_with("blessing_skin_admin_notice=; Path=/admin;")
+                    && cookie.contains("Max-Age=0")
+            });
+        assert!(clears_flash_cookie);
+        let flashed_dashboard = String::from_utf8(
+            to_bytes(flashed_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(flashed_dashboard.contains("Sent successfully!"));
+        let next_dashboard = session_request(&app, &admin_cookie, "GET", "/admin", None).await;
+        let next_dashboard = String::from_utf8(
+            to_bytes(next_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!next_dashboard.contains("Sent successfully!"));
         let saved_query_notice: String = sqlx::query_scalar(
             "SELECT data FROM notifications WHERE notifiable_id = 7 AND data LIKE '%Query notice%' LIMIT 1",
         )

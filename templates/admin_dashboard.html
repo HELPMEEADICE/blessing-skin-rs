@@ -16,6 +16,7 @@
     .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-top:2rem}
     .chart{padding:1.25rem;background:#f4f6f9;border-radius:8px;min-width:0}
     .chart h2{font-size:1rem;margin:0 0 .75rem}
+    .notice-flash{max-width:960px;margin:1.5rem auto;padding:1rem 1.25rem;background:#d4edda;color:#155724;border-radius:8px}
     .chart svg{display:block;width:100%;height:auto;overflow:visible}
     .chart-labels{display:flex;justify-content:space-between;color:#667085;font-size:.8rem}
   </style>
@@ -24,6 +25,9 @@
   {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
 </head>
 <body>
+{% if !notification_success_message.is_empty() %}
+  <div class="notice-flash" role="status" aria-live="polite">{{ notification_success_message }}</div>
+{% endif %}
 {% if frontend_script_available %}
   <div id="admin-dashboard-app"></div>
   <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
