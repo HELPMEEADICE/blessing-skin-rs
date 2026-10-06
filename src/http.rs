@@ -10967,6 +10967,24 @@ async fn user_profile_update(
             else {
                 return profile_validation_error("password", "password", &request_locale(&state));
             };
+            match database.user_email_exists(prefix, email, user.uid).await {
+                Ok(true) => {
+                    return login_result(
+                        1,
+                        if chinese {
+                            "此邮箱已被占用"
+                        } else {
+                            "This email address is occupied."
+                        },
+                        None,
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, user_id = user.uid, "failed to check email uniqueness");
+                    return unavailable();
+                }
+            }
             let credential = match database.credentials_by_user_id(prefix, user.uid).await {
                 Ok(Some(credential)) => credential,
                 Ok(None) => return unauthenticated(),
@@ -10990,24 +11008,6 @@ async fn user_profile_update(
                     },
                     None,
                 );
-            }
-            match database.user_email_exists(prefix, email, user.uid).await {
-                Ok(true) => {
-                    return login_result(
-                        1,
-                        if chinese {
-                            "此邮箱已被占用"
-                        } else {
-                            "This email address is occupied."
-                        },
-                        None,
-                    );
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::error!(%error, user_id = user.uid, "failed to check email uniqueness");
-                    return unavailable();
-                }
             }
             if let Err(error) = database
                 .update_user_email_and_reset_verification(prefix, user.uid, email)
@@ -27509,6 +27509,36 @@ mod tests {
         .unwrap();
         assert_eq!(restored_email["code"], 0);
         let cookie = login_test_account(&app, "alex@example.test", "correct horse", login_ip).await;
+        let duplicate_email_with_wrong_password = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/user/profile")
+                    .header(
+                        "cookie",
+                        format!("{}; {}", cookie.clone(), test_csrf_cookie),
+                    )
+                    .header("x-csrf-token", test_csrf_token.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"email","email":"uploader@example.test","password":"incorrect horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let duplicate_email_with_wrong_password: serde_json::Value = serde_json::from_slice(
+            &to_bytes(duplicate_email_with_wrong_password.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(duplicate_email_with_wrong_password["code"], 1);
+        assert_eq!(
+            duplicate_email_with_wrong_password["message"],
+            "This email address is occupied."
+        );
         sqlx::query("UPDATE users SET verified = 1 WHERE uid = 7")
             .execute(&pool)
             .await
