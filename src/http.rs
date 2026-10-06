@@ -11139,6 +11139,7 @@ async fn user_set_avatar(
     let Some(database) = &state.database else {
         return unavailable();
     };
+    let locale = request_locale(&state);
     let request = parse_legacy_input_object(
         &query,
         &body,
@@ -11153,7 +11154,7 @@ async fn user_set_avatar(
         .and_then(|value| value.get("tid"))
         .and_then(|value| request_i64(Some(value)))
     else {
-        return profile_validation_error("tid", "integer", &request_locale(&state));
+        return profile_validation_error("tid", "integer", &locale);
     };
     let can_update = state
         .wasm_runtime
@@ -11184,15 +11185,14 @@ async fn user_set_avatar(
         {
             Ok(Some(texture)) => texture,
             Ok(None) => {
-                return login_result(
-                    1,
-                    if request_locale(&state).starts_with("zh") {
-                        "材质不存在"
-                    } else {
-                        "No such texture."
-                    },
-                    None,
-                );
+                let message = crate::mail_templates::legacy_translation(
+                    &locale,
+                    "skinlib",
+                    &[],
+                    "non-existent",
+                )
+                .unwrap_or_else(|| "No such texture.".to_owned());
+                return login_result(1, &message, None);
             }
             Err(error) => {
                 tracing::error!(%error, tid, "failed to load requested user avatar texture");
@@ -11200,26 +11200,27 @@ async fn user_set_avatar(
             }
         };
         if texture.texture_type == "cape" {
-            return login_result(
-                1,
-                if request_locale(&state).starts_with("zh") {
-                    "披风不能被设置为头像"
-                } else {
-                    "You can't set a cape as avatar."
-                },
-                None,
-            );
+            let message = crate::mail_templates::legacy_translation(
+                &locale,
+                "user",
+                &["profile", "avatar"],
+                "wrong-type",
+            )
+            .unwrap_or_else(|| "You can't set a cape as avatar.".to_owned());
+            return login_result(1, &message, None);
         }
         if !texture.is_public && texture.uploader != user.uid && user.permission < 1 {
-            return login_result(
-                1,
-                if request_locale(&state).starts_with("zh") {
-                    "请求的材质已经设为私密，仅上传者和管理员可查看"
-                } else {
-                    "The requested texture is private and only visible to the uploader and admins."
-                },
-                None,
-            );
+            let message = crate::mail_templates::legacy_translation(
+                &locale,
+                "skinlib",
+                &["show"],
+                "private",
+            )
+            .unwrap_or_else(|| {
+                "The requested texture is private and only visible to the uploader and admins."
+                    .to_owned()
+            });
+            return login_result(1, &message, None);
         }
     }
     if let Err(error) = database
@@ -11235,15 +11236,14 @@ async fn user_set_avatar(
         serde_json::json!({"user_id": user.uid, "texture_id": tid}),
     )
     .await;
-    login_result(
-        0,
-        if request_locale(&state).starts_with("zh") {
-            "设置成功"
-        } else {
-            "New avatar was set successfully."
-        },
-        None,
+    let message = crate::mail_templates::legacy_translation(
+        &locale,
+        "user",
+        &["profile", "avatar"],
+        "success",
     )
+    .unwrap_or_else(|| "New avatar was set successfully.".to_owned());
+    login_result(0, &message, None)
 }
 
 async fn toggle_user_dark_mode(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -27543,6 +27543,67 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO textures (tid,name,type,hash,size,uploader,public,upload_at,likes) VALUES (22,'Avatar cape','cape','avatar-cape-hash',8,8,1,'2026-10-02 15:05:00',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let localized_avatar = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/profile/avatar?lang=es_ES&tid=2",
+            None,
+        )
+        .await;
+        let localized_avatar: serde_json::Value = serde_json::from_slice(
+            &to_bytes(localized_avatar.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(localized_avatar["code"], 0);
+        assert_eq!(
+            localized_avatar["message"],
+            "Nuevo avatar se ha establecido correctamente."
+        );
+        let localized_cape_error = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/profile/avatar?lang=es_ES&tid=22",
+            None,
+        )
+        .await;
+        let localized_cape_error: serde_json::Value = serde_json::from_slice(
+            &to_bytes(localized_cape_error.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(localized_cape_error["code"], 1);
+        assert_eq!(
+            localized_cape_error["message"],
+            "No puedes establecer una capa como avatar."
+        );
+        let localized_private_error = session_request(
+            &app,
+            &registered_cookie,
+            "POST",
+            "/user/profile/avatar?lang=es_ES&tid=21",
+            None,
+        )
+        .await;
+        let localized_private_error: serde_json::Value = serde_json::from_slice(
+            &to_bytes(localized_private_error.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(localized_private_error["code"], 1);
+        assert_eq!(
+            localized_private_error["message"],
+            "La textura solicitada es privada y sólo visible para el subidor y los administradores."
+        );
 
         let set_avatar = app
             .clone()

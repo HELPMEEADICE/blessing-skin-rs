@@ -14,6 +14,7 @@ enum TemplateKind {
 struct LocaleFiles {
     locale: &'static str,
     user: &'static str,
+    skinlib: &'static str,
     auth: &'static str,
     errors: &'static str,
     setup: &'static str,
@@ -26,6 +27,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "de_DE",
         user: include_str!("../resources/lang/de_DE/user.yml"),
+        skinlib: include_str!("../resources/lang/de_DE/skinlib.yml"),
         auth: include_str!("../resources/lang/de_DE/auth.yml"),
         errors: include_str!("../resources/lang/de_DE/errors.yml"),
         setup: include_str!("../resources/lang/de_DE/setup.yml"),
@@ -36,6 +38,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "el_GR",
         user: include_str!("../resources/lang/el_GR/user.yml"),
+        skinlib: include_str!("../resources/lang/el_GR/skinlib.yml"),
         auth: include_str!("../resources/lang/el_GR/auth.yml"),
         errors: include_str!("../resources/lang/el_GR/errors.yml"),
         setup: include_str!("../resources/lang/el_GR/setup.yml"),
@@ -46,6 +49,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "en",
         user: include_str!("../resources/lang/en/user.yml"),
+        skinlib: include_str!("../resources/lang/en/skinlib.yml"),
         auth: include_str!("../resources/lang/en/auth.yml"),
         errors: include_str!("../resources/lang/en/errors.yml"),
         setup: include_str!("../resources/lang/en/setup.yml"),
@@ -56,6 +60,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "es_ES",
         user: include_str!("../resources/lang/es_ES/user.yml"),
+        skinlib: include_str!("../resources/lang/es_ES/skinlib.yml"),
         auth: include_str!("../resources/lang/es_ES/auth.yml"),
         errors: include_str!("../resources/lang/es_ES/errors.yml"),
         setup: include_str!("../resources/lang/es_ES/setup.yml"),
@@ -66,6 +71,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "fr_FR",
         user: include_str!("../resources/lang/fr_FR/user.yml"),
+        skinlib: include_str!("../resources/lang/fr_FR/skinlib.yml"),
         auth: include_str!("../resources/lang/fr_FR/auth.yml"),
         errors: include_str!("../resources/lang/fr_FR/errors.yml"),
         setup: include_str!("../resources/lang/fr_FR/setup.yml"),
@@ -76,6 +82,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "it_IT",
         user: include_str!("../resources/lang/it_IT/user.yml"),
+        skinlib: include_str!("../resources/lang/it_IT/skinlib.yml"),
         auth: include_str!("../resources/lang/it_IT/auth.yml"),
         errors: include_str!("../resources/lang/it_IT/errors.yml"),
         setup: include_str!("../resources/lang/it_IT/setup.yml"),
@@ -86,6 +93,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "ja_JP",
         user: include_str!("../resources/lang/ja_JP/user.yml"),
+        skinlib: include_str!("../resources/lang/ja_JP/skinlib.yml"),
         auth: include_str!("../resources/lang/ja_JP/auth.yml"),
         errors: include_str!("../resources/lang/ja_JP/errors.yml"),
         setup: include_str!("../resources/lang/ja_JP/setup.yml"),
@@ -96,6 +104,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "ko_KR",
         user: include_str!("../resources/lang/ko_KR/user.yml"),
+        skinlib: include_str!("../resources/lang/ko_KR/skinlib.yml"),
         auth: include_str!("../resources/lang/ko_KR/auth.yml"),
         errors: include_str!("../resources/lang/ko_KR/errors.yml"),
         setup: include_str!("../resources/lang/ko_KR/setup.yml"),
@@ -106,6 +115,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "nl_NL",
         user: include_str!("../resources/lang/nl_NL/user.yml"),
+        skinlib: include_str!("../resources/lang/nl_NL/skinlib.yml"),
         auth: include_str!("../resources/lang/nl_NL/auth.yml"),
         errors: include_str!("../resources/lang/nl_NL/errors.yml"),
         setup: include_str!("../resources/lang/nl_NL/setup.yml"),
@@ -116,6 +126,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "pt_PT",
         user: include_str!("../resources/lang/pt_PT/user.yml"),
+        skinlib: include_str!("../resources/lang/pt_PT/skinlib.yml"),
         auth: include_str!("../resources/lang/pt_PT/auth.yml"),
         errors: include_str!("../resources/lang/pt_PT/errors.yml"),
         setup: include_str!("../resources/lang/pt_PT/setup.yml"),
@@ -126,6 +137,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "ru_RU",
         user: include_str!("../resources/lang/ru_RU/user.yml"),
+        skinlib: include_str!("../resources/lang/ru_RU/skinlib.yml"),
         auth: include_str!("../resources/lang/ru_RU/auth.yml"),
         errors: include_str!("../resources/lang/ru_RU/errors.yml"),
         setup: include_str!("../resources/lang/ru_RU/setup.yml"),
@@ -136,6 +148,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "zh_CN",
         user: include_str!("../resources/lang/zh_CN/user.yml"),
+        skinlib: include_str!("../resources/lang/zh_CN/skinlib.yml"),
         auth: include_str!("../resources/lang/zh_CN/auth.yml"),
         errors: include_str!("../resources/lang/zh_CN/errors.yml"),
         setup: include_str!("../resources/lang/zh_CN/setup.yml"),
@@ -146,6 +159,7 @@ const LOCALES: &[LocaleFiles] = &[
     LocaleFiles {
         locale: "zh_TW",
         user: include_str!("../resources/lang/zh_TW/user.yml"),
+        skinlib: include_str!("../resources/lang/zh_TW/skinlib.yml"),
         auth: include_str!("../resources/lang/zh_TW/auth.yml"),
         errors: include_str!("../resources/lang/zh_TW/errors.yml"),
         setup: include_str!("../resources/lang/zh_TW/setup.yml"),
@@ -175,6 +189,7 @@ pub(crate) fn legacy_translation(
         .or_else(|| LOCALES.iter().find(|files| files.locale == "en"))?;
     let english = LOCALES.iter().find(|files| files.locale == "en")?;
     let (source, english_source) = match catalog {
+        "skinlib" => (language.skinlib, english.skinlib),
         "auth" => (language.auth, english.auth),
         "user" => (language.user, english.user),
         "errors" => (language.errors, english.errors),
@@ -456,6 +471,12 @@ mod tests {
         assert_eq!(
             legacy_translation("es_ES", "admin", &["status", "db"], "prefix").as_deref(),
             Some("Prefijo de tabla")
+        );
+        assert_eq!(
+            legacy_translation("es_ES", "skinlib", &["show"], "private").as_deref(),
+            Some(
+                "La textura solicitada es privada y sólo visible para el subidor y los administradores."
+            )
         );
     }
 
