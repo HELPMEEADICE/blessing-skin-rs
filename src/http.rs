@@ -1928,7 +1928,7 @@ async fn web_not_found(
         locale: locale.clone(),
         title: http_error_title(StatusCode::NOT_FOUND).to_owned(),
         site_name: site_name(&state).await,
-        message: http_error_message(&locale, StatusCode::NOT_FOUND).to_owned(),
+        message: http_error_page_message(&locale, StatusCode::NOT_FOUND, None),
         home_url: request_app_url(&state),
     };
     match page.render() {
@@ -1967,6 +1967,51 @@ fn should_render_html_error(path: &str, headers: &HeaderMap) -> bool {
                 media_type.eq_ignore_ascii_case("text/html") && quality > 0.0
             })
         })
+}
+
+fn app_debug_enabled() -> bool {
+    crate::config::legacy_env("APP_DEBUG").is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn should_include_http_error_detail(status: StatusCode, debug: bool) -> bool {
+    status == StatusCode::FORBIDDEN
+        || (debug
+            && matches!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE
+            ))
+}
+
+fn http_error_detail_prefix(locale: &str) -> &'static str {
+    match locale {
+        "de_DE" => "Details: ",
+        "es_ES" => "Detalles: ",
+        "fr_FR" => "Détails : ",
+        "ru_RU" => "Подробнее: ",
+        "zh_CN" => "详细信息：",
+        "zh_TW" => "詳細内容: ",
+        _ => "Details: ",
+    }
+}
+
+fn http_error_page_message(locale: &str, status: StatusCode, detail: Option<String>) -> String {
+    let message = detail.unwrap_or_else(|| http_error_message(locale, status).to_owned());
+    if matches!(
+        status,
+        StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        format!("{}{message}", http_error_detail_prefix(locale))
+    } else {
+        message
+    }
 }
 
 fn http_error_title(status: StatusCode) -> &'static str {
@@ -2101,7 +2146,7 @@ async fn render_html_error_page(
 
     let (mut parts, body) = response.into_parts();
     let locale = request_locale(&state);
-    let detail = if status == StatusCode::FORBIDDEN {
+    let detail = if should_include_http_error_detail(status, app_debug_enabled()) {
         axum::body::to_bytes(body, 32 * 1024)
             .await
             .ok()
@@ -2115,7 +2160,7 @@ async fn render_html_error_page(
         locale: locale.clone(),
         title: http_error_title(status).to_owned(),
         site_name: site_name(&state).await,
-        message: detail.unwrap_or_else(|| http_error_message(&locale, status).to_owned()),
+        message: http_error_page_message(&locale, status, detail),
         home_url: request_app_url(&state),
     };
     let html = match page.render() {
@@ -6312,12 +6357,7 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 
     let chinese = request_locale(&state).starts_with("zh");
-    let debug = crate::config::legacy_env("APP_DEBUG").is_some_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    });
+    let debug = app_debug_enabled();
     let commit = crate::config::legacy_env("GIT_COMMIT")
         .or_else(|| crate::config::legacy_env("SOURCE_VERSION"))
         .unwrap_or_default();
@@ -18950,7 +18990,7 @@ mod tests {
         )
         .unwrap();
         assert!(denied.contains("403 Forbidden"));
-        assert!(denied.contains("Permission denied"));
+        assert!(denied.contains("Details: Permission denied"));
 
         let method_not_allowed = error_app
             .clone()
@@ -19030,7 +19070,12 @@ mod tests {
         )
         .unwrap();
         assert!(unavailable.contains("503 Service Unavailable"));
-        assert!(!unavailable.contains("maintenance details"));
+        if super::app_debug_enabled() {
+            assert!(unavailable.contains("Details: maintenance details"));
+        } else {
+            assert!(!unavailable.contains("maintenance details"));
+            assert!(unavailable.contains("Details: The application is now in maintenance mode."));
+        }
 
         let internal_error = error_app
             .oneshot(
@@ -19050,7 +19095,28 @@ mod tests {
         )
         .unwrap();
         assert!(internal_error.contains("500 Internal Server Error"));
-        assert!(!internal_error.contains("database password=secret"));
+        if super::app_debug_enabled() {
+            assert!(internal_error.contains("Details: database password=secret"));
+        } else {
+            assert!(!internal_error.contains("database password=secret"));
+            assert!(internal_error.contains("Details: Please try again later."));
+        }
+        assert!(super::should_include_http_error_detail(
+            StatusCode::FORBIDDEN,
+            false
+        ));
+        assert!(!super::should_include_http_error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false
+        ));
+        assert!(super::should_include_http_error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            true
+        ));
+        assert!(super::should_include_http_error_detail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            true
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
