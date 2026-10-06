@@ -1950,6 +1950,7 @@ fn should_render_html_error(path: &str, headers: &HeaderMap) -> bool {
 fn http_error_title(status: StatusCode) -> &'static str {
     match status {
         StatusCode::FORBIDDEN => "403 Forbidden",
+        StatusCode::METHOD_NOT_ALLOWED => "405 Method Not Allowed",
         StatusCode::NOT_FOUND => "404 Not Found",
         StatusCode::INTERNAL_SERVER_ERROR => "500 Internal Server Error",
         StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable",
@@ -1961,6 +1962,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
     match locale {
         "de_DE" => match status {
             StatusCode::FORBIDDEN => "Sie haben keine Zugriffsberechtigung für diese Seite.",
+            StatusCode::METHOD_NOT_ALLOWED => "Methode ist nicht zulässig.",
             StatusCode::NOT_FOUND => "Hier ist nichts.",
             StatusCode::INTERNAL_SERVER_ERROR => "Bitte später nochmal versuchen.",
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -1970,6 +1972,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "es_ES" => match status {
             StatusCode::FORBIDDEN => "No tiene permiso para accesar esta página.",
+            StatusCode::METHOD_NOT_ALLOWED => "Método no permitido.",
             StatusCode::NOT_FOUND => "No hay nada.",
             StatusCode::INTERNAL_SERVER_ERROR => "Por favor intente más tarde.",
             StatusCode::SERVICE_UNAVAILABLE => "La aplicación está ahora en modo de mantenimiento.",
@@ -1977,6 +1980,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "fr_FR" => match status {
             StatusCode::FORBIDDEN => "Vous n'avez pas la permission d'accéder à cette page.",
+            StatusCode::METHOD_NOT_ALLOWED => "Méthode non autorisée.",
             StatusCode::NOT_FOUND => "Il n'y a rien ici.",
             StatusCode::INTERNAL_SERVER_ERROR => "Veuillez réessayer plus tard.",
             StatusCode::SERVICE_UNAVAILABLE => "L'application est maintenant en mode maintenance.",
@@ -1984,6 +1988,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "ko_KR" => match status {
             StatusCode::FORBIDDEN => "이 페이지의 액세스 권한이 없습니다.",
+            StatusCode::METHOD_NOT_ALLOWED => "지원되지 않는 방법입니다.",
             StatusCode::NOT_FOUND => "여기에 아무것도 없어!",
             StatusCode::INTERNAL_SERVER_ERROR => "나중에 다시 시도해주십시오.",
             StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
@@ -1991,6 +1996,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "ru_RU" => match status {
             StatusCode::FORBIDDEN => "У вас нет прав доступа для этой страницы.",
+            StatusCode::METHOD_NOT_ALLOWED => "Метод не поддерживается.",
             StatusCode::NOT_FOUND => "Здесь пусто.",
             StatusCode::INTERNAL_SERVER_ERROR => "Пожалуйста, повторите попытку позже.",
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -2000,6 +2006,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "zh_CN" => match status {
             StatusCode::FORBIDDEN => "您无权访问此页面。",
+            StatusCode::METHOD_NOT_ALLOWED => "不允许的 HTTP 请求方法",
             StatusCode::NOT_FOUND => "这里什么都没有哦",
             StatusCode::INTERNAL_SERVER_ERROR => "服务器内部错误，请稍后再试。",
             StatusCode::SERVICE_UNAVAILABLE => "网站维护中",
@@ -2007,6 +2014,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         "zh_TW" => match status {
             StatusCode::FORBIDDEN => "您無權使用這個頁面。",
+            StatusCode::METHOD_NOT_ALLOWED => "請求不被允許。",
             StatusCode::NOT_FOUND => "這裡甚麼都沒有。",
             StatusCode::INTERNAL_SERVER_ERROR => "請稍後再試一次。",
             StatusCode::SERVICE_UNAVAILABLE => "網站現在正在維護中。",
@@ -2014,6 +2022,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         },
         _ => match status {
             StatusCode::FORBIDDEN => "You have no permission to access this page.",
+            StatusCode::METHOD_NOT_ALLOWED => "Method not allowed.",
             StatusCode::NOT_FOUND => "Nothing here.",
             StatusCode::INTERNAL_SERVER_ERROR => "Please try again later.",
             StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
@@ -2033,7 +2042,10 @@ async fn render_html_error_page(
     let status = response.status();
     if !matches!(
         status,
-        StatusCode::FORBIDDEN | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::FORBIDDEN
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::SERVICE_UNAVAILABLE
     ) || !should_render_html_error(&path, &request_headers)
     {
         return response;
@@ -18842,6 +18854,7 @@ mod tests {
                 "/denied",
                 axum::routing::get(|| async { (StatusCode::FORBIDDEN, "Permission denied") }),
             )
+            .route("/method", axum::routing::get(|| async { "GET only" }))
             .route(
                 "/api/denied",
                 axum::routing::get(|| async { (StatusCode::FORBIDDEN, "Permission denied") }),
@@ -18901,6 +18914,28 @@ mod tests {
         .unwrap();
         assert!(denied.contains("403 Forbidden"));
         assert!(denied.contains("Permission denied"));
+
+        let method_not_allowed = error_app
+            .clone()
+            .oneshot(
+                Request::post("/method")
+                    .header("accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(method_not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(method_not_allowed.headers().contains_key("allow"));
+        let method_not_allowed = String::from_utf8(
+            to_bytes(method_not_allowed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(method_not_allowed.contains("405 Method Not Allowed"));
+        assert!(method_not_allowed.contains("Method not allowed."));
 
         let api_denied = error_app
             .clone()
