@@ -3,10 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>
-      {% if locale.starts_with("zh") %}版本更新{% else %}Rust service releases{%
-      endif %} - {{ site_name }}
-    </title>
+    <title>{{ copy.page_title }} - {{ site_name }}</title>
     <style>
       body {
         font: 16px system-ui, sans-serif;
@@ -65,101 +62,45 @@
   <body>
     <main>
       <header>
-        <h1>
-          {% if locale.starts_with("zh") %}Rust 服务版本更新{% else %}Rust
-          service updates{% endif %}
-        </h1>
-        <a href="/admin"
-          >{% if locale.starts_with("zh") %}返回管理后台{% else %}Admin
-          dashboard{% endif %}</a
-        >
+        <h1>{{ copy.title }}</h1>
+        <a href="/admin">{{ copy.back }}</a>
       </header>
       <section>
-        <h2>
-          {% if locale.starts_with("zh") %}当前版本{% else %}Current version{%
-          endif %}
-        </h2>
+        <h2>{{ copy.current_version }}</h2>
         <p class="version">{{ version }}</p>
         {% if update_check_failed %}
-        <p role="status">
-          {% if locale.starts_with("zh")
-          %}暂时无法检查最新版本；仍可打开发行页手动查看。{% else %}Could not
-          check for a newer release. You can still view releases manually.{%
-          endif %}
-        </p>
+        <p role="status">{{ copy.check_failed }}</p>
         {% else if update_check_disabled %}
-        <p role="status">
-          {% if locale.starts_with("zh") %}版本检查已禁用。{% else %}Release
-          checks are disabled.{% endif %}
-        </p>
+        <p role="status">{{ copy.check_disabled }}</p>
         {% else if update_check_no_release %}
-        <p role="status">
-          {% if locale.starts_with("zh") %}该仓库尚未发布正式发行版。{% else
-          %}This repository has not published a release yet.{% endif %}
-        </p>
+        <p role="status">{{ copy.no_release }}</p>
         {% else if has_release_info %}
         <p role="status">
-          {% if update_available %} {% if locale.starts_with("zh")
-          %}发现新版本：<strong>{{ latest_version }}</strong>。{% else %}New
-          version available: <strong>{{ latest_version }}</strong>.{% endif %}
-          {% else %} {% if locale.starts_with("zh") %}最新版本：<strong
-            >{{ latest_version }}</strong
-          >；当前已是最新版本。{% else %}Latest version:
-          <strong>{{ latest_version }}</strong>; this service is up to date.{%
-          endif %} {% endif %}
+          {% if update_available %} {{ copy.update_available }}{{
+          copy.status_colon }} <strong>{{ latest_version }}</strong>{{
+          copy.status_period }} {% else %} {{ copy.latest_version }}
+          <strong>{{ latest_version }}</strong>{{ copy.version_separator }}{{
+          copy.up_to_date }} {% endif %}
         </p>
         {% endif %}
-        <p>
-          {% if locale.starts_with("zh") %}发行包提供 Linux
-          x86_64/ARM64、Windows x86_64 和 macOS x86_64/ARM64 版本。{% else
-          %}Release packages are available for Linux x86_64/ARM64, Windows
-          x86_64, and macOS x86_64/ARM64.{% endif %}
-        </p>
+        <p>{{ copy.platforms }}</p>
         <a
           class="button"
           href="{{ releases_url }}"
           target="_blank"
           rel="noopener noreferrer"
-          >{% if locale.starts_with("zh") %}查看并下载发行包{% else %}View and
-          download releases{% endif %}</a
+          >{{ copy.releases_link }}</a
         >
       </section>
       <section>
-        <h2>
-          {% if locale.starts_with("zh") %}升级步骤{% else %}Update steps{%
-          endif %}
-        </h2>
+        <h2>{{ copy.steps_title }}</h2>
         <ol>
-          <li>
-            {% if locale.starts_with("zh") %}备份数据库和纹理目录。{% else
-            %}Back up the database and texture directory.{% endif %}
-          </li>
-          <li>
-            {% if locale.starts_with("zh") %}停止 Rust
-            服务，下载适用于当前操作系统和架构的软件包。{% else %}Stop the Rust
-            service and download the package for this operating system and
-            architecture.{% endif %}
-          </li>
-          <li>
-            {% if locale.starts_with("zh") %}替换可执行文件和
-            <code>public/app</code> 前端资源，保留
-            <code>.env</code>、<code>storage</code>、Passport 密钥和纹理文件。{%
-            else %}Replace the executable and <code>public/app</code> assets.
-            Keep <code>.env</code>, <code>storage</code>, Passport keys, and
-            texture files.{% endif %}
-          </li>
-          <li>
-            {% if locale.starts_with("zh") %}重新启动服务并确认
-            <code>/health/ready</code> 返回成功。{% else %}Restart the service
-            and confirm <code>/health/ready</code> succeeds.{% endif %}
-          </li>
+          <li>{{ copy.backup_step }}</li>
+          <li>{{ copy.download_step }}</li>
+          <li>{{ copy.replace_step }}</li>
+          <li>{{ copy.restart_step }}</li>
         </ol>
-        <p>
-          {% if locale.starts_with("zh") %}旧 PHP
-          站点直接复用现有数据库和纹理目录，不要运行新站安装器。{% else %}An
-          existing PHP installation reuses its current database and texture
-          directory. Do not run the new-site installer.{% endif %}
-        </p>
+        <p>{{ copy.existing_site_note }}</p>
       </section>
     </main>
   </body>

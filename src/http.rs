@@ -6310,10 +6310,35 @@ struct AdminStatusPageCopy {
     no_plugins: String,
 }
 
+struct AdminUpdatePageCopy {
+    page_title: String,
+    title: String,
+    back: String,
+    current_version: String,
+    latest_version: String,
+    check_failed: String,
+    check_disabled: String,
+    no_release: String,
+    update_available: String,
+    status_colon: String,
+    status_period: String,
+    up_to_date: String,
+    releases_link: String,
+    platforms: String,
+    steps_title: String,
+    backup_step: String,
+    download_step: String,
+    replace_step: String,
+    restart_step: String,
+    existing_site_note: String,
+    version_separator: String,
+}
+
 #[derive(Template)]
 #[template(path = "admin_update.html")]
 struct AdminUpdatePage {
     site_name: String,
+    copy: AdminUpdatePageCopy,
     locale: String,
     version: String,
     latest_version: String,
@@ -7667,6 +7692,110 @@ async fn web_admin_status(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 }
 
+fn admin_update_page_copy(locale: &str) -> AdminUpdatePageCopy {
+    let translated = |path: &[&str], key: &str, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, "admin", path, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let strip_sentence_punctuation = |value: String| {
+        value
+            .trim_end_matches(&['.', ':', '!', '?', '。', '：', '！', '？'][..])
+            .trim_end()
+            .to_owned()
+    };
+    let is_chinese = locale.starts_with("zh");
+    let title = translated(&["update", "info"], "title", "Update Information");
+    let page_title = if is_chinese {
+        "Rust 服务版本更新".to_owned()
+    } else if locale == "en" {
+        "Rust service releases".to_owned()
+    } else {
+        format!("Rust · {title}")
+    };
+
+    AdminUpdatePageCopy {
+        page_title: page_title.clone(),
+        title: page_title,
+        back: crate::mail_templates::legacy_translation(locale, "general", &[], "admin-panel")
+            .unwrap_or_else(|| "Admin dashboard".to_owned()),
+        current_version: if locale == "en" {
+            "Current version".to_owned()
+        } else {
+            translated(
+                &["update", "info", "versions"],
+                "current",
+                "Current version:",
+            )
+        },
+        latest_version: translated(&["update", "info", "versions"], "latest", "Latest version:"),
+        check_failed: if is_chinese {
+            "暂时无法检查最新版本；仍可打开发行页手动查看。".to_owned()
+        } else {
+            "Could not check for a newer release. You can still view releases manually.".to_owned()
+        },
+        check_disabled: if is_chinese {
+            "版本检查已禁用。".to_owned()
+        } else {
+            "Release checks are disabled.".to_owned()
+        },
+        no_release: if is_chinese {
+            "该仓库尚未发布正式发行版。".to_owned()
+        } else {
+            "This repository has not published a release yet.".to_owned()
+        },
+        update_available: strip_sentence_punctuation(translated(
+            &["update", "info"],
+            "available",
+            "New version available.",
+        )),
+        status_colon: if is_chinese { "：" } else { ":" }.to_owned(),
+        status_period: if is_chinese { "。" } else { "." }.to_owned(),
+        up_to_date: translated(
+            &["update", "info"],
+            "up-to-date",
+            "This service is up to date.",
+        ),
+        releases_link: translated(&["update", "info"], "check-github", "Check GitHub Releases"),
+        platforms: if is_chinese {
+            "发行包提供 Linux x86_64/ARM64、Windows x86_64 和 macOS x86_64/ARM64 版本。".to_owned()
+        } else {
+            "Release packages are available for Linux x86_64/ARM64, Windows x86_64, and macOS x86_64/ARM64.".to_owned()
+        },
+        steps_title: if is_chinese {
+            "升级步骤".to_owned()
+        } else {
+            "Update steps".to_owned()
+        },
+        backup_step: if is_chinese {
+            "备份数据库和纹理目录。".to_owned()
+        } else {
+            "Back up the database and texture directory.".to_owned()
+        },
+        download_step: if is_chinese {
+            "停止 Rust 服务，下载适用于当前操作系统和架构的软件包。".to_owned()
+        } else {
+            "Stop the Rust service and download the package for this operating system and architecture.".to_owned()
+        },
+        replace_step: if is_chinese {
+            "替换可执行文件和 public/app 前端资源，保留 .env、storage、Passport 密钥和纹理文件。"
+                .to_owned()
+        } else {
+            "Replace the executable and public/app assets. Keep .env, storage, Passport keys, and texture files.".to_owned()
+        },
+        restart_step: if is_chinese {
+            "重新启动服务并确认 /health/ready 返回成功。".to_owned()
+        } else {
+            "Restart the service and confirm /health/ready succeeds.".to_owned()
+        },
+        existing_site_note: if is_chinese {
+            "旧 PHP 站点直接复用现有数据库和纹理目录，不要运行新站安装器。".to_owned()
+        } else {
+            "An existing PHP installation reuses its current database and texture directory. Do not run the new-site installer.".to_owned()
+        },
+        version_separator: if is_chinese { "；" } else { "; " }.to_owned(),
+    }
+}
+
 async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match authenticated_web_user(&state, &headers).await {
         Ok(user) => user,
@@ -7700,9 +7829,11 @@ async fn web_admin_update(State(state): State<AppState>, headers: HeaderMap) -> 
     } else {
         (String::new(), false, false, false, false)
     };
+    let locale = request_locale(&state);
     let page = AdminUpdatePage {
         site_name: site_name(&state).await,
-        locale: request_locale(&state),
+        copy: admin_update_page_copy(&locale),
+        locale,
         version: state.config.rust_version.to_owned(),
         latest_version,
         has_release_info,
@@ -20492,6 +20623,59 @@ mod tests {
         assert_eq!(russian.labels.notifications, "Уведомления");
         assert_eq!(russian.labels.no_players, "У вас пока нет игроков");
         assert_eq!(russian.announcement, "Объявление");
+    }
+
+    #[test]
+    fn admin_update_copy_reuses_legacy_catalogs_for_supported_locales() {
+        let spanish = super::admin_update_page_copy("es_ES");
+        assert_eq!(spanish.page_title, "Rust · Actualizar información");
+        assert_eq!(spanish.title, "Rust · Actualizar información");
+        assert_eq!(spanish.back, "Panel de administración");
+        assert_eq!(spanish.current_version, "Versión actual:");
+        assert_eq!(spanish.latest_version, "Última versión:");
+        assert_eq!(spanish.update_available, "Nueva versión disponible");
+        assert_eq!(spanish.up_to_date, "Ya está actualizado.");
+        assert_eq!(spanish.releases_link, "Comprobar versiones de GitHub");
+        assert!(spanish.download_step.starts_with("Stop the Rust service"));
+
+        let chinese = super::admin_update_page_copy("zh_CN");
+        assert_eq!(chinese.page_title, "Rust 服务版本更新");
+        assert_eq!(chinese.update_available, "有更新可用");
+        assert_eq!(chinese.status_colon, "：");
+        assert_eq!(chinese.status_period, "。");
+        assert_eq!(chinese.version_separator, "；");
+        assert!(chinese.download_step.starts_with("停止 Rust 服务"));
+
+        let unknown = super::admin_update_page_copy("missing");
+        assert_eq!(unknown.title, "Rust · Update Information");
+        assert_eq!(unknown.back, "Admin Panel");
+    }
+
+    #[test]
+    fn admin_update_template_renders_catalog_copy_and_release_status() {
+        let copy = super::admin_update_page_copy("es_ES");
+        let page = super::AdminUpdatePage {
+            site_name: "Blessing Skin".to_owned(),
+            copy,
+            locale: "es_ES".to_owned(),
+            version: "1.0.0".to_owned(),
+            latest_version: "1.1.0".to_owned(),
+            has_release_info: true,
+            update_available: true,
+            update_check_failed: false,
+            update_check_disabled: false,
+            update_check_no_release: false,
+            releases_url: "https://example.test/releases".to_owned(),
+        };
+
+        let html = page.render().unwrap();
+        assert!(html.contains("Rust · Actualizar información"));
+        assert!(html.contains("Panel de administración"));
+        assert!(html.contains("Versión actual:"));
+        assert!(html.contains("Nueva versión disponible: <strong>1.1.0</strong>."));
+        assert!(html.contains("1.1.0"));
+        assert!(html.contains("Comprobar versiones de GitHub"));
+        assert!(!html.contains("Current version"));
     }
 
     #[test]
