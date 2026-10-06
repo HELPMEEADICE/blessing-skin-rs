@@ -13,7 +13,8 @@ const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum ImageCacheKey {
     Preview {
-        tid: i64,
+        texture_hash: String,
+        texture_type: String,
         png: bool,
         cape_height: Option<u32>,
     },
@@ -146,7 +147,8 @@ mod tests {
 
     fn key(tid: i64) -> ImageCacheKey {
         ImageCacheKey::Preview {
-            tid,
+            texture_hash: format!("{tid:064x}"),
+            texture_type: "steve".to_owned(),
             png: true,
             cape_height: None,
         }

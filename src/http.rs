@@ -19553,7 +19553,8 @@ async fn preview_for_texture(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let cache_key = ImageCacheKey::Preview {
-        tid,
+        texture_hash: texture.hash.clone(),
+        texture_type: texture.texture_type.clone(),
         png: use_png,
         cape_height: (texture.texture_type == "cape").then_some(height),
     };
@@ -28556,13 +28557,40 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/preview/900001?png")
-                    .header(axum::http::header::IF_NONE_MATCH, skin_preview_etag)
+                    .header(axum::http::header::IF_NONE_MATCH, skin_preview_etag.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(cached_skin_preview.status(), StatusCode::NOT_MODIFIED);
+        sqlx::query("UPDATE textures SET type = 'steve' WHERE tid = 900001")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed_skin_model_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/preview/900001?png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed_skin_model_preview.status(), StatusCode::OK);
+        assert_ne!(
+            changed_skin_model_preview
+                .headers()
+                .get(axum::http::header::ETAG)
+                .unwrap(),
+            &skin_preview_etag,
+            "changing the texture model must render a fresh preview"
+        );
+        sqlx::query("UPDATE textures SET type = 'alex' WHERE tid = 900001")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let cape_preview_uri = format!("/preview/hash/{preview_cape_hash}?png&height=160");
         let cape_preview = app
