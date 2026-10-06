@@ -924,7 +924,7 @@ async fn web_csrf_mismatch_response(
         locale: locale.to_owned(),
         title: http_error_title(status).to_owned(),
         site_name,
-        message: http_error_message(locale, status).to_owned(),
+        message: http_error_message(locale, status),
         home_url: request_app_url(state),
     };
     match page.render() {
@@ -2540,7 +2540,7 @@ fn http_error_detail_prefix(locale: &str) -> &'static str {
 }
 
 fn http_error_page_message(locale: &str, status: StatusCode, detail: Option<String>) -> String {
-    let message = detail.unwrap_or_else(|| http_error_message(locale, status).to_owned());
+    let message = detail.unwrap_or_else(|| http_error_message(locale, status));
     if matches!(
         status,
         StatusCode::FORBIDDEN
@@ -2684,99 +2684,46 @@ fn http_error_title(status: StatusCode) -> &'static str {
     }
 }
 
-fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
-    match locale {
-        "de_DE" => match status {
-            StatusCode::FORBIDDEN => "Sie haben keine Zugriffsberechtigung für diese Seite.",
-            StatusCode::METHOD_NOT_ALLOWED => "Methode ist nicht zulässig.",
-            StatusCode::PAYLOAD_TOO_LARGE => "Die übermittelten Daten sind zu groß.",
-            status if status.as_u16() == 419 => {
-                "Token stimmt nicht überein. Laden Sie die Seite neu."
-            }
-            StatusCode::NOT_FOUND => "Hier ist nichts.",
-            StatusCode::INTERNAL_SERVER_ERROR => "Bitte später nochmal versuchen.",
-            StatusCode::SERVICE_UNAVAILABLE => {
-                "Die Anwendung befindet sich jetzt im Wartungsmodus."
-            }
-            _ => "Fehler aufgetreten",
-        },
-        "es_ES" => match status {
-            StatusCode::FORBIDDEN => "No tiene permiso para accesar esta página.",
-            StatusCode::METHOD_NOT_ALLOWED => "Método no permitido.",
-            StatusCode::PAYLOAD_TOO_LARGE => "Los datos enviados son demasiado grandes.",
-            status if status.as_u16() == 419 => "El token no coincide, intente recargar la página.",
-            StatusCode::NOT_FOUND => "No hay nada.",
-            StatusCode::INTERNAL_SERVER_ERROR => "Por favor intente más tarde.",
-            StatusCode::SERVICE_UNAVAILABLE => "La aplicación está ahora en modo de mantenimiento.",
-            _ => "Se produjo un error",
-        },
-        "fr_FR" => match status {
-            StatusCode::FORBIDDEN => "Vous n'avez pas la permission d'accéder à cette page.",
-            StatusCode::METHOD_NOT_ALLOWED => "Méthode non autorisée.",
-            StatusCode::PAYLOAD_TOO_LARGE => "Les données envoyées sont trop volumineuses.",
-            status if status.as_u16() == 419 => {
-                "Le jeton ne correspond pas, essayez de recharger la page."
-            }
-            StatusCode::NOT_FOUND => "Il n'y a rien ici.",
-            StatusCode::INTERNAL_SERVER_ERROR => "Veuillez réessayer plus tard.",
-            StatusCode::SERVICE_UNAVAILABLE => "L'application est maintenant en mode maintenance.",
-            _ => "Une erreur s'est produite",
-        },
-        "ko_KR" => match status {
-            StatusCode::FORBIDDEN => "이 페이지의 액세스 권한이 없습니다.",
-            StatusCode::METHOD_NOT_ALLOWED => "지원되지 않는 방법입니다.",
-            StatusCode::PAYLOAD_TOO_LARGE => "전송한 데이터가 너무 큽니다.",
-            status if status.as_u16() == 419 => "Token does not match, try reloading the page.",
-            StatusCode::NOT_FOUND => "여기에 아무것도 없어!",
-            StatusCode::INTERNAL_SERVER_ERROR => "나중에 다시 시도해주십시오.",
-            StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
-            _ => "오류가 발생했습니다",
-        },
-        "ru_RU" => match status {
-            StatusCode::FORBIDDEN => "У вас нет прав доступа для этой страницы.",
-            StatusCode::METHOD_NOT_ALLOWED => "Метод не поддерживается.",
-            StatusCode::PAYLOAD_TOO_LARGE => "Размер отправленных данных слишком велик.",
-            status if status.as_u16() == 419 => {
-                "Токен не совпадает, попробуйте перезагрузить страницу."
-            }
-            StatusCode::NOT_FOUND => "Здесь пусто.",
-            StatusCode::INTERNAL_SERVER_ERROR => "Пожалуйста, повторите попытку позже.",
-            StatusCode::SERVICE_UNAVAILABLE => {
-                "В настоящее время приложение находится в режиме обслуживания."
-            }
-            _ => "Произошла ошибка",
-        },
-        "zh_CN" => match status {
-            StatusCode::FORBIDDEN => "您无权访问此页面。",
-            StatusCode::METHOD_NOT_ALLOWED => "不允许的 HTTP 请求方法",
-            StatusCode::PAYLOAD_TOO_LARGE => "提交的数据过大。",
-            status if status.as_u16() == 419 => "Token 不正确，请尝试刷新页面",
-            StatusCode::NOT_FOUND => "这里什么都没有哦",
-            StatusCode::INTERNAL_SERVER_ERROR => "服务器内部错误，请稍后再试。",
-            StatusCode::SERVICE_UNAVAILABLE => "网站维护中",
-            _ => "出现错误",
-        },
-        "zh_TW" => match status {
-            StatusCode::FORBIDDEN => "您無權使用這個頁面。",
-            StatusCode::METHOD_NOT_ALLOWED => "請求不被允許。",
-            StatusCode::PAYLOAD_TOO_LARGE => "提交的資料過大。",
-            status if status.as_u16() == 419 => "Token 不匹配，請嘗試重新載入該頁。",
-            StatusCode::NOT_FOUND => "這裡甚麼都沒有。",
-            StatusCode::INTERNAL_SERVER_ERROR => "請稍後再試一次。",
-            StatusCode::SERVICE_UNAVAILABLE => "網站現在正在維護中。",
-            _ => "發生錯誤",
-        },
-        _ => match status {
-            StatusCode::FORBIDDEN => "You have no permission to access this page.",
-            StatusCode::METHOD_NOT_ALLOWED => "Method not allowed.",
-            StatusCode::PAYLOAD_TOO_LARGE => "The submitted data is too large.",
-            status if status.as_u16() == 419 => "CSRF token mismatched.",
-            StatusCode::NOT_FOUND => "Nothing here.",
-            StatusCode::INTERNAL_SERVER_ERROR => "Please try again later.",
-            StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
-            _ => "Error occurred",
-        },
+fn http_error_message(locale: &str, status: StatusCode) -> String {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return match locale {
+            "de_DE" => "Die übermittelten Daten sind zu groß.",
+            "es_ES" => "Los datos enviados son demasiado grandes.",
+            "fr_FR" => "Les données envoyées sont trop volumineuses.",
+            "ko_KR" => "전송한 데이터가 너무 큽니다.",
+            "ru_RU" => "Размер отправленных данных слишком велик.",
+            "zh_CN" => "提交的数据过大。",
+            "zh_TW" => "提交的資料過大。",
+            _ => "The submitted data is too large.",
+        }
+        .to_owned();
     }
+
+    let key = match status {
+        StatusCode::FORBIDDEN => "msg-403",
+        StatusCode::METHOD_NOT_ALLOWED => "method-not-allowed",
+        status if status.as_u16() == 419 => "csrf-token-mismatch",
+        StatusCode::NOT_FOUND => "msg-404",
+        StatusCode::INTERNAL_SERVER_ERROR => "msg-500",
+        StatusCode::SERVICE_UNAVAILABLE => "msg-503",
+        _ => return legacy_http_error_title(locale),
+    };
+    let fallback = match key {
+        "msg-403" => "You have no permission to access this page.",
+        "method-not-allowed" => "Method not allowed.",
+        "csrf-token-mismatch" => "Token does not match, try reloading the page.",
+        "msg-404" => "Nothing here.",
+        "msg-500" => "Please try again later.",
+        "msg-503" => "The application is now in maintenance mode.",
+        _ => "Error occurred",
+    };
+    crate::mail_templates::legacy_translation(locale, "errors", &["http"], key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn legacy_http_error_title(locale: &str) -> String {
+    crate::mail_templates::legacy_translation(locale, "errors", &["general"], "title")
+        .unwrap_or_else(|| "Error occurred".to_owned())
 }
 
 async fn render_html_error_page(
@@ -20045,6 +19992,26 @@ mod tests {
         assert_eq!(
             super::auth_form_label("fr_FR", "remember", "Remember me"),
             "Remember me"
+        );
+    }
+
+    #[test]
+    fn html_http_errors_reuse_legacy_translations_and_keep_payload_fallbacks() {
+        assert_eq!(
+            super::http_error_message("es_ES", axum::http::StatusCode::NOT_FOUND),
+            "No hay nada."
+        );
+        assert_eq!(
+            super::http_error_message("ru_RU", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+            "Метод не поддерживается."
+        );
+        assert_eq!(
+            super::http_error_message("zh_TW", axum::http::StatusCode::PAYLOAD_TOO_LARGE),
+            "提交的資料過大。"
+        );
+        assert_eq!(
+            super::http_error_message("missing", axum::http::StatusCode::NOT_FOUND),
+            "Nothing here."
         );
     }
 
