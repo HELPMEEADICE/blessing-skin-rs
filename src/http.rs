@@ -452,20 +452,42 @@ fn request_wants_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn web_csrf_mismatch_response(headers: &HeaderMap) -> Response {
+async fn web_csrf_mismatch_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    locale: &str,
+) -> Response {
     let status = StatusCode::from_u16(419).expect("HTTP 419 is a valid status");
     if request_wants_json(headers) {
-        (
+        return (
             status,
             Json(serde_json::json!({"message": "CSRF token mismatched."})),
         )
-            .into_response()
-    } else {
-        (
-            status,
-            Html("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Page Expired</title></head><body><h1>Page Expired</h1><p>CSRF token mismatched.</p></body></html>"),
-        )
-            .into_response()
+            .into_response();
+    }
+
+    let site_name = REQUEST_LOCALE
+        .scope(locale.to_owned(), site_name(state))
+        .await;
+    let page = NotFoundPage {
+        locale: locale.to_owned(),
+        title: http_error_title(status).to_owned(),
+        site_name,
+        message: http_error_message(locale, status).to_owned(),
+        home_url: request_app_url(state),
+    };
+    match page.render() {
+        Ok(html) => {
+            let mut response = (status, Html(html)).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => {
+            tracing::error!(%error, status = status.as_u16(), "failed to render CSRF error page");
+            (status, "").into_response()
+        }
     }
 }
 
@@ -783,6 +805,8 @@ async fn detect_locale_preference(
     let method = request.method().clone();
     let request_headers = request.headers().clone();
     let is_api = path == "/api" || path.starts_with("/api/");
+    let input_locale = body_locale.or_else(|| requested_query_locale(&request));
+    let mut locale = select_request_locale(&state, &request, input_locale.as_deref());
     if state.session_key.is_some()
         && requires_web_csrf(path, &method)
         && !valid_web_csrf_request(
@@ -794,7 +818,7 @@ async fn detect_locale_preference(
                 .or(form_csrf_token.as_deref()),
         )
     {
-        return web_csrf_mismatch_response(&request_headers);
+        return web_csrf_mismatch_response(&state, &request_headers, &locale).await;
     }
     let inject_csrf = state.session_key.is_some()
         && method == Method::GET
@@ -812,8 +836,6 @@ async fn detect_locale_preference(
         } else {
             None
         };
-    let input_locale = body_locale.or_else(|| requested_query_locale(&request));
-    let mut locale = select_request_locale(&state, &request, input_locale.as_deref());
     if !is_api && is_user_facing_web_path(path) {
         if let (Some(user_id), Some(database)) = (
             session_user_id(&state, request.headers()),
@@ -1951,6 +1973,7 @@ fn http_error_title(status: StatusCode) -> &'static str {
     match status {
         StatusCode::FORBIDDEN => "403 Forbidden",
         StatusCode::METHOD_NOT_ALLOWED => "405 Method Not Allowed",
+        status if status.as_u16() == 419 => "419 Page Expired",
         StatusCode::NOT_FOUND => "404 Not Found",
         StatusCode::INTERNAL_SERVER_ERROR => "500 Internal Server Error",
         StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable",
@@ -1963,6 +1986,9 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "de_DE" => match status {
             StatusCode::FORBIDDEN => "Sie haben keine Zugriffsberechtigung für diese Seite.",
             StatusCode::METHOD_NOT_ALLOWED => "Methode ist nicht zulässig.",
+            status if status.as_u16() == 419 => {
+                "Token stimmt nicht überein. Laden Sie die Seite neu."
+            }
             StatusCode::NOT_FOUND => "Hier ist nichts.",
             StatusCode::INTERNAL_SERVER_ERROR => "Bitte später nochmal versuchen.",
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -1973,6 +1999,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "es_ES" => match status {
             StatusCode::FORBIDDEN => "No tiene permiso para accesar esta página.",
             StatusCode::METHOD_NOT_ALLOWED => "Método no permitido.",
+            status if status.as_u16() == 419 => "El token no coincide, intente recargar la página.",
             StatusCode::NOT_FOUND => "No hay nada.",
             StatusCode::INTERNAL_SERVER_ERROR => "Por favor intente más tarde.",
             StatusCode::SERVICE_UNAVAILABLE => "La aplicación está ahora en modo de mantenimiento.",
@@ -1981,6 +2008,9 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "fr_FR" => match status {
             StatusCode::FORBIDDEN => "Vous n'avez pas la permission d'accéder à cette page.",
             StatusCode::METHOD_NOT_ALLOWED => "Méthode non autorisée.",
+            status if status.as_u16() == 419 => {
+                "Le jeton ne correspond pas, essayez de recharger la page."
+            }
             StatusCode::NOT_FOUND => "Il n'y a rien ici.",
             StatusCode::INTERNAL_SERVER_ERROR => "Veuillez réessayer plus tard.",
             StatusCode::SERVICE_UNAVAILABLE => "L'application est maintenant en mode maintenance.",
@@ -1989,6 +2019,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "ko_KR" => match status {
             StatusCode::FORBIDDEN => "이 페이지의 액세스 권한이 없습니다.",
             StatusCode::METHOD_NOT_ALLOWED => "지원되지 않는 방법입니다.",
+            status if status.as_u16() == 419 => "Token does not match, try reloading the page.",
             StatusCode::NOT_FOUND => "여기에 아무것도 없어!",
             StatusCode::INTERNAL_SERVER_ERROR => "나중에 다시 시도해주십시오.",
             StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
@@ -1997,6 +2028,9 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "ru_RU" => match status {
             StatusCode::FORBIDDEN => "У вас нет прав доступа для этой страницы.",
             StatusCode::METHOD_NOT_ALLOWED => "Метод не поддерживается.",
+            status if status.as_u16() == 419 => {
+                "Токен не совпадает, попробуйте перезагрузить страницу."
+            }
             StatusCode::NOT_FOUND => "Здесь пусто.",
             StatusCode::INTERNAL_SERVER_ERROR => "Пожалуйста, повторите попытку позже.",
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -2007,6 +2041,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "zh_CN" => match status {
             StatusCode::FORBIDDEN => "您无权访问此页面。",
             StatusCode::METHOD_NOT_ALLOWED => "不允许的 HTTP 请求方法",
+            status if status.as_u16() == 419 => "Token 不正确，请尝试刷新页面",
             StatusCode::NOT_FOUND => "这里什么都没有哦",
             StatusCode::INTERNAL_SERVER_ERROR => "服务器内部错误，请稍后再试。",
             StatusCode::SERVICE_UNAVAILABLE => "网站维护中",
@@ -2015,6 +2050,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         "zh_TW" => match status {
             StatusCode::FORBIDDEN => "您無權使用這個頁面。",
             StatusCode::METHOD_NOT_ALLOWED => "請求不被允許。",
+            status if status.as_u16() == 419 => "Token 不匹配，請嘗試重新載入該頁。",
             StatusCode::NOT_FOUND => "這裡甚麼都沒有。",
             StatusCode::INTERNAL_SERVER_ERROR => "請稍後再試一次。",
             StatusCode::SERVICE_UNAVAILABLE => "網站現在正在維護中。",
@@ -2023,6 +2059,7 @@ fn http_error_message(locale: &str, status: StatusCode) -> &'static str {
         _ => match status {
             StatusCode::FORBIDDEN => "You have no permission to access this page.",
             StatusCode::METHOD_NOT_ALLOWED => "Method not allowed.",
+            status if status.as_u16() == 419 => "CSRF token mismatched.",
             StatusCode::NOT_FOUND => "Nothing here.",
             StatusCode::INTERNAL_SERVER_ERROR => "Please try again later.",
             StatusCode::SERVICE_UNAVAILABLE => "The application is now in maintenance mode.",
@@ -19377,7 +19414,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/auth/login")
+                        .uri("/auth/login?lang=zh_CN")
                         .header("cookie", &cookie)
                         .header("accept", "text/html")
                         .header("content-type", "application/x-www-form-urlencoded")
@@ -19406,7 +19443,8 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-            assert!(browser_error.contains("Page Expired"));
+            assert!(browser_error.contains("419 Page Expired"));
+            assert!(browser_error.contains("Token 不正确，请尝试刷新页面"));
 
             let signature_char = csrf_token.as_bytes()[49];
             let replacement = if signature_char == b'0' { "1" } else { "0" };
