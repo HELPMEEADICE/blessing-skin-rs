@@ -11,6 +11,7 @@ mod mail_templates;
 mod mailer;
 mod oauth;
 mod options_cache_command;
+mod passport_keys_command;
 mod plugin_command;
 mod plugin_runtime;
 mod salt_command;
@@ -90,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(command) = passport_keys_command::parse(&arguments)? {
+        passport_keys_command::run(&command, &storage_dir)?;
+        println!("Encryption keys generated successfully.");
+        return Ok(());
+    }
     let plugins_dir = crate::config::legacy_env("PLUGINS_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
