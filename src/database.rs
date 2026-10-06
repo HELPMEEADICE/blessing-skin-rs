@@ -1157,40 +1157,48 @@ impl DatabasePool {
                 format!("SELECT option_value FROM {prefix}options WHERE option_name = $1 LIMIT 1")
             }
         };
-        match self {
-            Self::Sqlite(pool) => Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .bind(key)
-                .fetch_optional(pool)
-                .await?),
-            Self::MySql(pool) => {
-                let sql = sql.replace("$1", "?");
-                Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+        let row = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
                     .bind(key)
                     .fetch_optional(pool)
-                    .await?)
+                    .await?
             }
-            Self::Postgres(pool) => Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                .bind(key)
-                .fetch_optional(pool)
-                .await?),
-        }
+            Self::MySql(pool) => {
+                let sql = sql.replace("$1", "?");
+                sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(sql))
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(row.flatten())
     }
 
-    pub async fn all_options(&self, prefix: &str) -> Result<Vec<(String, String)>, sqlx::Error> {
+    pub async fn all_options(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
         let sql = format!("SELECT option_name, option_value FROM {prefix}options");
         match self {
             Self::Sqlite(pool) => {
-                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(sql))
                     .fetch_all(pool)
                     .await
             }
             Self::MySql(pool) => {
-                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(sql))
                     .fetch_all(pool)
                     .await
             }
             Self::Postgres(pool) => {
-                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+                sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(sql))
                     .fetch_all(pool)
                     .await
             }
@@ -1524,6 +1532,15 @@ impl DatabasePool {
         prefix: &str,
         key: &str,
         value: &str,
+    ) -> Result<(), sqlx::Error> {
+        self.set_option_nullable(prefix, key, Some(value)).await
+    }
+
+    pub async fn set_option_nullable(
+        &self,
+        prefix: &str,
+        key: &str,
+        value: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let (update_sql, exists_sql, insert_sql) = match self {
             Self::Postgres(_) => (
@@ -8110,7 +8127,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE bs_options (id INTEGER PRIMARY KEY, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
+        sqlx::query("CREATE TABLE bs_options (id INTEGER PRIMARY KEY, option_name TEXT NOT NULL, option_value TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -9455,7 +9472,7 @@ mod language_line_tests {
                 "CREATE TABLE {prefix}textures (tid {integer_primary_key_type}, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size INTEGER NOT NULL, uploader {integer_type} NOT NULL, public BOOLEAN NOT NULL, upload_at {timestamp_type} NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
             ),
             format!(
-                "CREATE TABLE {prefix}options (id {integer_primary_key_type}, option_name VARCHAR(50) NOT NULL, option_value {long_text_type} NOT NULL)"
+                "CREATE TABLE {prefix}options (id {integer_primary_key_type}, option_name VARCHAR(50) NOT NULL, option_value {long_text_type})"
             ),
             format!(
                 "CREATE TABLE {prefix}user_closet (user_uid {integer_type} NOT NULL, texture_tid {integer_type} NOT NULL, item_name TEXT NULL)"
@@ -9568,6 +9585,22 @@ mod language_line_tests {
                 .unwrap()
                 .as_deref(),
             Some("Rust-backed Legacy Skin")
+        );
+        database
+            .set_option_nullable(&prefix, "nullable_setting", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            database.option(&prefix, "nullable_setting").await.unwrap(),
+            None
+        );
+        assert!(
+            database
+                .all_options(&prefix)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(key, value)| key == "nullable_setting" && value.is_none())
         );
 
         let added_player = match database.add_player(&prefix, 7, "Steve", 4).await.unwrap() {

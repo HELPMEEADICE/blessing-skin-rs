@@ -29,26 +29,25 @@ pub(crate) async fn run(config: &Config, storage_dir: &Path) -> Result<(), Box<d
     Ok(())
 }
 
-fn write_cache(storage_dir: &Path, options: &[(String, String)]) -> io::Result<PathBuf> {
+fn write_cache(storage_dir: &Path, options: &[(String, Option<String>)]) -> io::Result<PathBuf> {
     fs::create_dir_all(storage_dir)?;
     let path = storage_dir.join("options.php");
     fs::write(&path, render_php_options(options))?;
     Ok(path)
 }
 
-fn render_php_options(options: &[(String, String)]) -> String {
+fn render_php_options(options: &[(String, Option<String>)]) -> String {
     let mut options = options.iter().collect::<Vec<_>>();
     options.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut output =
         String::from("<?php\n// This is auto-generated. DO NOT edit manually.\nreturn array (\n");
     for (name, value) in options {
-        let _ = writeln!(
-            output,
-            "  '{}' => '{}',",
-            php_single_quoted(name),
-            php_single_quoted(value)
-        );
+        let value = value
+            .as_deref()
+            .map(|value| format!("'{}'", php_single_quoted(value)))
+            .unwrap_or_else(|| "NULL".to_owned());
+        let _ = writeln!(output, "  '{}' => {value},", php_single_quoted(name));
     }
     output.push_str(");\n");
     output
@@ -103,19 +102,20 @@ mod tests {
     #[test]
     fn renders_deterministic_php_options_array() {
         let output = render_php_options(&[
-            ("z_last".to_owned(), "line 1\nline 2".to_owned()),
-            ("site_name".to_owned(), "Skin's \\ Server".to_owned()),
+            ("z_last".to_owned(), Some("line 1\nline 2".to_owned())),
+            ("site_name".to_owned(), Some("Skin's \\ Server".to_owned())),
+            ("optional".to_owned(), None),
         ]);
         assert_eq!(
             output,
-            "<?php\n// This is auto-generated. DO NOT edit manually.\nreturn array (\n  'site_name' => 'Skin\\'s \\\\ Server',\n  'z_last' => 'line 1\nline 2',\n);\n"
+            "<?php\n// This is auto-generated. DO NOT edit manually.\nreturn array (\n  'optional' => NULL,\n  'site_name' => 'Skin\\'s \\\\ Server',\n  'z_last' => 'line 1\nline 2',\n);\n"
         );
     }
 
     #[test]
     fn writes_the_legacy_cache_path_without_touching_database_files() {
         let directory = test_dir("write");
-        let options = vec![("site_name".to_owned(), "Blessing Skin".to_owned())];
+        let options = vec![("site_name".to_owned(), Some("Blessing Skin".to_owned()))];
         let path = write_cache(&directory, &options).unwrap();
         assert_eq!(path, directory.join("options.php"));
         assert_eq!(

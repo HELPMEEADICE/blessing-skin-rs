@@ -23972,7 +23972,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE options (id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT NOT NULL, option_value TEXT NOT NULL)")
+        sqlx::query("CREATE TABLE options (id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT NOT NULL, option_value TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -26430,18 +26430,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let original_meta_keywords: Option<String> = sqlx::query_scalar(
-            "SELECT option_value FROM options WHERE option_name = 'meta_keywords'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
         let original_site_name: Option<String> = sqlx::query_scalar(
             "SELECT option_value FROM options WHERE option_name = 'site_name_en'",
         )
         .fetch_optional(&pool)
         .await
         .unwrap();
+        let original_options: Vec<(i64, String, Option<String>)> =
+            sqlx::query_as("SELECT id, option_name, option_value FROM options")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         let legacy_settings_form = app
             .clone()
             .oneshot(
@@ -26487,18 +26486,7 @@ mod tests {
         .unwrap();
         assert_eq!(saved_meta_keywords, "legacy form keywords");
         assert_eq!(unchanged_site_name, original_site_name);
-        let original_upload_limit: Option<String> = sqlx::query_scalar(
-            "SELECT option_value FROM options WHERE option_name = 'max_upload_file_size'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-        let original_texture_width: Option<String> = sqlx::query_scalar(
-            "SELECT option_value FROM options WHERE option_name = 'max_texture_width'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+
         let legacy_raw_settings_form = app
             .clone()
             .oneshot(
@@ -26512,7 +26500,7 @@ mod tests {
                     .header("x-csrf-token", test_csrf_token.as_str())
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from(
-                        "option=general&register_with_player_name=true&allow_downloading_texture=true&max_upload_file_size=1048577&max_texture_width=065537",
+                        "option=general&site_name=Rust+Compatibility&site_description=Legacy+site+description&site_url=http%3A%2F%2Flocalhost&register_with_player_name=true&require_verification=false&regs_per_ip=2&max_upload_file_size=1048577&max_texture_width=065537&player_name_rule=official&custom_player_name_regexp=&player_name_length_min=3&player_name_length_max=16&auto_del_invalid_texture=false&allow_downloading_texture=true&status_code_for_private=403&texture_name_regexp=&content_policy=",
                     ))
                     .unwrap(),
             )
@@ -26533,46 +26521,21 @@ mod tests {
         .unwrap();
         assert_eq!(saved_upload_limit, "1048577");
         assert_eq!(saved_texture_width, "065537");
-        if let Some(original) = original_upload_limit {
-            sqlx::query(
-                "UPDATE options SET option_value = ? WHERE option_name = 'max_upload_file_size'",
-            )
-            .bind(original)
-            .execute(&pool)
+        let mut restore_options = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM options")
+            .execute(&mut *restore_options)
             .await
             .unwrap();
-        } else {
-            sqlx::query("DELETE FROM options WHERE option_name = 'max_upload_file_size'")
-                .execute(&pool)
+        for (id, name, value) in original_options {
+            sqlx::query("INSERT INTO options (id, option_name, option_value) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(name)
+                .bind(value)
+                .execute(&mut *restore_options)
                 .await
                 .unwrap();
         }
-        if let Some(original) = original_texture_width {
-            sqlx::query(
-                "UPDATE options SET option_value = ? WHERE option_name = 'max_texture_width'",
-            )
-            .bind(original)
-            .execute(&pool)
-            .await
-            .unwrap();
-        } else {
-            sqlx::query("DELETE FROM options WHERE option_name = 'max_texture_width'")
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-        if let Some(original) = original_meta_keywords {
-            sqlx::query("UPDATE options SET option_value = ? WHERE option_name = 'meta_keywords'")
-                .bind(original)
-                .execute(&pool)
-                .await
-                .unwrap();
-        } else {
-            sqlx::query("DELETE FROM options WHERE option_name = 'meta_keywords'")
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
+        restore_options.commit().await.unwrap();
         let saved_settings = session_request(
             &app,
             &registered_cookie,

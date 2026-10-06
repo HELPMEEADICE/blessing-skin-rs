@@ -325,7 +325,7 @@ async fn initialize_schema(pool: &DatabasePool, prefix: &str) -> Result<(), sqlx
             "CREATE TABLE IF NOT EXISTS {prefix}textures (tid {id}, name VARCHAR(50) NOT NULL, type VARCHAR(10) NOT NULL, hash VARCHAR(64) NOT NULL, size INTEGER NOT NULL, uploader INTEGER NOT NULL, public BOOLEAN NOT NULL DEFAULT FALSE, upload_at {datetime} NOT NULL, likes INTEGER NOT NULL DEFAULT 0)"
         ),
         format!(
-            "CREATE TABLE IF NOT EXISTS {prefix}options (id {id}, option_name VARCHAR(50) NOT NULL, option_value {long_text} NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS {prefix}options (id {id}, option_name VARCHAR(50) NOT NULL, option_value {long_text})"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {prefix}user_closet (user_uid INTEGER NOT NULL, texture_tid INTEGER NOT NULL, item_name TEXT)"
@@ -663,6 +663,13 @@ mod tests {
         assert_eq!(
             pool.option("bs_", "announcement").await.unwrap().as_deref(),
             Some("Welcome to Blessing Skin 6.0.2!")
+        );
+        pool.set_option_nullable("bs_", "nullable_install_option", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pool.option("bs_", "nullable_install_option").await.unwrap(),
+            None
         );
         let password_hash = hash_legacy_password("correct horse", "BCRYPT", "", 10).unwrap();
         let admin = Admin {

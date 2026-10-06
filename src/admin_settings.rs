@@ -410,7 +410,10 @@ async fn render_page(
             return (StatusCode::SERVICE_UNAVAILABLE, "Database is not ready.").into_response();
         }
     };
-    let options = rows.into_iter().collect::<HashMap<_, _>>();
+    let options = rows
+        .into_iter()
+        .map(|(key, value)| (key, value.unwrap_or_default()))
+        .collect::<HashMap<_, _>>();
     let locale = http::request_locale(&state);
     let fields = definitions
         .iter()
@@ -546,10 +549,11 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
         let normalized_value = if legacy_form {
             normalize_legacy_form_value(definition, value)
         } else {
-            normalize_value(definition, value)
+            normalize_value(definition, value).map(Some).ok_or(())
         };
-        let Some(value) = normalized_value else {
-            return invalid(&format!("Invalid value for {key}"));
+        let value = match normalized_value {
+            Ok(value) => value,
+            Err(()) => return invalid(&format!("Invalid value for {key}")),
         };
         normalized.push((key.clone(), value));
     }
@@ -590,21 +594,36 @@ async fn save_page(state: &AppState, headers: &HeaderMap, section: &str, body: B
         let mut parts = current.split(',');
         let from = updates
             .get("sign_score_from")
-            .map(String::as_str)
+            .map(|value| value.as_deref().unwrap_or(""))
             .or_else(|| parts.next())
             .unwrap_or("10");
         let to = updates
             .get("sign_score_to")
-            .map(String::as_str)
+            .map(|value| value.as_deref().unwrap_or(""))
             .or_else(|| parts.next())
             .unwrap_or("100");
-        updates.insert("sign_score".to_owned(), format!("{from},{to}"));
-        updates.remove("sign_score_from");
-        updates.remove("sign_score_to");
+        updates.insert("sign_score".to_owned(), Some(format!("{from},{to}")));
     }
     for (key, value) in updates {
+        if value.is_none() {
+            match database
+                .option(&state.config.database.table_prefix, &key)
+                .await
+            {
+                Ok(None) => continue,
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    tracing::error!(%error, option = %key, "failed to check current administrator setting");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"code":2,"message":"Database is not ready."})),
+                    )
+                        .into_response();
+                }
+            }
+        }
         if let Err(error) = database
-            .set_option(&state.config.database.table_prefix, &key, &value)
+            .set_option_nullable(&state.config.database.table_prefix, &key, value.as_deref())
             .await
         {
             tracing::error!(%error, option = %key, "failed to save administrator setting");
@@ -744,7 +763,13 @@ fn legacy_form_values(section: &str, body: &[u8]) -> Option<HashMap<String, Valu
             values.insert((*key).to_owned(), Value::String(value.clone()));
         } else if checkboxes.contains(key) {
             values.insert((*key).to_owned(), Value::Bool(false));
+        } else {
+            values.insert((*key).to_owned(), Value::Null);
         }
+    }
+    if (section, option.as_str()) == ("resource", "resources") && !form.contains_key("cdn_address")
+    {
+        values.insert("cdn_address".to_owned(), Value::String(String::new()));
     }
     (!values.is_empty()).then_some(values)
 }
@@ -836,15 +861,21 @@ fn normalize_value(definition: &Definition, value: &Value) -> Option<String> {
     }
 }
 
-fn normalize_legacy_form_value(definition: &Definition, value: &Value) -> Option<String> {
+fn normalize_legacy_form_value(
+    definition: &Definition,
+    value: &Value,
+) -> Result<Option<String>, ()> {
+    if value.is_null() {
+        return Ok(None);
+    }
     let mut value = match value {
         Value::String(value) => value.clone(),
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
-        _ => return None,
+        _ => return Err(()),
     };
     if value.contains('\0') {
-        return None;
+        return Err(());
     }
     if definition.key == "cdn_address" {
         if value.ends_with('/') {
@@ -858,7 +889,7 @@ fn normalize_legacy_form_value(definition: &Definition, value: &Value) -> Option
             value.truncate(value.len() - "/index.php".len());
         }
     }
-    Some(value)
+    Ok(Some(value))
 }
 
 fn invalid(message: &str) -> Response {
@@ -1041,7 +1072,7 @@ mod tests {
         CUSTOMIZE, GENERAL, LEGACY_DEFAULT_COPYRIGHT_TEXT, LEGACY_DEFAULT_SITE_DESCRIPTION,
         RESOURCE, SCORE, legacy_form_values, normalize_legacy_form_value, normalize_value,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn legacy_forms_only_update_the_selected_option_group() {
@@ -1052,6 +1083,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(values.get("meta_keywords"), Some(&json!("legacy keywords")));
+        assert_eq!(values.get("meta_description"), Some(&Value::Null));
+        assert_eq!(values.get("meta_extras"), Some(&Value::Null));
         assert!(!values.contains_key("site_name"));
         assert_eq!(
             legacy_form_values("score", b"option=meta&meta_keywords=ignored"),
@@ -1066,6 +1099,14 @@ mod tests {
 
         assert_eq!(values.get("enable_avatar_cache"), Some(&json!("on")));
         assert_eq!(values.get("enable_preview_cache"), Some(&json!(false)));
+
+        let resource_values =
+            legacy_form_values("resource", b"option=resources&force_ssl=on").unwrap();
+        assert_eq!(resource_values.get("cdn_address"), Some(&json!("")));
+        assert_eq!(
+            resource_values.get("auto_detect_asset_url"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -1093,8 +1134,12 @@ mod tests {
             .unwrap();
         assert_eq!(normalize_value(max_upload, &json!("1048577")), None);
         assert_eq!(
+            normalize_legacy_form_value(max_upload, &Value::Null),
+            Ok(None)
+        );
+        assert_eq!(
             normalize_legacy_form_value(max_upload, &json!("1048577")),
-            Some("1048577".to_owned())
+            Ok(Some("1048577".to_owned()))
         );
         let max_width = GENERAL
             .iter()
@@ -1102,7 +1147,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             normalize_legacy_form_value(max_width, &json!("065537")),
-            Some("065537".to_owned())
+            Ok(Some("065537".to_owned()))
         );
         let player_name_rule = GENERAL
             .iter()
@@ -1110,7 +1155,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             normalize_legacy_form_value(player_name_rule, &json!("legacy-custom")),
-            Some("legacy-custom".to_owned())
+            Ok(Some("legacy-custom".to_owned()))
         );
     }
 
