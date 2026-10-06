@@ -12,10 +12,10 @@ const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum ImageCacheKey {
-    // The legacy key intentionally omits `height` from preview requests.
     Preview {
         tid: i64,
         png: bool,
+        cape_height: Option<u32>,
     },
     Avatar {
         texture_hash: String,
@@ -145,7 +145,11 @@ mod tests {
     use super::*;
 
     fn key(tid: i64) -> ImageCacheKey {
-        ImageCacheKey::Preview { tid, png: true }
+        ImageCacheKey::Preview {
+            tid,
+            png: true,
+            cape_height: None,
+        }
     }
 
     fn image(body: &'static [u8]) -> CachedImage {

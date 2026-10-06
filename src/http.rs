@@ -19552,7 +19552,11 @@ async fn preview_for_texture(
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let cache_key = ImageCacheKey::Preview { tid, png: use_png };
+    let cache_key = ImageCacheKey::Preview {
+        tid,
+        png: use_png,
+        cape_height: (texture.texture_type == "cape").then_some(height),
+    };
     if let Some(cached) = state.image_cache.get(&cache_key) {
         let ttl = cache_ttl(state).await;
         return image_response(
@@ -28607,6 +28611,27 @@ mod tests {
         assert_eq!(
             (decoded_cape_preview.width(), decoded_cape_preview.height()),
             (100, 160)
+        );
+        let shorter_cape_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/preview/hash/{preview_cape_hash}?png&height=80"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shorter_cape_preview.status(), StatusCode::OK);
+        let shorter_cape_bytes = to_bytes(shorter_cape_preview.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded_shorter_cape =
+            image::load_from_memory_with_format(&shorter_cape_bytes, ImageFormat::Png).unwrap();
+        assert_eq!(
+            (decoded_shorter_cape.width(), decoded_shorter_cape.height()),
+            (50, 80),
+            "a different requested cape preview height must not reuse the old cached dimensions"
         );
         let repeated_cape_preview = app
             .clone()
