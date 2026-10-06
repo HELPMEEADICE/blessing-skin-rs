@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1597,12 +1597,15 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
 impl TokenRequest {
     fn parse(body: &[u8]) -> Result<Self, ()> {
         let mut fields = HashMap::new();
+        let mut seen = HashSet::new();
         for (key, value) in form_urlencoded::parse(body) {
-            if fields
-                .insert(key.into_owned(), value.into_owned())
-                .is_some()
-            {
+            let key = key.into_owned();
+            if !seen.insert(key.clone()) {
                 return Err(());
+            }
+            let value = value.into_owned();
+            if !value.is_empty() {
+                fields.insert(key, value);
             }
         }
         Ok(Self { fields })
@@ -1808,6 +1811,26 @@ mod tests {
             .iter()
             .map(|scope| (*scope).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn empty_form_oauth_values_behave_like_converted_nulls() {
+        let request =
+            TokenRequest::parse(b"grant_type=password&username=&client_id=7&client_secret=")
+                .unwrap();
+        assert_eq!(
+            request.fields.get("grant_type").map(String::as_str),
+            Some("password")
+        );
+        assert_eq!(
+            request.fields.get("client_id").map(String::as_str),
+            Some("7")
+        );
+        assert!(!request.fields.contains_key("username"));
+        assert!(!request.fields.contains_key("client_secret"));
+
+        let password_with_spaces = TokenRequest::parse(b"password=++").unwrap();
+        assert_eq!(password_with_spaces.fields.get("password").unwrap(), "  ");
     }
 
     #[test]

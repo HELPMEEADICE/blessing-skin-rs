@@ -342,17 +342,42 @@ fn trim_json_input_strings(value: &mut serde_json::Value) -> bool {
     }
 }
 
+fn convert_empty_json_input_strings(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) if text.is_empty() => {
+            *value = serde_json::Value::Null;
+            true
+        }
+        serde_json::Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            convert_empty_json_input_strings(value) || changed
+        }),
+        serde_json::Value::Object(values) => {
+            values.iter_mut().fold(false, |changed, (_, value)| {
+                convert_empty_json_input_strings(value) || changed
+            })
+        }
+        _ => false,
+    }
+}
+
+fn convert_empty_strings_exempt_path(path: &str) -> bool {
+    matches!(
+        path.trim_matches('/'),
+        "admin/options" | "admin/score" | "admin/resource" | "admin/customize"
+    )
+}
+
 fn trim_urlencoded_input_strings(encoded: &str) -> Option<String> {
     let mut changed = false;
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in form_urlencoded::parse(encoded.as_bytes()) {
+        let original = value.into_owned();
         let value = if php_trim_exempts_key(&key) {
-            value.into_owned()
+            original.clone()
         } else {
-            let trimmed = php_trim_string(&value);
-            changed |= trimmed != value;
-            trimmed.to_owned()
+            php_trim_string(&original).to_owned()
         };
+        changed |= value != original;
         serializer.append_pair(&key, &value);
     }
     changed.then(|| serializer.finish())
@@ -371,10 +396,16 @@ fn trim_request_query(uri: &mut axum::http::Uri) {
     }
 }
 
-fn trim_request_body_strings(body: &[u8], media_type: &str) -> Option<Bytes> {
+fn trim_request_body_strings(
+    body: &[u8],
+    media_type: &str,
+    convert_empty_strings: bool,
+) -> Option<Bytes> {
     if media_type == "application/json" || media_type.ends_with("+json") {
         let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-        return trim_json_input_strings(&mut value)
+        let trimmed = trim_json_input_strings(&mut value);
+        let converted = convert_empty_strings && convert_empty_json_input_strings(&mut value);
+        return (trimmed || converted)
             .then(|| serde_json::to_vec(&value).ok().map(Bytes::from))
             .flatten();
     }
@@ -414,6 +445,7 @@ async fn buffer_request_body_for_locale(
     request: axum::extract::Request,
 ) -> Result<(axum::extract::Request, Option<String>, Option<String>), Response> {
     let (mut parts, request_body) = request.into_parts();
+    let convert_empty_strings = !convert_empty_strings_exempt_path(parts.uri.path());
     trim_request_query(&mut parts.uri);
     if parts.method == Method::GET || parts.method == Method::HEAD {
         return Ok((
@@ -454,7 +486,7 @@ async fn buffer_request_body_for_locale(
     let request_body = axum::body::to_bytes(request_body, MAX_LOCALE_REQUEST_BODY_BYTES)
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
-    let trimmed_body = trim_request_body_strings(&request_body, &media_type);
+    let trimmed_body = trim_request_body_strings(&request_body, &media_type, convert_empty_strings);
     let body_changed = trimmed_body.is_some();
     let request_body = trimmed_body.unwrap_or(request_body);
     if body_changed
@@ -12249,6 +12281,9 @@ fn parse_legacy_input_object(
     } else if !body.is_empty() {
         return Err(());
     }
+    for value in fields.values_mut() {
+        convert_empty_json_input_strings(value);
+    }
     Ok(fields)
 }
 
@@ -20523,6 +20558,15 @@ mod tests {
         assert_eq!(form["tid"], "8");
         assert_eq!(form["name"], "My Texture");
 
+        let empty_form = super::parse_legacy_input_object(
+            &BTreeMap::new(),
+            b"email=&nickname=Alex",
+            Some("application/x-www-form-urlencoded"),
+        )
+        .unwrap();
+        assert!(empty_form["email"].is_null());
+        assert_eq!(empty_form["nickname"], "Alex");
+
         let json = super::parse_legacy_input_object(
             &query,
             br#"{"tid":9,"name":"JSON Texture"}"#,
@@ -21317,6 +21361,38 @@ mod tests {
         assert_eq!(pairs[1], ("password".into(), " secret ".into()));
         assert_eq!(pairs[2], ("current_password".into(), "\told\r".into()));
         assert!(super::trim_urlencoded_input_strings("nickname=Alex").is_none());
+        assert_eq!(
+            super::trim_urlencoded_input_strings("nickname=+Alex+&empty=").unwrap(),
+            "nickname=Alex&empty="
+        );
+        let mut flag_query = "/avatar/user/7?png".parse().unwrap();
+        super::trim_request_query(&mut flag_query);
+        assert_eq!(flag_query.query(), Some("png"));
+        let mut empty_json = serde_json::json!({
+            "empty": "",
+            "password": "",
+            "nested": ["", "value"]
+        });
+        assert!(super::convert_empty_json_input_strings(&mut empty_json));
+        assert!(empty_json["empty"].is_null());
+        assert!(empty_json["password"].is_null());
+        assert!(empty_json["nested"][0].is_null());
+        assert_eq!(empty_json["nested"][1], "value");
+        assert!(super::convert_empty_strings_exempt_path("/admin/options/"));
+        assert!(!super::convert_empty_strings_exempt_path("/admin/users"));
+        let converted_body = super::trim_request_body_strings(
+            br#"{"name":"  Alex  ","optional":"","password":""}"#,
+            "application/json",
+            true,
+        )
+        .unwrap();
+        let converted_body: serde_json::Value = serde_json::from_slice(&converted_body).unwrap();
+        assert_eq!(converted_body["name"], "Alex");
+        assert!(converted_body["optional"].is_null());
+        assert!(converted_body["password"].is_null());
+        let exempt_body =
+            super::trim_request_body_strings(br#"{"value":""}"#, "application/json", false);
+        assert!(exempt_body.is_none());
     }
 
     #[test]
