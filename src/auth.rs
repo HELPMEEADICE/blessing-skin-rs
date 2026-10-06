@@ -130,7 +130,10 @@ pub fn hash_legacy_password(
     match method.to_ascii_uppercase().as_str() {
         "BCRYPT" | "PHP_PASSWORD_HASH" => bcrypt::hash(password, bcrypt_rounds).ok(),
         "ARGON2I" => {
-            let argon = Argon2::new(ArgonAlgorithm::Argon2i, Version::V0x13, Params::default());
+            // Match PHP password_hash(PASSWORD_ARGON2I)'s 64 MiB, 4-pass, single-lane defaults.
+            let params = Params::new(65_536, 4, 1, None)
+                .expect("PHP's default Argon2i parameters are valid");
+            let argon = Argon2::new(ArgonAlgorithm::Argon2i, Version::V0x13, params);
             let salt = SaltString::generate(&mut rand::thread_rng());
             argon
                 .hash_password(password.as_bytes(), &salt)
@@ -319,6 +322,7 @@ mod tests {
         ));
         let argon = super::hash_legacy_password("correct horse", "ARGON2I", "", 10).unwrap();
         assert!(argon.starts_with("$argon2i$"));
+        assert!(argon.contains("$m=65536,t=4,p=1$"));
         assert!(super::verify_legacy_password(
             "correct horse",
             &argon,
