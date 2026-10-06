@@ -134,7 +134,15 @@ struct OAuthAuthorizationFormClaims {
 struct OAuthAuthorizePage {
     site_name: String,
     locale: String,
+    title: String,
     client_name: String,
+    introduction_before: String,
+    introduction_after: String,
+    permission_prompt: String,
+    permissions_label: String,
+    approve_label: String,
+    deny_label: String,
+    trust_notice: String,
     scopes: Vec<String>,
     auth_token: String,
     client_id: i64,
@@ -159,6 +167,51 @@ fn login_redirect_url(return_to: &str) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("redirect_to", return_to);
     format!("/auth/login?{}", serializer.finish())
+}
+
+fn legacy_oauth_translation(locale: &str, path: &[&str], key: &str, fallback: &str) -> String {
+    crate::mail_templates::legacy_translation(locale, "auth", path, key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn oauth_scope_label(locale: &str, scope: &str) -> String {
+    let Some((_, translation_key)) = DEFAULT_SCOPE_DESCRIPTIONS
+        .iter()
+        .find(|(name, _)| *name == scope)
+    else {
+        return scope.to_owned();
+    };
+    let Some(translation_key) = translation_key.strip_prefix("auth.") else {
+        return scope.to_owned();
+    };
+    let mut segments = translation_key.split('.').collect::<Vec<_>>();
+    let Some(key) = segments.pop() else {
+        return scope.to_owned();
+    };
+    legacy_oauth_translation(locale, &segments, key, scope)
+}
+
+fn oauth_page_label(locale: &str, key: &str) -> &'static str {
+    match (locale, key) {
+        ("zh_CN", "permission_prompt") => "批准后，此应用可以：",
+        ("zh_TW", "permission_prompt") => "批准後，此應用可以：",
+        ("es_ES", "permission_prompt") => "Si la apruebas, esta aplicación podrá:",
+        ("ru_RU", "permission_prompt") => "После одобрения приложение сможет:",
+        ("zh_CN", "deny") => "拒绝",
+        ("zh_TW", "deny") => "拒絕",
+        ("es_ES", "deny") => "Denegar",
+        ("ru_RU", "deny") => "Отклонить",
+        ("zh_CN", "trust_notice") => "请确认你信任此应用。",
+        ("zh_TW", "trust_notice") => "請確認你信任此應用。",
+        ("es_ES", "trust_notice") => "Aprueba solo las aplicaciones en las que confías.",
+        ("ru_RU", "trust_notice") => {
+            "Одобряйте запросы только от приложений, которым вы доверяете."
+        }
+        (_, "permission_prompt") => "If you approve, this app can:",
+        (_, "deny") => "Deny",
+        (_, "trust_notice") => "Only approve apps you trust.",
+        _ => "",
+    }
 }
 
 pub async fn authorize(
@@ -386,11 +439,49 @@ pub async fn authorize(
         }),
         i18n,
     );
+    let locale = crate::http::request_locale(&state);
+    let introduction = legacy_oauth_translation(
+        &locale,
+        &["oauth", "authorization"],
+        "introduction",
+        r#"A 3rd-party application ":name" is requesting permission to access your account."#,
+    );
+    let (introduction_before, introduction_after) = introduction
+        .split_once(":name")
+        .map(|(before, after)| (before.to_owned(), after.to_owned()))
+        .unwrap_or_else(|| (String::new(), introduction));
+    let displayed_scopes = scopes
+        .iter()
+        .map(|scope| oauth_scope_label(&locale, scope))
+        .collect();
     let page = OAuthAuthorizePage {
         site_name,
-        locale: crate::http::request_locale(&state),
+        locale: locale.clone(),
+        title: legacy_oauth_translation(
+            &locale,
+            &["oauth", "authorization"],
+            "title",
+            "Authorization",
+        ),
         client_name: client.name,
-        scopes,
+        introduction_before,
+        introduction_after,
+        permission_prompt: oauth_page_label(&locale, "permission_prompt").to_owned(),
+        permissions_label: legacy_oauth_translation(
+            &locale,
+            &["oauth", "authorization"],
+            "permissions",
+            "Permissions",
+        ),
+        approve_label: legacy_oauth_translation(
+            &locale,
+            &["oauth", "authorization"],
+            "button",
+            "Authorize",
+        ),
+        deny_label: oauth_page_label(&locale, "deny").to_owned(),
+        trust_notice: oauth_page_label(&locale, "trust_notice").to_owned(),
+        scopes: displayed_scopes,
         auth_token,
         client_id,
         frontend_style_available: stylesheet.is_some(),
@@ -1804,13 +1895,28 @@ fn oauth_error(status: StatusCode, error: &str, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{KNOWN_SCOPES, TokenRequest, decode_stored_scopes, new_uuid, parse_scopes};
+    use super::{
+        KNOWN_SCOPES, TokenRequest, decode_stored_scopes, new_uuid, oauth_scope_label, parse_scopes,
+    };
 
     fn known_scopes() -> Vec<String> {
         KNOWN_SCOPES
             .iter()
             .map(|scope| (*scope).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn oauth_authorization_scope_labels_reuse_legacy_translations() {
+        assert_eq!(
+            oauth_scope_label("es_ES", "User.Read"),
+            "Inicia sesión y lee tu perfil"
+        );
+        assert_eq!(
+            oauth_scope_label("ru_RU", "Player.Read"),
+            "Приложение сможет читать ваших игроков."
+        );
+        assert_eq!(oauth_scope_label("en", "Plugin.Custom"), "Plugin.Custom");
     }
 
     #[test]
@@ -2454,6 +2560,7 @@ mod integration_tests {
         )
         .unwrap();
         assert!(page_html.contains("Third-party app"));
+        assert!(page_html.contains("Sign you in and read your profile"));
         assert!(page_html.contains("Plugin.Custom"));
         assert!(page_html.contains("https://skin.example.test/app/app.012abcd.js"));
         assert!(page_html.contains("https://skin.example.test/app/style.012abcd.css"));

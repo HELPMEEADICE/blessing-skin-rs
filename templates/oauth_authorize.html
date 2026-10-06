@@ -1,38 +1,118 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ locale }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% if locale.starts_with("zh") %}授权请求{% else %}Authorization request{% endif %} · {{ site_name }}</title>
-  <style>
-    body{font:16px system-ui,sans-serif;margin:0;background:#f4f6f9;color:#343a40}main{max-width:620px;margin:4rem auto;padding:2rem;background:#fff;border-radius:10px;box-shadow:0 8px 32px #0001}h1{font-size:1.6rem;margin-top:0}.scopes{padding-left:1.4rem;color:#495057}li{margin:.6rem 0}.actions{display:flex;gap:.8rem;margin-top:2rem}.actions form{flex:1}.actions button{width:100%;padding:.75rem 1rem;border:0;border-radius:5px;font:inherit;cursor:pointer;background:#0d6efd;color:white}.actions .deny button{background:#6c757d}small{color:#6c757d}@media(max-width:700px){main{margin:1rem;padding:1.25rem}.actions{flex-direction:column}}
-  </style>
-  {% if frontend_style_available %}<link rel="stylesheet" href="{{ frontend_stylesheet }}" crossorigin="anonymous">{% endif %}
-  {% if frontend_script_available %}<script>window.blessing=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('{{ frontend_globals_b64 }}'), character => character.charCodeAt(0))));</script>{% endif %}
-</head>
-<body>
-  <main id="oauth-authorize-app">
-    <h1>{% if locale.starts_with("zh") %}授权请求{% else %}Authorization request{% endif %}</h1>
-    <p>{% if locale.starts_with("zh") %}<strong>{{ client_name }}</strong> 请求访问你的 Blessing Skin 账户。{% else %}<strong>{{ client_name }}</strong> is requesting access to your Blessing Skin account.{% endif %}</p>
-    <p>{% if locale.starts_with("zh") %}批准后，此应用可以：{% else %}If you approve, this app can:{% endif %}</p>
-    <ul class="scopes">
-      {% for scope in scopes %}<li>{{ scope }}</li>{% endfor %}
-    </ul>
-    <div class="actions">
-      <form method="post" action="/oauth/authorize">
-        <input type="hidden" name="auth_token" value="{{ auth_token }}">
-        <input type="hidden" name="client_id" value="{{ client_id }}">
-        <button name="decision" value="approve">{% if locale.starts_with("zh") %}批准{% else %}Approve{% endif %}</button>
-      </form>
-      <form class="deny" method="post" action="/oauth/authorize">
-        <input type="hidden" name="auth_token" value="{{ auth_token }}">
-        <input type="hidden" name="client_id" value="{{ client_id }}">
-        <input type="hidden" name="_method" value="DELETE">
-        <button>{% if locale.starts_with("zh") %}拒绝{% else %}Deny{% endif %}</button>
-      </form>
-    </div>
-    <p><small>{% if locale.starts_with("zh") %}请确认你信任此应用。{% else %}Only approve apps you trust.{% endif %}</small></p>
-  </main>
-  {% if frontend_script_available %}<script src="{{ frontend_script }}" crossorigin="anonymous"></script>{% endif %}
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ title }} · {{ site_name }}</title>
+    <style>
+      body {
+        font: 16px system-ui, sans-serif;
+        margin: 0;
+        background: #f4f6f9;
+        color: #343a40;
+      }
+      main {
+        max-width: 620px;
+        margin: 4rem auto;
+        padding: 2rem;
+        background: #fff;
+        border-radius: 10px;
+        box-shadow: 0 8px 32px #0001;
+      }
+      h1 {
+        font-size: 1.6rem;
+        margin-top: 0;
+      }
+      .scopes {
+        padding-left: 1.4rem;
+        color: #495057;
+      }
+      li {
+        margin: 0.6rem 0;
+      }
+      .actions {
+        display: flex;
+        gap: 0.8rem;
+        margin-top: 2rem;
+      }
+      .actions form {
+        flex: 1;
+      }
+      .actions button {
+        width: 100%;
+        padding: 0.75rem 1rem;
+        border: 0;
+        border-radius: 5px;
+        font: inherit;
+        cursor: pointer;
+        background: #0d6efd;
+        color: white;
+      }
+      .actions .deny button {
+        background: #6c757d;
+      }
+      small {
+        color: #6c757d;
+      }
+      @media (max-width: 700px) {
+        main {
+          margin: 1rem;
+          padding: 1.25rem;
+        }
+        .actions {
+          flex-direction: column;
+        }
+      }
+    </style>
+    {% if frontend_style_available %}
+    <link
+      rel="stylesheet"
+      href="{{ frontend_stylesheet }}"
+      crossorigin="anonymous"
+    />
+    {% endif %} {% if frontend_script_available %}
+    <script>
+      window.blessing = JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob('{{ frontend_globals_b64 }}'), (character) =>
+            character.charCodeAt(0),
+          ),
+        ),
+      )
+    </script>
+    {% endif %}
+  </head>
+  <body>
+    <main id="oauth-authorize-app">
+      <h1>{{ title }}</h1>
+      <p>
+        {{ introduction_before }}<strong>{{ client_name }}</strong>{{
+        introduction_after }}
+      </p>
+      <p>{{ permission_prompt }}</p>
+      <h2>{{ permissions_label }}</h2>
+      <ul class="scopes">
+        {% for scope in scopes %}
+        <li>{{ scope }}</li>
+        {% endfor %}
+      </ul>
+      <div class="actions">
+        <form method="post" action="/oauth/authorize">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}" />
+          <input type="hidden" name="client_id" value="{{ client_id }}" />
+          <button name="decision" value="approve">{{ approve_label }}</button>
+        </form>
+        <form class="deny" method="post" action="/oauth/authorize">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}" />
+          <input type="hidden" name="client_id" value="{{ client_id }}" />
+          <input type="hidden" name="_method" value="DELETE" />
+          <button>{{ deny_label }}</button>
+        </form>
+      </div>
+      <p><small>{{ trust_notice }}</small></p>
+    </main>
+    {% if frontend_script_available %}
+    <script src="{{ frontend_script }}" crossorigin="anonymous"></script>
+    {% endif %}
+  </body>
 </html>
