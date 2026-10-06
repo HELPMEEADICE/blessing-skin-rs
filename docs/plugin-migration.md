@@ -29,3 +29,7 @@ Host API version 1.46 adds `grid:user.index` to the user dashboard with the `ema
 Host API version 1.47 adds `grid:user.profile` with the `avatar`, `password`, `nickname`, `email`, and `delete_account` region identifiers; legacy PHP/Twig partials are rejected.
 
 Host API version 1.48 adds `side_menu` for safe Rust navigation. Its only context field is the menu `type` (`user`, `admin`, or `explore`); it accepts up to 64 bounded label/link objects and the `#divider` special item. PHP partial names and arbitrary HTML are not executed.
+
+## PHP-only hooks intentionally not exposed
+
+The legacy `scripts` filter can inject arbitrary JavaScript into rendered pages. The Rust host does not execute plugin-provided JavaScript; use the bounded `head_links` filter only for safe stylesheet or metadata links. The legacy `can_login` and `verify_password` filters receive submitted passwords (and, for password verification, user data). Rust components never receive raw credentials, so these filters are not exposed. Plugins that depend on them need a redesigned Rust integration that uses the documented credential-free authentication events; they cannot be ported as drop-in permission filters.

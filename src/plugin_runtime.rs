@@ -1517,6 +1517,21 @@ mod tests {
         assert_eq!(super::HOST_API_VERSION, "1.48.0");
     }
 
+    #[test]
+    fn credential_and_script_filters_are_not_exposed_to_components() {
+        for filter in ["can_login", "verify_password", "scripts"] {
+            assert!(
+                super::validate_plugin_filter(
+                    filter,
+                    &serde_json::Value::Bool(true),
+                    &serde_json::json!({})
+                )
+                .is_err(),
+                "legacy filter {filter} must stay unsupported"
+            );
+        }
+    }
+
     use super::{
         PLUGIN_CONFIGURATION_LIMIT, PLUGIN_EVENT_PAYLOAD_LIMIT, PLUGIN_FILTER_FILE_BYTES_LIMIT,
         PLUGIN_FILTER_VALUE_LIMIT, PLUGIN_LOG_MESSAGE_LIMIT, PLUGIN_STATE_VALUE_LIMIT,
