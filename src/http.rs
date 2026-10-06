@@ -17765,19 +17765,20 @@ fn admin_user_missing_message(locale: &str) -> String {
 }
 
 fn admin_texture_missing_message(tid: i64, locale: &str) -> String {
-    if locale.starts_with("zh") {
-        format!("材质 tid.{tid} 不存在")
-    } else {
-        format!("No such texture tid.{tid}")
-    }
+    crate::mail_templates::legacy_translation(
+        locale,
+        "admin",
+        &["players", "textures"],
+        "non-existent",
+    )
+    .unwrap_or_else(|| "No such texture tid.:tid".to_owned())
+    .replace(":tid", &tid.to_string())
 }
 
 fn admin_player_permission_error(locale: &str) -> Response {
-    let message = if locale.starts_with("zh") {
-        "你无权操作此角色"
-    } else {
-        "You have no permission to operate this player."
-    };
+    let message =
+        crate::mail_templates::legacy_translation(locale, "admin", &["players"], "no-permission")
+            .unwrap_or_else(|| "You have no permission to operate this player.".to_owned());
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({"code": 1, "message": message})),
@@ -21647,6 +21648,26 @@ mod tests {
         assert_eq!(
             length["errors"]["password"][0],
             "密码 必须介于 8 - 16 个字符之间。"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_player_errors_use_legacy_locale_catalogs() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+
+        assert_eq!(
+            super::admin_texture_missing_message(42, "es_ES"),
+            "Textura Inexistente tid.42"
+        );
+        let denied = super::admin_player_permission_error("es_ES");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied: serde_json::Value =
+            serde_json::from_slice(&to_bytes(denied.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            denied["message"],
+            "No tienes permiso para operar este jugador."
         );
     }
 
