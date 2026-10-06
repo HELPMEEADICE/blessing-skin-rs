@@ -17095,17 +17095,23 @@ fn admin_user_success(mutation: AdminUserMutation, locale: &str, value: Option<&
     login_result(0, &message, None)
 }
 
-fn admin_user_permission_error(locale: &str) -> Response {
-    let message = crate::mail_templates::legacy_translation(
+fn admin_user_permission_message(locale: &str) -> String {
+    crate::mail_templates::legacy_translation(
         locale,
         "admin",
         &["users", "operations"],
         "no-permission",
     )
-    .unwrap_or_else(|| "You have no permission to operate this user.".to_owned());
+    .unwrap_or_else(|| "You have no permission to operate this user.".to_owned())
+}
+
+fn admin_user_permission_error(locale: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "code": 1, "message": message })),
+        Json(serde_json::json!({
+            "code": 1,
+            "message": admin_user_permission_message(locale),
+        })),
     )
         .into_response()
 }
@@ -18610,14 +18616,23 @@ async fn review_report_action(
     let request = parse_legacy_input_object(query, body, content_type)
         .ok()
         .map(serde_json::Value::Object);
-    let Some(action) = request
-        .as_ref()
-        .and_then(|request| request.get("action"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|action| matches!(*action, "reject" | "ban" | "delete"))
-    else {
-        return report_review_validation_error(&request_locale(&state));
+    let action_value = request.as_ref().and_then(|request| request.get("action"));
+    let is_missing = action_value.is_none_or(|value| match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        _ => false,
+    });
+    if is_missing {
+        return report_review_validation_error("required", &request_locale(&state));
+    }
+    let Some(action) = action_value.and_then(serde_json::Value::as_str) else {
+        return report_review_validation_error("in", &request_locale(&state));
     };
+    if !matches!(action, "reject" | "ban" | "delete") {
+        return report_review_validation_error("in", &request_locale(&state));
+    }
     emit_plugin_event(
         state,
         "report.reviewing",
@@ -18728,20 +18743,12 @@ async fn review_report_action(
         }
 
         Ok(crate::database::ReportReviewOutcome::UploaderNotFound) => {
-            let message = if request_locale(&state).starts_with("zh") {
-                "用户不存在"
-            } else {
-                "No such user."
-            };
-            login_result(1, message, None)
+            let message = admin_user_missing_message(&request_locale(&state));
+            login_result(1, &message, None)
         }
         Ok(crate::database::ReportReviewOutcome::UploaderPermissionDenied) => {
-            let message = if request_locale(&state).starts_with("zh") {
-                "你无权操作此用户"
-            } else {
-                "You have no permission to operate this user."
-            };
-            login_result(1, message, None)
+            let message = admin_user_permission_message(&request_locale(&state));
+            login_result(1, &message, None)
         }
         Ok(crate::database::ReportReviewOutcome::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -18752,25 +18759,30 @@ async fn review_report_action(
 }
 
 fn report_review_success(state: &AppState, status: i32) -> Response {
-    let message = if request_locale(&state).starts_with("zh") {
-        "操作成功"
-    } else {
-        "Operated successfully."
-    };
-    login_result(0, message, Some(serde_json::json!({ "status": status })))
+    let locale = request_locale(state);
+    let message = crate::mail_templates::legacy_translation(&locale, "general", &[], "op-success")
+        .unwrap_or_else(|| "Operated successfully.".to_owned());
+    login_result(0, &message, Some(serde_json::json!({ "status": status })))
 }
 
-fn report_review_validation_error(locale: &str) -> Response {
+fn report_review_validation_error(rule: &str, locale: &str) -> Response {
     let chinese = locale.starts_with("zh");
     let message = if chinese {
         "给定数据无效。"
     } else {
         "The given data was invalid."
     };
-    let field_error = if chinese {
-        "所选操作无效。"
+    let (key, fallback) = match rule {
+        "required" => ("required", "The action field is required."),
+        "in" => ("in", "The selected action is invalid."),
+        _ => ("", "The given field is invalid."),
+    };
+    let field_error = if key.is_empty() {
+        fallback.to_owned()
     } else {
-        "The selected action is invalid."
+        crate::mail_templates::legacy_translation(locale, "validation", &[], key)
+            .unwrap_or_else(|| fallback.to_owned())
+            .replace(":attribute", "action")
     };
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -18851,15 +18863,15 @@ async fn delete_reported_texture(
                     serde_json::json!({"report_id": report_id, "admin_user_id": admin_user_id, "action": "delete", "status": 1}),
                 )
                 .await;
-                login_result(
-                    0,
-                    if request_locale(&state).starts_with("zh") {
-                        "请求的材质已被删除"
-                    } else {
-                        "The requested texture has been deleted."
-                    },
-                    Some(serde_json::json!({ "status": 1 })),
+                let locale = request_locale(state);
+                let message = crate::mail_templates::legacy_translation(
+                    &locale,
+                    "general",
+                    &[],
+                    "texture-deleted",
                 )
+                .unwrap_or_else(|| "The requested texture has been deleted.".to_owned());
+                login_result(0, &message, Some(serde_json::json!({ "status": 1 })))
             }
             Ok(crate::database::ReportReviewOutcome::NotFound) => {
                 StatusCode::NOT_FOUND.into_response()
@@ -22225,14 +22237,25 @@ mod tests {
     async fn formats_report_review_validation_errors_by_action() {
         use axum::body::to_bytes;
 
-        let response = super::report_review_validation_error("en");
+        let response = super::report_review_validation_error("in", "en");
         assert_eq!(
             response.status(),
             axum::http::StatusCode::UNPROCESSABLE_ENTITY
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(value["errors"]["action"][0].as_str().is_some());
+        assert_eq!(
+            value["errors"]["action"][0],
+            "The selected action is invalid."
+        );
+
+        let response = super::report_review_validation_error("required", "es_ES");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["errors"]["action"][0],
+            "El campo action es obligatorio."
+        );
     }
 
     #[tokio::test]
