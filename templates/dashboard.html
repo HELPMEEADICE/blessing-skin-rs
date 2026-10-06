@@ -120,13 +120,22 @@
     {% endif %}
   </head>
   <body>
-    <main>
+    <main
+      id="user-dashboard"
+      data-no-unread="{{ copy.no_unread }}"
+      data-read-notification-error="{{ copy.labels.read_notification_error }}"
+      data-unable-send-email="{{ copy.labels.unable_send_email }}"
+      data-connection-error="{{ copy.labels.connection_error }}"
+    >
       <header>
         <h1>{{ site_name }}</h1>
         <div class="account-actions">
           <details class="account-menu">
             <summary>{{ user.nickname }}</summary>
-            <nav class="account-menu-items" aria-label="User menu">
+            <nav
+              class="account-menu-items"
+              aria-label="{{ copy.labels.user_menu_aria }}"
+            >
               {% for item in menu %} {% if item.link == "#divider" %}
               <hr />
               {% else %}
@@ -134,10 +143,7 @@
               {% endif %} {% endfor %}
             </nav>
           </details>
-          <button id="logout">
-            {% if locale.starts_with("zh") %}退出登录{% else %}Log out{% endif
-            %}
-          </button>
+          <button id="logout">{{ copy.labels.logout }}</button>
         </div>
       </header>
       <h2>
@@ -147,8 +153,7 @@
             class="account-avatar"
             src="{{ avatar_png_url }}"
             alt="{{ user.nickname }}" /></picture
-        >{% if locale.starts_with("zh") %}欢迎，{{ user.nickname }}{% else
-        %}Welcome, {{ user.nickname }}{% endif %}
+        >{{ copy.labels.welcome }}{{ user.nickname }}
       </h2>
       {% if badges.len() > 0 %}
       <p>
@@ -159,35 +164,32 @@
       </p>
       {% endif %}
       <p>{{ user.email }}</p>
-      {% for widget in page_widgets %}
-      {% if widget == "email_verification" && show_email_verification %}
+      {% for widget in page_widgets %} {% if widget == "email_verification" &&
+      show_email_verification %}
       <p>
         <button id="send-verification">
-          {% if locale.starts_with("zh") %}发送验证邮件{% else %}Send
-          verification email{% endif %}
+          {{ copy.labels.send_verification }}
         </button>
         <span id="verification-status" role="status"></span>
       </p>
-      {% endif %}
-      {% if widget == "usage" && frontend_script_available %}
-      <section id="usage-box" aria-label="Account usage and score"></section>
-      {% endif %}
-      {% if widget == "announcement" %}
+      {% endif %} {% if widget == "usage" && frontend_script_available %}
+      <section
+        id="usage-box"
+        aria-label="{{ copy.labels.usage_aria }}"
+      ></section>
+      {% endif %} {% if widget == "announcement" %}
       <section class="announcement">
         <h3>
-          {% if locale.starts_with("zh") %}公告{% else %}Announcement{% endif %}
-          {% if user.permission >= 1 %} ·
-          <a href="/admin/options">{% if locale.starts_with("zh") %}编辑{% else %}Edit{% endif %}</a>
+          {{ copy.announcement }} {% if user.permission >= 1 %} ·
+          <a href="/admin/options">{{ copy.labels.edit }}</a>
           {% endif %}
         </h3>
         <div>{{ announcement_html|safe }}</div>
       </section>
-      {% endif %}
-      {% endfor %}
+      {% endif %} {% endfor %}
       <section aria-labelledby="notifications-title">
         <h3 id="notifications-title">
-          {% if locale.starts_with("zh") %}站内通知{% else %}Notifications{%
-          endif %}
+          {{ copy.labels.notifications }}
           <span id="notification-count">{{ notifications.len() }}</span>
         </h3>
         <ul id="notifications">
@@ -198,10 +200,7 @@
             </button>
           </li>
           {% else %}
-          <li>
-            {% if locale.starts_with("zh") %}没有未读通知{% else %}No unread
-            notifications{% endif %}
-          </li>
+          <li>{{ copy.no_unread }}</li>
           {% endfor %}
         </ul>
       </section>
@@ -210,33 +209,46 @@
         <div id="notification-content"></div>
         <small id="notification-time"></small>
         <form method="dialog">
-          <button>
-            {% if locale.starts_with("zh") %}关闭{% else %}Close{% endif %}
-          </button>
+          <button>{{ copy.labels.close }}</button>
         </form>
       </dialog>
-      <nav aria-label="{% if locale.starts_with("zh") %}用户导航{% else %}Dashboard navigation{% endif %}" style="display: flex; align-items: center; gap: .75rem; flex-wrap: wrap">
-        {% for item in side_menu_user %}
-        {% if item.link == "#divider" %}<span role="separator" aria-orientation="vertical" style="border-left: 1px solid #c9ced6; margin: 0 .5rem"></span>{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %}
-        {% endfor %}
-        {% for item in side_menu_explore %}
-        {% if item.link == "#divider" %}<span role="separator" aria-orientation="vertical" style="border-left: 1px solid #c9ced6; margin: 0 .5rem"></span>{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %}
-        {% endfor %}
-        {% if user.permission >= 1 %}<a href="/admin">{% if locale.starts_with("zh") %}管理后台{% else %}Admin dashboard{% endif %}</a>{% endif %}
+      <nav
+        aria-label="{{ copy.labels.dashboard_nav }}"
+        style="
+          display: flex;
+          align-items: center;
+          gap: 0.75rem;
+          flex-wrap: wrap;
+        "
+      >
+        {% for item in side_menu_user %} {% if item.link == "#divider" %}<span
+          role="separator"
+          aria-orientation="vertical"
+          style="border-left: 1px solid #c9ced6; margin: 0 0.5rem"
+        ></span
+        >{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %} {%
+        endfor %} {% for item in side_menu_explore %} {% if item.link ==
+        "#divider" %}<span
+          role="separator"
+          aria-orientation="vertical"
+          style="border-left: 1px solid #c9ced6; margin: 0 0.5rem"
+        ></span
+        >{% else %}<a href="{{ item.link }}">{{ item.label }}</a>{% endif %} {%
+        endfor %} {% if user.permission >= 1 %}<a href="/admin"
+          >{{ copy.labels.admin_dashboard }}</a
+        >{% endif %}
       </nav>
-      <h3>{% if locale.starts_with("zh") %}角色{% else %}Players{% endif %}</h3>
+      <h3>{{ copy.labels.players }}</h3>
       <ul>
         {% for player in players %}
         <li>{{ player.name }}</li>
         {% else %}
-        <li>
-          {% if locale.starts_with("zh") %}还没有角色{% else %}No players yet{%
-          endif %}
-        </li>
+        <li>{{ copy.labels.no_players }}</li>
         {% endfor %}
       </ul>
     </main>
     <script>
+      const dashboardCopy = document.getElementById('user-dashboard').dataset
       const notificationList = document.getElementById('notifications')
       notificationList.addEventListener('click', async (event) => {
         const button = event.target.closest('button[data-notification-id]')
@@ -249,7 +261,9 @@
           )
           const detail = await response.json()
           if (!response.ok)
-            throw new Error(detail.message || 'Unable to read notification.')
+            throw new Error(
+              detail.message || dashboardCopy.readNotificationError,
+            )
           document.getElementById('notification-title').textContent =
             detail.title
           document.getElementById('notification-content').innerHTML =
@@ -263,9 +277,7 @@
           )
           if (!notificationList.querySelector('button[data-notification-id]')) {
             const empty = document.createElement('li')
-            empty.textContent = document.documentElement.lang.startsWith('zh')
-              ? '没有未读通知'
-              : 'No unread notifications'
+            empty.textContent = dashboardCopy.noUnread
             notificationList.replaceChildren(empty)
           }
         } catch (error) {
@@ -283,11 +295,11 @@
               headers: { Accept: 'application/json' },
             })
             const result = await response.json()
-            status.textContent = result.message || 'Unable to send email.'
+            status.textContent = result.message || dashboardCopy.unableSendEmail
             if (!response.ok || result.code !== 0)
               verificationButton.disabled = false
           } catch (_) {
-            status.textContent = 'Unable to connect to the server.'
+            status.textContent = dashboardCopy.connectionError
             verificationButton.disabled = false
           }
         })

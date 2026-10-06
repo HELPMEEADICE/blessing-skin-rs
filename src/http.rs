@@ -5851,6 +5851,7 @@ fn strip_configured_html_tags(value: &str) -> String {
 #[template(path = "dashboard.html")]
 struct DashboardPage {
     site_name: String,
+    copy: DashboardPageCopy,
     avatar_url: String,
     avatar_png_url: String,
     badges: Vec<DashboardBadge>,
@@ -5869,6 +5870,166 @@ struct DashboardPage {
     frontend_script_available: bool,
     frontend_script: String,
     frontend_globals_b64: String,
+}
+
+#[derive(Clone, Copy)]
+struct DashboardPageLabels {
+    logout: &'static str,
+    welcome: &'static str,
+    user_menu_aria: &'static str,
+    send_verification: &'static str,
+    usage_aria: &'static str,
+    edit: &'static str,
+    notifications: &'static str,
+    close: &'static str,
+    dashboard_nav: &'static str,
+    admin_dashboard: &'static str,
+    players: &'static str,
+    no_players: &'static str,
+    read_notification_error: &'static str,
+    unable_send_email: &'static str,
+    connection_error: &'static str,
+    manage_players: &'static str,
+    manage_closet: &'static str,
+    my_reports: &'static str,
+    account_settings: &'static str,
+    oauth_apps: &'static str,
+    skin_library: &'static str,
+}
+
+struct DashboardPageCopy {
+    labels: DashboardPageLabels,
+    announcement: String,
+    no_unread: String,
+}
+
+fn dashboard_page_copy(locale: &str) -> DashboardPageCopy {
+    let labels = match locale {
+        "zh_TW" => DashboardPageLabels {
+            logout: "退出登入",
+            welcome: "歡迎，",
+            user_menu_aria: "使用者選單",
+            send_verification: "發送驗證郵件",
+            usage_aria: "帳戶用量與積分",
+            edit: "編輯",
+            notifications: "站內通知",
+            close: "關閉",
+            dashboard_nav: "使用者導覽",
+            admin_dashboard: "管理後台",
+            players: "角色",
+            no_players: "還沒有角色",
+            read_notification_error: "無法讀取通知。",
+            unable_send_email: "無法發送郵件。",
+            connection_error: "無法連接伺服器。",
+            manage_players: "管理角色",
+            manage_closet: "管理衣櫃",
+            my_reports: "我的舉報",
+            account_settings: "帳戶設定",
+            oauth_apps: "OAuth 應用",
+            skin_library: "皮膚庫",
+        },
+        locale if locale.starts_with("zh") => DashboardPageLabels {
+            logout: "退出登录",
+            welcome: "欢迎，",
+            user_menu_aria: "用户菜单",
+            send_verification: "发送验证邮件",
+            usage_aria: "账户用量与积分",
+            edit: "编辑",
+            notifications: "站内通知",
+            close: "关闭",
+            dashboard_nav: "用户导航",
+            admin_dashboard: "管理后台",
+            players: "角色",
+            no_players: "还没有角色",
+            read_notification_error: "无法读取通知。",
+            unable_send_email: "无法发送邮件。",
+            connection_error: "无法连接服务器。",
+            manage_players: "管理角色",
+            manage_closet: "管理衣柜",
+            my_reports: "我的举报",
+            account_settings: "账户设置",
+            oauth_apps: "OAuth 应用",
+            skin_library: "皮肤库",
+        },
+        "es_ES" => DashboardPageLabels {
+            logout: "Cerrar sesión",
+            welcome: "Te damos la bienvenida, ",
+            user_menu_aria: "Menú de usuario",
+            send_verification: "Enviar correo de verificación",
+            usage_aria: "Uso de cuenta y puntuación",
+            edit: "Editar",
+            notifications: "Notificaciones",
+            close: "Cerrar",
+            dashboard_nav: "Navegación del panel",
+            admin_dashboard: "Panel de administración",
+            players: "Jugadores",
+            no_players: "Aún no tienes jugadores",
+            read_notification_error: "No se pudo leer la notificación.",
+            unable_send_email: "No se pudo enviar el correo.",
+            connection_error: "No se pudo conectar con el servidor.",
+            manage_players: "Gestionar jugadores",
+            manage_closet: "Gestionar armario",
+            my_reports: "Mis reportes",
+            account_settings: "Configuración de cuenta",
+            oauth_apps: "Aplicaciones OAuth",
+            skin_library: "Biblioteca de skins",
+        },
+        "ru_RU" => DashboardPageLabels {
+            logout: "Выйти",
+            welcome: "Добро пожаловать, ",
+            user_menu_aria: "Меню пользователя",
+            send_verification: "Отправить письмо для подтверждения",
+            usage_aria: "Использование аккаунта и баллы",
+            edit: "Изменить",
+            notifications: "Уведомления",
+            close: "Закрыть",
+            dashboard_nav: "Навигация панели",
+            admin_dashboard: "Панель администратора",
+            players: "Игроки",
+            no_players: "У вас пока нет игроков",
+            read_notification_error: "Не удалось прочитать уведомление.",
+            unable_send_email: "Не удалось отправить письмо.",
+            connection_error: "Не удалось подключиться к серверу.",
+            manage_players: "Управление игроками",
+            manage_closet: "Управление гардеробом",
+            my_reports: "Мои жалобы",
+            account_settings: "Настройки аккаунта",
+            oauth_apps: "Приложения OAuth",
+            skin_library: "Библиотека скинов",
+        },
+        _ => DashboardPageLabels {
+            logout: "Log out",
+            welcome: "Welcome, ",
+            user_menu_aria: "User menu",
+            send_verification: "Send verification email",
+            usage_aria: "Account usage and score",
+            edit: "Edit",
+            notifications: "Notifications",
+            close: "Close",
+            dashboard_nav: "Dashboard navigation",
+            admin_dashboard: "Admin dashboard",
+            players: "Players",
+            no_players: "No players yet",
+            read_notification_error: "Unable to read notification.",
+            unable_send_email: "Unable to send email.",
+            connection_error: "Unable to connect to the server.",
+            manage_players: "Manage players",
+            manage_closet: "Manage closet",
+            my_reports: "My reports",
+            account_settings: "Account settings",
+            oauth_apps: "OAuth apps",
+            skin_library: "Skin library",
+        },
+    };
+    let legacy = |key, fallback: &str| {
+        crate::mail_templates::legacy_translation(locale, "user", &[], key)
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    DashboardPageCopy {
+        labels,
+        announcement: legacy("announcement", labels.notifications),
+        no_unread: legacy("no-unread", "No unread notifications"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -6540,61 +6701,23 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         serde_json::from_value::<Vec<DashboardBadge>>(filter_user_badges(&state, &user).await)
             .unwrap_or_default();
     let menu = filter_user_menu(&state, &user, &locale).await;
-    let chinese = locale.starts_with("zh");
+    let copy = dashboard_page_copy(&locale);
     let side_menu_user = filter_side_menu(
         &state,
         "user",
         vec![
-            dashboard_menu_item(
-                if chinese {
-                    "管理角色"
-                } else {
-                    "Manage players"
-                },
-                "/user/player",
-            ),
-            dashboard_menu_item(
-                if chinese {
-                    "管理衣柜"
-                } else {
-                    "Manage closet"
-                },
-                "/user/closet",
-            ),
-            dashboard_menu_item(
-                if chinese {
-                    "我的举报"
-                } else {
-                    "My reports"
-                },
-                "/user/reports",
-            ),
-            dashboard_menu_item(
-                if chinese {
-                    "账户设置"
-                } else {
-                    "Account settings"
-                },
-                "/user/profile",
-            ),
-            dashboard_menu_item(
-                if chinese {
-                    "OAuth 应用"
-                } else {
-                    "OAuth apps"
-                },
-                "/user/oauth/manage",
-            ),
+            dashboard_menu_item(copy.labels.manage_players, "/user/player"),
+            dashboard_menu_item(copy.labels.manage_closet, "/user/closet"),
+            dashboard_menu_item(copy.labels.my_reports, "/user/reports"),
+            dashboard_menu_item(copy.labels.account_settings, "/user/profile"),
+            dashboard_menu_item(copy.labels.oauth_apps, "/user/oauth/manage"),
         ],
     )
     .await;
     let side_menu_explore = filter_side_menu(
         &state,
         "explore",
-        vec![dashboard_menu_item(
-            if chinese { "皮肤库" } else { "Skin library" },
-            "/skinlib",
-        )],
+        vec![dashboard_menu_item(copy.labels.skin_library, "/skinlib")],
     )
     .await;
     let site_name = site_name(&state).await;
@@ -6619,6 +6742,7 @@ async fn web_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     );
     let page = DashboardPage {
         site_name,
+        copy,
         avatar_url,
         avatar_png_url,
         badges,
@@ -20016,6 +20140,20 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_copy_uses_legacy_languages_and_localizes_account_actions() {
+        let spanish = super::dashboard_page_copy("es_ES");
+        assert_eq!(spanish.labels.logout, "Cerrar sesión");
+        assert_eq!(spanish.labels.manage_players, "Gestionar jugadores");
+        assert_eq!(spanish.announcement, "Anuncio");
+        assert_eq!(spanish.no_unread, "No hay notificaciones nuevas.");
+
+        let russian = super::dashboard_page_copy("ru_RU");
+        assert_eq!(russian.labels.notifications, "Уведомления");
+        assert_eq!(russian.labels.no_players, "У вас пока нет игроков");
+        assert_eq!(russian.announcement, "Объявление");
+    }
+
+    #[test]
     fn legacy_locale_aliases_and_accept_language_quality_are_resolved() {
         assert_eq!(super::normalize_locale("zh-HANS-CN"), Some("zh_CN"));
         assert_eq!(super::normalize_locale("en_US"), Some("en"));
@@ -26233,6 +26371,24 @@ mod tests {
         let dashboard_html = String::from_utf8(dashboard_html.to_vec()).unwrap();
         assert!(dashboard_html.contains("alex@example.test"));
         assert!(dashboard_html.contains("Alex"));
+
+        let spanish_dashboard =
+            session_request(&app, &cookie, "GET", "/user?lang=es_ES", None).await;
+        assert_eq!(spanish_dashboard.status(), StatusCode::OK);
+        let spanish_dashboard_html = String::from_utf8(
+            to_bytes(spanish_dashboard.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(spanish_dashboard_html.contains("Te damos la bienvenida, Alex"));
+        assert!(spanish_dashboard_html.contains("Cerrar sesión"));
+        assert!(spanish_dashboard_html.contains("Anuncio"));
+        assert!(spanish_dashboard_html.contains("No hay notificaciones nuevas."));
+        let restored_dashboard_locale =
+            session_request(&app, &cookie, "GET", "/user/profile?lang=en", None).await;
+        assert_eq!(restored_dashboard_locale.status(), StatusCode::OK);
         sqlx::query("INSERT INTO options (option_name,option_value) VALUES ('score_per_storage','2'), ('score_per_player','100'), ('sign_after_zero','false'), ('sign_gap_time','24'), ('sign_score','10,10')")
             .execute(&pool)
             .await
