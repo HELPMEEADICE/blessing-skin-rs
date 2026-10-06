@@ -15510,25 +15510,30 @@ async fn submit_skinlib_report(
             .and_then(|value| value.to_str().ok()),
     ) {
         Ok(fields) => fields,
-        Err(()) => return report_validation_error("tid", &request_locale(&state)),
+        Err(()) => return report_validation_error("tid", "required", &request_locale(&state)),
     };
     let request = serde_json::Value::Object(fields);
-    let Some(tid) = texture_id_from_request(request.get("tid")) else {
-        return report_validation_error("tid", &request_locale(&state));
+    let tid_value = request.get("tid");
+    if legacy_required_value_is_missing(tid_value) {
+        return report_validation_error("tid", "required", &request_locale(&state));
+    }
+    let Some(tid) = texture_id_from_request(tid_value) else {
+        return report_validation_error("tid", "exists", &request_locale(&state));
     };
-    let Some(reason) = request.get("reason").and_then(serde_json::Value::as_str) else {
-        return report_validation_error("reason", &request_locale(&state));
+    let reason_value = request.get("reason");
+    if legacy_required_value_is_missing(reason_value) {
+        return report_validation_error("reason", "required", &request_locale(&state));
+    }
+    let Some(reason) = reason_value.and_then(serde_json::Value::as_str) else {
+        return report_validation_error("reason", "required", &request_locale(&state));
     };
     let reason = reason.trim();
-    if reason.is_empty() {
-        return report_validation_error("reason", &request_locale(&state));
-    }
     let texture = match database
         .texture_info(&state.config.database.table_prefix, tid)
         .await
     {
         Ok(Some(texture)) => texture,
-        Ok(None) => return report_validation_error("tid", &request_locale(&state)),
+        Ok(None) => return report_validation_error("tid", "exists", &request_locale(&state)),
         Err(error) => {
             tracing::error!(%error, tid, "failed to load reported texture");
             return unavailable();
@@ -15590,34 +15595,17 @@ async fn submit_skinlib_report(
                 serde_json::json!({"reporter_id": reporter.uid, "texture_id": tid, "uploader_id": texture.uploader}),
             )
             .await;
-            login_result(
-                0,
-                if request_locale(&state).starts_with("zh") {
-                    "举报已提交，请等待管理员处理"
-                } else {
-                    "Thanks for reporting! The administrators will review it as soon as possible."
-                },
-                None,
-            )
+            let message = report_submission_message("success", &request_locale(&state));
+            login_result(0, &message, None)
         }
-        Ok(crate::database::ReportSubmissionOutcome::AlreadyReported) => login_result(
-            1,
-            if request_locale(&state).starts_with("zh") {
-                "您已经举报过该材质了，请耐心等待管理员处理。您可以在用户中心查看举报的处理进度。"
-            } else {
-                "You have already reported this texture. The administrators will review it as soon as possible. You can also track the status of your report at User Center."
-            },
-            None,
-        ),
-        Ok(crate::database::ReportSubmissionOutcome::InsufficientScore) => login_result(
-            1,
-            if request_locale(&state).starts_with("zh") {
-                "积分不足"
-            } else {
-                "You don't have enough score to upload this texture."
-            },
-            None,
-        ),
+        Ok(crate::database::ReportSubmissionOutcome::AlreadyReported) => {
+            let message = report_submission_message("duplicate", &request_locale(&state));
+            login_result(1, &message, None)
+        }
+        Ok(crate::database::ReportSubmissionOutcome::InsufficientScore) => {
+            let message = report_submission_message("lack-score", &request_locale(&state));
+            login_result(1, &message, None)
+        }
         Err(error) => {
             tracing::error!(%error, tid, "failed to submit skin library report");
             unavailable()
@@ -15625,19 +15613,57 @@ async fn submit_skinlib_report(
     }
 }
 
-fn report_validation_error(field: &str, locale: &str) -> Response {
+fn report_submission_message(message_key: &str, locale: &str) -> String {
+    let (path, key, fallback): (&[&str], &str, &str) = match message_key {
+        "success" => (
+            &["report"],
+            "success",
+            "Thanks for reporting! The administrators will review it as soon as possible.",
+        ),
+        "duplicate" => (
+            &["report"],
+            "duplicate",
+            "You have already reported this texture. The administrators will review it as soon as possible. You can also track the status of your report at User Center.",
+        ),
+        "lack-score" => (
+            &["upload"],
+            "lack-score",
+            "You don't have enough score to upload this texture.",
+        ),
+        _ => return "The report could not be submitted.".to_owned(),
+    };
+    crate::mail_templates::legacy_translation(locale, "skinlib", path, key)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn legacy_required_value_is_missing(value: Option<&serde_json::Value>) -> bool {
+    value.is_none_or(|value| match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        _ => false,
+    })
+}
+
+fn report_validation_error(field: &str, rule: &str, locale: &str) -> Response {
     let chinese = locale.starts_with("zh");
     let message = if chinese {
         "给定数据无效。"
     } else {
         "The given data was invalid."
     };
-    let field_error = match (field, chinese) {
-        ("tid", true) => "材质编号必须是存在的整数。",
-        ("tid", false) => "The tid field must reference an existing texture.",
-        ("reason", true) => "举报理由为必填项。",
-        ("reason", false) => "The reason field is required.",
-        _ => "The given field is invalid.",
+    let (key, fallback) = match rule {
+        "required" => ("required", "The :attribute field is required."),
+        "exists" => ("exists", "The selected :attribute is invalid."),
+        _ => ("", "The given field is invalid."),
+    };
+    let field_error = if key.is_empty() {
+        fallback.to_owned()
+    } else {
+        crate::mail_templates::legacy_translation(locale, "validation", &[], key)
+            .unwrap_or_else(|| fallback.to_owned())
+            .replace(":attribute", field)
     };
     let mut errors = serde_json::Map::new();
     errors.insert(field.to_owned(), serde_json::json!([field_error]));
@@ -18617,14 +18643,7 @@ async fn review_report_action(
         .ok()
         .map(serde_json::Value::Object);
     let action_value = request.as_ref().and_then(|request| request.get("action"));
-    let is_missing = action_value.is_none_or(|value| match value {
-        serde_json::Value::Null => true,
-        serde_json::Value::String(value) => value.trim().is_empty(),
-        serde_json::Value::Array(values) => values.is_empty(),
-        serde_json::Value::Object(values) => values.is_empty(),
-        _ => false,
-    });
-    if is_missing {
+    if legacy_required_value_is_missing(action_value) {
         return report_review_validation_error("required", &request_locale(&state));
     }
     let Some(action) = action_value.and_then(serde_json::Value::as_str) else {
@@ -22258,19 +22277,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn report_submission_messages_reuse_skinlib_translations() {
+        assert_eq!(
+            super::report_submission_message("success", "es_ES"),
+            "¡Gracias por reportar! Los administradores lo revisarán tan pronto sea posible."
+        );
+        assert_eq!(
+            super::report_submission_message("duplicate", "zh_CN"),
+            "您已经举报过该材质了，请耐心等待管理员处理。您可以在用户中心查看举报的处理进度。"
+        );
+        assert_eq!(
+            super::report_submission_message("lack-score", "es_ES"),
+            "No tienes suficiente puntuación para subir esta textura."
+        );
+    }
+
     #[tokio::test]
     async fn formats_report_validation_errors_by_field() {
         use axum::body::to_bytes;
 
-        let response = super::report_validation_error("reason", "en");
+        let response = super::report_validation_error("reason", "required", "en");
         assert_eq!(
             response.status(),
             axum::http::StatusCode::UNPROCESSABLE_ENTITY
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(value["errors"]["reason"][0].as_str().is_some());
+        assert_eq!(
+            value["errors"]["reason"][0],
+            "The reason field is required."
+        );
         assert!(value["errors"]["field"].is_null());
+
+        let response = super::report_validation_error("tid", "exists", "es_ES");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["errors"]["tid"][0], "tid es inválido.");
     }
     #[test]
     fn sanitizes_png_uploads_and_checks_skin_dimensions() {
